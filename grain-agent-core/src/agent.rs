@@ -11,7 +11,7 @@ use crate::agent_loop::{
     self, AfterToolCallFn, AgentLoopConfig, BeforeToolCallFn, ConvertToLlmFn, EventSink,
     GetApiKeyFn, MessagesProviderFn, PrepareNextTurnFn, TransformContextFn,
 };
-use crate::stream::{StreamFn, StreamOptions};
+use crate::stream::{OnPayloadFn, OnResponseFn, StreamFn, StreamOptions};
 use crate::types::*;
 
 // ---------------------------------------------------------------------------
@@ -63,6 +63,20 @@ impl PendingMessageQueue {
 // Inner agent state
 // ---------------------------------------------------------------------------
 
+/// Bookkeeping for the run in flight.
+///
+/// Port of the TS `ActiveRun` (`{ promise, resolve, abortController }`,
+/// agent.ts:159-163): `token` is the abort controller, and the watch channel
+/// is the run-settlement promise — `finish_run` sends `true` only after the
+/// loop returned and every awaited listener (including `agent_end`
+/// listeners) settled, exactly when the TS `finishRun()` resolves the
+/// promise (agent.ts:514-520).
+struct ActiveRun {
+    token: CancellationToken,
+    done_tx: tokio::sync::watch::Sender<bool>,
+    done_rx: tokio::sync::watch::Receiver<bool>,
+}
+
 struct Inner {
     system_prompt: String,
     model: Model,
@@ -84,7 +98,12 @@ struct Inner {
     steering_queue: PendingMessageQueue,
     follow_up_queue: PendingMessageQueue,
 
-    active_run: Option<CancellationToken>,
+    /// Opaque session id forwarded in stream requests. Lives in `Inner` so
+    /// it is settable mid-life (TS `agent.sessionId = ...`, agent.ts:199-200
+    /// @ 34239180); the next stream request picks up the new value.
+    session_id: Option<String>,
+
+    active_run: Option<ActiveRun>,
 }
 
 impl Inner {
@@ -127,6 +146,12 @@ pub struct AgentOptions {
     pub stream_fn: StreamFn,
     /// Dynamic API-key provider.
     pub get_api_key: Option<GetApiKeyFn>,
+    /// Provider-payload inspection/replacement callback forwarded in stream
+    /// requests (TS `AgentOptions.onPayload`, agent.ts:103 @ 34239180).
+    pub on_payload: Option<OnPayloadFn>,
+    /// Response-received callback forwarded in stream requests
+    /// (TS `AgentOptions.onResponse`, agent.ts:104).
+    pub on_response: Option<OnResponseFn>,
     /// Pre-tool-execution hook (e.g. storm suppression).
     pub before_tool_call: Option<BeforeToolCallFn>,
     /// Post-tool-execution hook (e.g. result truncation).
@@ -140,6 +165,9 @@ pub struct AgentOptions {
     pub follow_up_mode: QueueMode,
     /// Opaque session id forwarded in stream requests.
     pub session_id: Option<String>,
+    /// Per-level thinking token budgets forwarded in stream requests
+    /// (TS `AgentOptions.thinkingBudgets`, agent.ts:117).
+    pub thinking_budgets: Option<ThinkingBudgets>,
     /// Transport identifier forwarded in stream requests.
     pub transport: Option<String>,
     /// Max retry backoff forwarded in stream requests.
@@ -162,12 +190,15 @@ impl AgentOptions {
             transform_context: None,
             stream_fn,
             get_api_key: None,
+            on_payload: None,
+            on_response: None,
             before_tool_call: None,
             after_tool_call: None,
             prepare_next_turn: None,
             steering_mode: QueueMode::OneAtATime,
             follow_up_mode: QueueMode::OneAtATime,
             session_id: None,
+            thinking_budgets: None,
             transport: None,
             max_retry_delay_ms: None,
             tool_execution: ToolExecutionMode::Parallel,
@@ -209,10 +240,12 @@ pub struct Agent {
     convert_to_llm: ConvertToLlmFn,
     transform_context: Option<TransformContextFn>,
     get_api_key: Option<GetApiKeyFn>,
+    on_payload: Option<OnPayloadFn>,
+    on_response: Option<OnResponseFn>,
     before_tool_call: Option<BeforeToolCallFn>,
     after_tool_call: Option<AfterToolCallFn>,
     prepare_next_turn: Option<PrepareNextTurnFn>,
-    session_id: Option<String>,
+    thinking_budgets: Option<ThinkingBudgets>,
     transport: Option<String>,
     max_retry_delay_ms: Option<u64>,
     tool_execution: ToolExecutionMode,
@@ -238,6 +271,7 @@ impl Agent {
             next_listener_id: 0,
             steering_queue: PendingMessageQueue::new(options.steering_mode),
             follow_up_queue: PendingMessageQueue::new(options.follow_up_mode),
+            session_id: options.session_id,
             active_run: None,
         };
         Agent {
@@ -248,10 +282,12 @@ impl Agent {
                 .unwrap_or_else(default_convert_to_llm),
             transform_context: options.transform_context,
             get_api_key: options.get_api_key,
+            on_payload: options.on_payload,
+            on_response: options.on_response,
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
             prepare_next_turn: options.prepare_next_turn,
-            session_id: options.session_id,
+            thinking_budgets: options.thinking_budgets,
             transport: options.transport,
             max_retry_delay_ms: options.max_retry_delay_ms,
             tool_execution: options.tool_execution,
@@ -292,6 +328,19 @@ impl Agent {
     /// Switch the model for subsequent turns.
     pub async fn set_model(&self, model: Model) {
         self.inner.lock().await.model = model;
+    }
+
+    /// Re-target the opaque session id mid-life: the next stream request
+    /// receives the new value (TS `agent.sessionId = ...` setter,
+    /// agent.ts:199-200, pinned by the second half of "forwards sessionId
+    /// to streamFunction options").
+    pub async fn set_session_id(&self, session_id: Option<String>) {
+        self.inner.lock().await.session_id = session_id;
+    }
+
+    /// Current opaque session id forwarded in stream requests.
+    pub async fn session_id(&self) -> Option<String> {
+        self.inner.lock().await.session_id.clone()
     }
 
     /// Change the thinking level for subsequent turns.
@@ -365,8 +414,8 @@ impl Agent {
     /// an in-progress LLM stream to be cancelled via the shared
     /// [`CancellationToken`].
     pub async fn abort(&self) {
-        if let Some(token) = self.inner.lock().await.active_run.clone() {
-            token.cancel();
+        if let Some(run) = self.inner.lock().await.active_run.as_ref() {
+            run.token.cancel();
         }
     }
 
@@ -374,7 +423,35 @@ impl Agent {
     /// when the agent is idle. Can be used by external code to tie their
     /// own cleanup to the agent lifecycle.
     pub async fn signal(&self) -> Option<CancellationToken> {
-        self.inner.lock().await.active_run.clone()
+        self.inner
+            .lock()
+            .await
+            .active_run
+            .as_ref()
+            .map(|run| run.token.clone())
+    }
+
+    /// Resolve when the current run and all awaited event listeners have
+    /// finished.
+    ///
+    /// Port of the TS `waitForIdle()` (agent.ts:321-323): returns the current
+    /// run's settlement promise, which resolves only after `agent_end`
+    /// listeners settle and runtime state is cleared. Returns immediately
+    /// when no run is active. Like upstream, it is bound to the run active
+    /// at call time — a run started afterwards does not extend the wait.
+    pub async fn wait_for_idle(&self) {
+        let rx = self
+            .inner
+            .lock()
+            .await
+            .active_run
+            .as_ref()
+            .map(|run| run.done_rx.clone());
+        let Some(mut rx) = rx else {
+            return;
+        };
+        // A closed channel (sender dropped) also means the run settled.
+        let _ = rx.wait_for(|done| *done).await;
     }
 
     /// Clear transcript and runtime state.
@@ -536,7 +613,12 @@ impl Agent {
             return Err(AgentError::AlreadyRunning);
         }
         let token = CancellationToken::new();
-        g.active_run = Some(token.clone());
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+        g.active_run = Some(ActiveRun {
+            token: token.clone(),
+            done_tx,
+            done_rx,
+        });
         g.is_streaming = true;
         g.streaming_message = None;
         g.error_message = None;
@@ -572,7 +654,11 @@ impl Agent {
                     timestamp: current_time_ms(),
                 };
                 let listeners_clone: Vec<EventListener> = g.listeners.values().cloned().collect();
-                let token = g.active_run.clone().unwrap_or_default();
+                let token = g
+                    .active_run
+                    .as_ref()
+                    .map(|run| run.token.clone())
+                    .unwrap_or_default();
                 (failure, listeners_clone, token)
             };
 
@@ -599,18 +685,26 @@ impl Agent {
             }
         }
 
-        let mut g = inner.lock().await;
-        if let Some(result) = final_result {
-            g.system_prompt = result.context.system_prompt;
-            g.messages = result.context.messages;
-            g.tools = result.context.tools;
-            g.model = result.model;
-            g.thinking_level = result.thinking_level;
+        let finished_run = {
+            let mut g = inner.lock().await;
+            if let Some(result) = final_result {
+                g.system_prompt = result.context.system_prompt;
+                g.messages = result.context.messages;
+                g.tools = result.context.tools;
+                g.model = result.model;
+                g.thinking_level = result.thinking_level;
+            }
+            g.is_streaming = false;
+            g.streaming_message = None;
+            g.pending_tool_calls.clear();
+            g.active_run.take()
+        };
+        // TS finishRun (agent.ts:514-520): resolve the run's settlement
+        // promise last, after runtime-owned state is cleared — waiters
+        // observe the fully idle agent.
+        if let Some(run) = finished_run {
+            let _ = run.done_tx.send(true);
         }
-        g.is_streaming = false;
-        g.streaming_message = None;
-        g.pending_tool_calls.clear();
-        g.active_run = None;
     }
 
     async fn snapshot_context(&self) -> AgentContext {
@@ -623,14 +717,20 @@ impl Agent {
     }
 
     async fn build_loop_config(&self, skip_initial_steering_poll: bool) -> AgentLoopConfig {
-        let (thinking_level, model) = {
+        let (thinking_level, model, session_id) = {
             let g = self.inner.lock().await;
-            (g.thinking_level, g.model.clone())
+            (g.thinking_level, g.model.clone(), g.session_id.clone())
         };
+        // Mirrors TS createLoopConfig (agent.ts:434-469): sessionId,
+        // onPayload, onResponse, thinkingBudgets, transport and
+        // maxRetryDelayMs all flow into the per-request stream options.
         let stream_options = StreamOptions {
-            session_id: self.session_id.clone(),
+            session_id,
             transport: self.transport.clone(),
             max_retry_delay_ms: self.max_retry_delay_ms,
+            on_payload: self.on_payload.clone(),
+            on_response: self.on_response.clone(),
+            thinking_budgets: self.thinking_budgets,
             reasoning: if thinking_level == ThinkingLevel::Off {
                 None
             } else {

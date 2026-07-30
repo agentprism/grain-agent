@@ -921,16 +921,13 @@ impl AgentHarness {
         self.agent.abort().await;
     }
 
-    /// Wait until the agent is idle (no active run). Polls the
-    /// agent's signal at ~10ms cadence; Phase 2 may replace with a
-    /// proper completion notification.
+    /// Wait until the agent is idle. Delegates to the core
+    /// [`Agent::wait_for_idle`], which resolves only after the current run
+    /// fully settles — including awaited async subscribers — with no start
+    /// race or polling cadence (patch-5; mirrors TS `waitForIdle`,
+    /// agent.ts:321-323).
     pub async fn wait_for_idle(&self) {
-        loop {
-            if self.agent.signal().await.is_none() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        self.agent.wait_for_idle().await;
     }
 
     /// A clone-cheap handle on the owned session. Internally an

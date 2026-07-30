@@ -269,6 +269,7 @@ impl AgentTool for ScriptedTool {
                         content: vec![UserContent::text(reply.content)],
                         details: serde_json::Value::Object(Default::default()),
                         terminate: None,
+                        ..Default::default()
                     })
                 }
             }

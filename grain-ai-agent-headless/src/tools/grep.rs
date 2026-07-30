@@ -222,6 +222,7 @@ impl AgentTool for GrepTool {
                 "maxTotal": total_cap,
             }),
             terminate: None,
+            ..Default::default()
         })
     }
 }

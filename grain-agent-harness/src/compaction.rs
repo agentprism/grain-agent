@@ -1695,6 +1695,8 @@ mod tests {
             details: serde_json::Value::Null,
             is_error: false,
             timestamp: 0,
+            usage: None,
+            added_tool_names: None,
         })
     }
 

@@ -152,6 +152,7 @@ impl AgentTool for GlobTool {
                 "truncated": total >= limit,
             }),
             terminate: None,
+            ..Default::default()
         })
     }
 }

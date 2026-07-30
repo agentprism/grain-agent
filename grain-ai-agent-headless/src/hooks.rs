@@ -143,13 +143,14 @@ pub fn before_tool_call_hook(registry: Arc<HookRegistry>) -> Option<BeforeToolCa
                         .clone()
                         .unwrap_or_else(|| format!("blocked by hook '{}'", rule.name));
                     registry.trace(rule, reason.clone());
-                    return Some(BeforeToolCallResult {
+                    return Ok(Some(BeforeToolCallResult {
                         block: true,
                         reason: Some(reason),
-                    });
+                        ..Default::default()
+                    }));
                 }
             }
-            None
+            Ok(None)
         })
     }))
 }
@@ -226,9 +227,9 @@ pub fn after_tool_call_hook(registry: Arc<HookRegistry>) -> Option<AfterToolCall
                 || out.is_error.is_some()
                 || out.terminate.is_some()
             {
-                Some(out)
+                Ok(Some(out))
             } else {
-                None
+                Ok(None)
             }
         })
     }))
@@ -466,12 +467,38 @@ pub fn chain_before_hooks(
             let a = a.clone();
             let b = b.clone();
             Box::pin(async move {
-                if let Some(result) = a(ctx.clone(), cancel.clone()).await
+                // A hook error short-circuits the chain; the loop contains it
+                // as an isError tool result (patch-2 semantics).
+                let first = a(ctx.clone(), cancel.clone()).await?;
+                if let Some(result) = &first
                     && result.block
                 {
-                    return Some(result);
+                    return Ok(first);
                 }
-                b(ctx, cancel).await
+                // patch-3 args overrides apply sequentially, mirroring
+                // upstream's single shared `validatedArgs` slot: a rewrite
+                // by the first hook is visible to the second hook's
+                // `ctx.args`, and the last hook to set `args` wins. A
+                // second-hook `None` (or a result without `args`) keeps the
+                // first hook's rewrite.
+                let first_args = first.and_then(|r| r.args);
+                let mut next_ctx = ctx;
+                if let Some(args) = &first_args {
+                    next_ctx.args = args.clone();
+                }
+                let second = b(next_ctx, cancel).await?;
+                Ok(match second {
+                    Some(mut second) => {
+                        if second.args.is_none() {
+                            second.args = first_args;
+                        }
+                        Some(second)
+                    }
+                    None => first_args.map(|args| BeforeToolCallResult {
+                        args: Some(args),
+                        ..Default::default()
+                    }),
+                })
             })
         })),
     }
@@ -488,7 +515,9 @@ pub fn chain_after_hooks(
             let a = a.clone();
             let b = b.clone();
             Box::pin(async move {
-                let first = a(ctx.clone(), cancel.clone()).await;
+                // A hook error short-circuits the chain; the loop contains it
+                // as an isError tool result (patch-2 semantics).
+                let first = a(ctx.clone(), cancel.clone()).await?;
                 let mut next_ctx = ctx;
                 if let Some(result) = &first {
                     if let Some(content) = &result.content {
@@ -504,8 +533,8 @@ pub fn chain_after_hooks(
                         next_ctx.is_error = is_error;
                     }
                 }
-                let second = b(next_ctx, cancel).await;
-                merge_after_results(first, second)
+                let second = b(next_ctx, cancel).await?;
+                Ok(merge_after_results(first, second))
             })
         })),
     }
@@ -605,6 +634,7 @@ mod tests {
             CancellationToken::new(),
         )
         .await
+        .expect("hook must not error")
         .unwrap();
         assert!(got.block);
         assert_eq!(got.reason.as_deref(), Some("dangerous"));
@@ -642,9 +672,130 @@ mod tests {
             CancellationToken::new(),
         )
         .await
+        .expect("hook must not error")
         .unwrap();
         let text = tool_result_text(&got.content.unwrap());
         assert!(text.starts_with("abcd"));
         assert!(text.contains("truncated"));
+    }
+
+    fn before_ctx(args: serde_json::Value) -> BeforeToolCallContext {
+        BeforeToolCallContext {
+            assistant_message: assistant(),
+            tool_call: ToolCall {
+                id: "1".into(),
+                name: "echo".into(),
+                arguments: args.clone(),
+            },
+            args,
+            context: Arc::new(AgentContext::default()),
+        }
+    }
+
+    /// Hook that records the args it observed and returns a fixed result.
+    fn observing_hook(
+        seen: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+        result: Option<BeforeToolCallResult>,
+    ) -> BeforeToolCallFn {
+        Arc::new(move |ctx, _cancel| {
+            let seen = seen.clone();
+            let result = result.clone();
+            Box::pin(async move {
+                *seen.lock().unwrap() = Some(ctx.args.clone());
+                Ok(result)
+            })
+        })
+    }
+
+    /// Chain rule (patch-3 composite): args overrides apply sequentially —
+    /// the second hook observes the first hook's rewrite, and a second-hook
+    /// `None` keeps the first hook's args override in the chain result.
+    #[tokio::test]
+    async fn chain_before_hooks_propagates_args_override_to_second_hook() {
+        let seen_by_second = Arc::new(std::sync::Mutex::new(None));
+        let first = observing_hook(
+            Arc::new(std::sync::Mutex::new(None)),
+            Some(BeforeToolCallResult {
+                args: Some(serde_json::json!({ "value": 1 })),
+                ..Default::default()
+            }),
+        );
+        let second = observing_hook(seen_by_second.clone(), None);
+
+        let chained = chain_before_hooks(Some(first), Some(second)).unwrap();
+        let got = chained(
+            before_ctx(serde_json::json!({ "value": 0 })),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chain must not error")
+        .expect("first hook's args override must survive a second-hook None");
+
+        assert_eq!(
+            seen_by_second.lock().unwrap().clone(),
+            Some(serde_json::json!({ "value": 1 })),
+            "second hook must observe the first hook's rewritten args"
+        );
+        assert!(!got.block);
+        assert_eq!(got.args, Some(serde_json::json!({ "value": 1 })));
+    }
+
+    /// Chain rule (patch-3 composite): the last hook to set `args` wins.
+    #[tokio::test]
+    async fn chain_before_hooks_last_args_override_wins() {
+        let first = observing_hook(
+            Arc::new(std::sync::Mutex::new(None)),
+            Some(BeforeToolCallResult {
+                args: Some(serde_json::json!({ "value": 1 })),
+                ..Default::default()
+            }),
+        );
+        let second = observing_hook(
+            Arc::new(std::sync::Mutex::new(None)),
+            Some(BeforeToolCallResult {
+                args: Some(serde_json::json!({ "value": 2 })),
+                ..Default::default()
+            }),
+        );
+
+        let chained = chain_before_hooks(Some(first), Some(second)).unwrap();
+        let got = chained(
+            before_ctx(serde_json::json!({ "value": 0 })),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chain must not error")
+        .expect("expected a chain result");
+
+        assert_eq!(got.args, Some(serde_json::json!({ "value": 2 })));
+    }
+
+    /// Chain rule: a blocking first hook short-circuits — the second hook
+    /// never runs and the block (with its reason) propagates unchanged.
+    #[tokio::test]
+    async fn chain_before_hooks_block_short_circuits_before_args_propagation() {
+        let second_ran = Arc::new(std::sync::Mutex::new(None));
+        let first = observing_hook(
+            Arc::new(std::sync::Mutex::new(None)),
+            Some(BeforeToolCallResult {
+                block: true,
+                reason: Some("nope".into()),
+                ..Default::default()
+            }),
+        );
+        let second = observing_hook(second_ran.clone(), None);
+
+        let chained = chain_before_hooks(Some(first), Some(second)).unwrap();
+        let got = chained(
+            before_ctx(serde_json::json!({ "value": 0 })),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("chain must not error")
+        .expect("expected the blocking result");
+
+        assert!(got.block);
+        assert_eq!(got.reason.as_deref(), Some("nope"));
+        assert!(second_ran.lock().unwrap().is_none(), "second must not run");
     }
 }

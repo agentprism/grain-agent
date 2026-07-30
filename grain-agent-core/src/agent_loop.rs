@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesOrdered, StreamExt};
 use tokio_util::sync::CancellationToken;
@@ -50,13 +49,29 @@ pub struct BeforeToolCallContext {
 pub struct BeforeToolCallResult {
     pub block: bool,
     pub reason: Option<String>,
+    /// Replacement tool arguments.
+    ///
+    /// Upstream `beforeToolCall` receives the validated `args` object by
+    /// reference and may mutate it in place; the tool then executes with the
+    /// mutated arguments **without revalidation** (prepareToolCall keeps the
+    /// same `validatedArgs` object, agent-loop.ts:619-656; pinned by the
+    /// upstream "should execute mutated beforeToolCall args without
+    /// revalidation" test). Rust hooks receive a clone, so the rewrite is an
+    /// explicit override channel: `Some(new_args)` replaces the prepared
+    /// arguments as-is — no second validation pass.
+    pub args: Option<serde_json::Value>,
 }
 
+/// Pre-tool-execution hook.
+///
+/// Fallible, mirroring the upstream contract: a hook error is contained as
+/// an `isError` tool result for that call (prepareToolCall's try/catch,
+/// agent-loop.ts:616-663) — it never aborts the loop.
 pub type BeforeToolCallFn = Arc<
     dyn Fn(
             BeforeToolCallContext,
             CancellationToken,
-        ) -> BoxFuture<'static, Option<BeforeToolCallResult>>
+        ) -> BoxFuture<'static, Result<Option<BeforeToolCallResult>, AgentToolError>>
         + Send
         + Sync,
 >;
@@ -71,19 +86,30 @@ pub struct AfterToolCallContext {
     pub context: Arc<AgentContext>,
 }
 
+/// Partial override returned from `afterToolCall`. Field-by-field merge
+/// semantics per upstream (`packages/agent/src/types.ts:66-90` @ 34239180):
+/// provided fields replace the executed tool-result values wholesale;
+/// omitted fields keep the originals. No deep merge.
 #[derive(Debug, Default, Clone)]
 pub struct AfterToolCallResult {
     pub content: Option<Vec<UserContent>>,
     pub details: Option<serde_json::Value>,
     pub is_error: Option<bool>,
+    /// Replaces the tool-result usage reading (agent-loop.ts:738).
+    pub usage: Option<Usage>,
     pub terminate: Option<bool>,
 }
 
+/// Post-tool-execution hook.
+///
+/// Fallible, mirroring the upstream contract: a hook error replaces the
+/// executed result with an `isError` tool result (finalizeExecutedToolCall's
+/// try/catch, agent-loop.ts:720-747) — it never aborts the loop.
 pub type AfterToolCallFn = Arc<
     dyn Fn(
             AfterToolCallContext,
             CancellationToken,
-        ) -> BoxFuture<'static, Option<AfterToolCallResult>>
+        ) -> BoxFuture<'static, Result<Option<AfterToolCallResult>, AgentToolError>>
         + Send
         + Sync,
 >;
@@ -421,15 +447,23 @@ async fn run_loop(
             has_more_tool_calls = false;
 
             if !tool_calls.is_empty() {
-                let batch = execute_tool_calls(
-                    context,
-                    &assistant,
-                    tool_calls,
-                    config,
-                    &emit,
-                    cancel.clone(),
-                )
-                .await;
+                // agent-loop.ts:208-214 — a "length" stop means the output
+                // was cut off by the token limit, so every tool call in the
+                // message may carry truncated arguments. Fail them all
+                // instead of executing potentially borked calls.
+                let batch = if assistant.stop_reason == StopReason::Length {
+                    fail_tool_calls_from_truncated_message(tool_calls, &emit).await
+                } else {
+                    execute_tool_calls(
+                        context,
+                        &assistant,
+                        tool_calls,
+                        config,
+                        &emit,
+                        cancel.clone(),
+                    )
+                    .await
+                };
                 tool_results = batch.messages;
                 has_more_tool_calls = !batch.terminate;
 
@@ -742,6 +776,51 @@ struct FinalizedCall {
     is_error: bool,
 }
 
+/// Fail all tool calls from an assistant message that was truncated by the
+/// output token limit.
+///
+/// Port of `failToolCallsFromTruncatedMessage` (agent-loop.ts:374-406):
+/// streamed tool-call arguments are finalized with a best-effort JSON
+/// salvage parser, so a truncated message can yield tool calls whose
+/// arguments parse and validate but are silently incomplete. None of them
+/// are safe to execute; report each as an error so the model can re-issue
+/// them. The batch never terminates the loop.
+async fn fail_tool_calls_from_truncated_message(
+    tool_calls: Vec<ToolCall>,
+    emit: &EventSink,
+) -> ExecutedBatch {
+    let mut messages: Vec<ToolResultMessage> = Vec::new();
+    for tool_call in tool_calls {
+        emit_now(
+            emit,
+            AgentEvent::ToolExecutionStart {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                args: tool_call.arguments.clone(),
+            },
+        )
+        .await;
+        // Exact upstream copy (agent-loop.ts:396).
+        let finalized = FinalizedCall {
+            result: AgentToolResult::error(format!(
+                "Tool call \"{}\" was not executed: the response hit the output token limit, \
+                 so its arguments may be truncated. Re-issue the tool call with complete arguments.",
+                tool_call.name
+            )),
+            is_error: true,
+            tool_call,
+        };
+        emit_tool_execution_end(&finalized, emit).await;
+        let trm = make_tool_result_message(&finalized);
+        emit_tool_result_message(&trm, emit).await;
+        messages.push(trm);
+    }
+    ExecutedBatch {
+        messages,
+        terminate: false,
+    }
+}
+
 async fn execute_tool_calls(
     context: &AgentContext,
     assistant: &AssistantMessage,
@@ -977,33 +1056,52 @@ async fn prepare_tool_call(
         }
     };
 
+    // agent-loop.ts:616-618 — prepare, then validate/coerce. The validated
+    // (coerced) arguments are what `beforeToolCall` and `execute` receive
+    // (prepareToolCall's `validatedArgs`); a preparation or validation
+    // failure becomes an immediate error tool result without executing.
     let prepared_args = match tool.prepare_arguments(tool_call.arguments.clone()) {
         Ok(v) => v,
         Err(e) => return Preparation::Immediate(AgentToolResult::error(e.to_string()), true),
     };
-    if let Err(e) = tool.validate_arguments(&prepared_args) {
-        return Preparation::Immediate(AgentToolResult::error(e.to_string()), true);
-    }
+    let mut validated_args = match tool.validate_arguments(prepared_args) {
+        Ok(v) => v,
+        Err(e) => return Preparation::Immediate(AgentToolResult::error(e.to_string()), true),
+    };
 
     if let Some(hook) = config.before_tool_call.clone() {
         let ctx_snapshot = Arc::new(context.clone());
         let before_ctx = BeforeToolCallContext {
             assistant_message: assistant.clone(),
             tool_call: tool_call.clone(),
-            args: prepared_args.clone(),
+            args: validated_args.clone(),
             context: ctx_snapshot,
         };
-        let outcome = hook(before_ctx, cancel.clone()).await;
+        // agent-loop.ts:657-663 — a throwing beforeToolCall is contained as
+        // an immediate error tool result (the in-try abort check never runs
+        // on the throw path).
+        let outcome = match hook(before_ctx, cancel.clone()).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                return Preparation::Immediate(AgentToolResult::error(e.to_string()), true);
+            }
+        };
         if cancel.is_cancelled() {
             return Preparation::Immediate(AgentToolResult::error("Operation aborted"), true);
         }
-        if let Some(result) = outcome
-            && result.block
-        {
-            let reason = result
-                .reason
-                .unwrap_or_else(|| "Tool execution was blocked".into());
-            return Preparation::Immediate(AgentToolResult::error(reason), true);
+        if let Some(result) = outcome {
+            if result.block {
+                let reason = result
+                    .reason
+                    .unwrap_or_else(|| "Tool execution was blocked".into());
+                return Preparation::Immediate(AgentToolResult::error(reason), true);
+            }
+            // patch-3 args-override channel: upstream mutates the shared
+            // `validatedArgs` object in place and the tool executes with the
+            // mutated value without revalidation (agent-loop.ts:619-656).
+            if let Some(new_args) = result.args {
+                validated_args = new_args;
+            }
         }
     }
 
@@ -1014,13 +1112,28 @@ async fn prepare_tool_call(
     Preparation::Prepared(PreparedToolCall {
         tool_call,
         tool,
-        args: prepared_args,
+        args: validated_args,
     })
 }
 
 struct ExecutedOutcome {
     result: AgentToolResult,
     is_error: bool,
+}
+
+/// Shared state behind the tool-update callback: the accepting-updates
+/// latch plus the in-flight update-event tasks.
+///
+/// Port of `executePreparedToolCall`'s `acceptingUpdates` flag and
+/// `updateEvents` promise array (agent-loop.ts:666-707, introduced by
+/// upstream commit daab056a): updates are delivered as they arrive, but the
+/// callback is scoped to the current `execute()` invocation — once the tool
+/// settles, the latch closes and later calls are ignored. Latch check and
+/// task registration happen under one lock so a concurrently-arriving update
+/// can never slip in after settlement drained the list.
+struct UpdateEventState {
+    accepting: bool,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 async fn execute_prepared(
@@ -1033,6 +1146,12 @@ async fn execute_prepared(
     let name = prepared.tool_call.name.clone();
     let args = prepared.tool_call.arguments.clone();
 
+    let state = Arc::new(std::sync::Mutex::new(UpdateEventState {
+        accepting: true,
+        tasks: Vec::new(),
+    }));
+
+    let state_for_callback = state.clone();
     let on_update: ToolUpdateCallback = Arc::new(move |partial: AgentToolResult| {
         let event = AgentEvent::ToolExecutionUpdate {
             tool_call_id: id.clone(),
@@ -1040,24 +1159,17 @@ async fn execute_prepared(
             args: args.clone(),
             partial_result: partial,
         };
-        // Fire-and-forget: emit asynchronously without awaiting from the tool
-        // body. tokio's spawn keeps semantics close to the TS implementation
-        // which accumulates promises and awaits them after execute resolves.
-        //
-        // Wrap in `catch_unwind` so a panicking subscriber surfaces as a
-        // stderr log instead of silently disappearing into the spawn — the
-        // JoinHandle is dropped, so without this the panic is fully eaten.
-        let fut = std::panic::AssertUnwindSafe((emit_cloned)(event)).catch_unwind();
-        tokio::spawn(async move {
-            if let Err(panic) = fut.await {
-                let msg = panic
-                    .downcast_ref::<&'static str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "<non-string panic>".into());
-                eprintln!("[warn] ToolExecutionUpdate listener panicked: {msg}");
-            }
-        });
+        let mut state = state_for_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // agent-loop.ts:680 — `if (!acceptingUpdates) return;`
+        if !state.accepting {
+            return;
+        }
+        // agent-loop.ts:681-691 — start the emission immediately and track
+        // its settlement; the settle path below awaits every tracked task
+        // before the tool call finalizes.
+        state.tasks.push(tokio::spawn((emit_cloned)(event)));
     });
 
     let exec = prepared
@@ -1069,6 +1181,23 @@ async fn execute_prepared(
             on_update,
         )
         .await;
+
+    // agent-loop.ts:694-706 — on both success and failure: close the latch,
+    // then await all pending update events before returning.
+    let tasks = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.accepting = false;
+        std::mem::take(&mut state.tasks)
+    };
+    for task in tasks {
+        if let Err(join_err) = task.await {
+            // A panicking subscriber must not be silently eaten (nor abort
+            // the tool call); surface it like the previous implementation.
+            eprintln!("[warn] ToolExecutionUpdate listener panicked: {join_err}");
+        }
+    }
 
     match exec {
         Ok(result) => ExecutedOutcome {
@@ -1121,19 +1250,31 @@ async fn finalize_executed_owned(
             is_error,
             context,
         };
-        let outcome = hook(after_ctx, cancel.clone()).await;
-        if let Some(after) = outcome {
-            if let Some(content) = after.content {
-                result.content = content;
+        match hook(after_ctx, cancel.clone()).await {
+            Ok(Some(after)) => {
+                // agent-loop.ts:734-741 — `afterResult.X ?? result.X` merge.
+                if let Some(content) = after.content {
+                    result.content = content;
+                }
+                if let Some(details) = after.details {
+                    result.details = details;
+                }
+                if let Some(usage) = after.usage {
+                    result.usage = Some(usage);
+                }
+                if let Some(t) = after.terminate {
+                    result.terminate = Some(t);
+                }
+                if let Some(err_flag) = after.is_error {
+                    is_error = err_flag;
+                }
             }
-            if let Some(details) = after.details {
-                result.details = details;
-            }
-            if let Some(t) = after.terminate {
-                result.terminate = Some(t);
-            }
-            if let Some(err_flag) = after.is_error {
-                is_error = err_flag;
+            Ok(None) => {}
+            Err(e) => {
+                // agent-loop.ts:743-746 — a throwing afterToolCall replaces
+                // the executed result with an error tool result.
+                result = AgentToolResult::error(e.to_string());
+                is_error = true;
             }
         }
     }
@@ -1158,11 +1299,20 @@ fn should_terminate(finalized: &[FinalizedCall]) -> bool {
 }
 
 fn make_tool_result_message(finalized: &FinalizedCall) -> ToolResultMessage {
+    // Port of createToolResultMessage (agent-loop.ts:773-787): the finalized
+    // result's usage carries over, and addedToolNames is included only when
+    // non-empty (the upstream conditional spread at agent-loop.ts:783).
     ToolResultMessage {
         tool_call_id: finalized.tool_call.id.clone(),
         tool_name: finalized.tool_call.name.clone(),
         content: finalized.result.content.clone(),
         details: finalized.result.details.clone(),
+        usage: finalized.result.usage.clone(),
+        added_tool_names: finalized
+            .result
+            .added_tool_names
+            .clone()
+            .filter(|names| !names.is_empty()),
         is_error: finalized.is_error,
         timestamp: current_time_ms(),
     }

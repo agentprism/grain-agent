@@ -249,6 +249,7 @@ impl AgentTool for SemanticSearchTool {
                 "model": self.config.embedding_model,
             }),
             terminate: None,
+            ..Default::default()
         })
     }
 }

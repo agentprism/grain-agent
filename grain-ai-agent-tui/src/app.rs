@@ -5615,7 +5615,7 @@ mod tests {
             details: serde_json::json!({
                 "uiDiff": "diff --git a/src/lib.rs b/src/lib.rs\nindex abc..def 100644\n@@ -1 +1 @@\n-old\n+new\n"
             }),
-            terminate: None,
+            ..Default::default()
         };
 
         let lines = tool_diff_preview("edit", &serde_json::json!({}), &result, None, 8);
@@ -5662,6 +5662,7 @@ mod tests {
             content: vec![],
             details: serde_json::json!({ "path": "file.rs" }),
             terminate: None,
+            ..Default::default()
         };
         let args = serde_json::json!({ "path": "file.rs" });
 
@@ -5681,6 +5682,7 @@ mod tests {
                 "created": true,
             }),
             terminate: None,
+            ..Default::default()
         };
         let args = serde_json::json!({
             "path": "src/main.rs",
@@ -5958,6 +5960,7 @@ mod tests {
                 content: vec![UserContent::text("ok")],
                 details: serde_json::Value::Null,
                 terminate: None,
+                ..Default::default()
             },
             is_error: false,
         })));

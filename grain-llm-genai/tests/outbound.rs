@@ -238,6 +238,8 @@ fn tool_result_message_maps_to_tool_role() {
         details: serde_json::Value::Null,
         is_error: false,
         timestamp: 0,
+        usage: None,
+        added_tool_names: None,
     });
     let chat = to_chat_request(&ctx(vec![msg], vec![], ""));
     assert_eq!(chat.messages[0].role, ChatRole::Tool);

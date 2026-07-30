@@ -125,6 +125,17 @@ pub struct Usage {
     pub cache_read: u64,
     #[serde(default)]
     pub cache_write: u64,
+    /// Subset of `cache_write` written with 1h retention. Only Anthropic
+    /// reports this split (pi-ai `types.ts:373-374` @ 34239180,
+    /// wire name `cacheWrite1h`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h: Option<u64>,
+    /// Reasoning/thinking tokens, when the provider reports them. A subset
+    /// of `output` (already included there); `Some(0)` is meaningful —
+    /// providers without a reasoning breakdown leave it `None`
+    /// (pi-ai `types.ts:375-380`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<u64>,
     #[serde(default)]
     pub total_tokens: u64,
     #[serde(default)]
@@ -168,9 +179,17 @@ impl Model {
 // Stop reasons, thinking levels, queue / execution modes
 // ---------------------------------------------------------------------------
 
+/// Assistant-message stop reason.
+///
+/// Mirrors the pi-ai `StopReason` union (`types.ts:391` @ 34239180:
+/// `"pending" | "stop" | "length" | "toolUse" | "error" | "aborted"`).
+/// `Refused` is a grain-side extension with no upstream counterpart, kept
+/// for downstream crates that classify provider refusals distinctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StopReason {
+    /// The message is still streaming (partial snapshot).
+    Pending,
     Stop,
     ToolUse,
     Length,
@@ -179,6 +198,12 @@ pub enum StopReason {
     Refused,
 }
 
+/// Thinking/reasoning level.
+///
+/// Mirrors the agent-facing union (`packages/agent/src/types.ts:294`
+/// @ 34239180: `"off" | "minimal" | "low" | "medium" | "high" | "xhigh" |
+/// "max"`). `xhigh` and `max` are only supported by selected model
+/// families.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
@@ -189,6 +214,23 @@ pub enum ThinkingLevel {
     Medium,
     High,
     XHigh,
+    Max,
+}
+
+/// Token budgets for each thinking level (token-based providers only).
+///
+/// Port of the pi-ai `ThinkingBudgets` (`types.ts:92-98` @ 34239180).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingBudgets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimal: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub medium: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,8 +256,36 @@ pub enum QueueMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct UserMessage {
+    /// Message content blocks.
+    ///
+    /// The upstream wire format admits `content: string |
+    /// (TextContent | ImageContent)[]` (pi-ai types.ts:393-397): a bare
+    /// string is a first-class user-message shape and deserializes as a
+    /// single text block; a missing/null content normalizes to `[]`
+    /// (upstream's `content ?? []` treatment). Serialization always emits
+    /// the structured array form, which upstream equally accepts.
+    #[serde(default, deserialize_with = "deserialize_user_content_list")]
     pub content: Vec<UserContent>,
     pub timestamp: i64,
+}
+
+/// Deserializer for [`UserMessage::content`]: accepts a bare string, the
+/// structured block array, or null (patch-7; upstream wire format per pi-ai
+/// types.ts:395).
+fn deserialize_user_content_list<'de, D>(deserializer: D) -> Result<Vec<UserContent>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(text) => Ok(vec![UserContent::Text(TextContent { text })]),
+        serde_json::Value::Array(_) => serde_json::from_value(value).map_err(D::Error::custom),
+        serde_json::Value::Null => Ok(Vec::new()),
+        other => Err(D::Error::custom(format!(
+            "invalid user message content: expected string, array, or null, got {other}"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -241,6 +311,15 @@ pub struct ToolResultMessage {
     pub content: Vec<UserContent>,
     #[serde(default)]
     pub details: serde_json::Value,
+    /// Usage from the tool execution itself, if available. Not part of main
+    /// LLM context accounting (pi-ai `types.ts:420-422` @ 34239180).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    /// Names from the tool set that became available after this result.
+    /// Present only when non-empty, matching upstream's conditional spread
+    /// into the toolResult message (agent-loop.ts:783).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_tool_names: Option<Vec<String>>,
     pub is_error: bool,
     pub timestamp: i64,
 }
@@ -315,11 +394,24 @@ impl AgentMessage {
 // Tool result + tools
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentToolResult {
     pub content: Vec<UserContent>,
     #[serde(default)]
     pub details: serde_json::Value,
+    /// Usage from the tool execution itself, if available. Merged into the
+    /// persisted toolResult message (pi-ai `types.ts:360-361`,
+    /// agent-loop.ts:782 @ 34239180).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    /// Names of tools introduced by this result and available from this
+    /// transcript point onward (pi-ai `types.ts:362-363`).
+    #[serde(
+        default,
+        rename = "addedToolNames",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub added_tool_names: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminate: Option<bool>,
 }
@@ -330,7 +422,7 @@ impl AgentToolResult {
         AgentToolResult {
             content: vec![UserContent::text(message)],
             details: serde_json::Value::Object(Default::default()),
-            terminate: None,
+            ..Default::default()
         }
     }
 
@@ -371,11 +463,24 @@ pub trait AgentTool: Send + Sync {
         Ok(args)
     }
 
-    /// Validates arguments against the tool schema. Default impl accepts anything.
-    /// Implementations can use the JSON value in `definition().parameters`.
-    fn validate_arguments(&self, args: &serde_json::Value) -> Result<(), AgentToolError> {
-        let _ = args;
-        Ok(())
+    /// Validates arguments against the tool's JSON schema and returns the
+    /// (potentially coerced) arguments the loop must pass to hooks and
+    /// [`Self::execute`].
+    ///
+    /// The default implementation ports upstream `validateToolArguments`
+    /// (pi-ai `utils/validation.ts:278-310`): schema-driven coercion followed
+    /// by full JSON-Schema validation. Malformed arguments become an error
+    /// tool result without the tool executing (agent-loop.ts:616-663).
+    fn validate_arguments(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, AgentToolError> {
+        crate::validation::validate_tool_arguments(
+            &self.definition().name,
+            &self.definition().parameters,
+            args,
+        )
+        .map_err(AgentToolError::Message)
     }
 
     async fn execute(
@@ -656,6 +761,7 @@ mod cost_tests {
             cache_write: 0,
             total_tokens: 2_000_000,
             cost: Cost::default(),
+            ..Usage::default()
         });
         // 1M @ 0.14 + 1M @ 0.28 = 0.42
         assert!((cost - 0.42).abs() < 1e-9);
@@ -670,6 +776,7 @@ mod cost_tests {
             cache_write: 0,
             total_tokens: 1_000_000,
             cost: Cost::default(),
+            ..Usage::default()
         });
         // 0 uncached + 1M @ 0.0028 = 0.0028
         assert!((cost - 0.0028).abs() < 1e-9);
@@ -684,6 +791,7 @@ mod cost_tests {
             cache_write: 0,
             total_tokens: 1_500_000,
             cost: Cost::default(),
+            ..Usage::default()
         });
         // 200k @ 0.14 + 800k @ 0.0028 + 500k @ 0.28 = 0.028 + 0.00224 + 0.14
         let expected = 0.2e6 * 0.14 / 1e6 + 0.8e6 * 0.0028 / 1e6 + 0.5e6 * 0.28 / 1e6;
@@ -701,6 +809,7 @@ mod cost_tests {
             cache_write: 0,
             total_tokens: 1_000,
             cost: Cost::default(),
+            ..Usage::default()
         });
         // Uncached clamps to 0; treat all 1_000 as cached.
         let expected = 1_000.0 * 0.0028 / 1_000_000.0;

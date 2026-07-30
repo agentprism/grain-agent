@@ -51,7 +51,7 @@ pub fn storm_hook(config: StormConfig) -> BeforeToolCallFn {
             let name = ctx.tool_call.name.clone();
             let now = Instant::now();
             let mut ring = ring.lock().await;
-            decide_storm(&mut ring, now, &config, &name, &args_key)
+            Ok(decide_storm(&mut ring, now, &config, &name, &args_key))
         })
     })
 }
@@ -104,6 +104,7 @@ fn decide_storm(
         Some(BeforeToolCallResult {
             block: true,
             reason: Some(reason),
+            ..Default::default()
         })
     } else {
         None

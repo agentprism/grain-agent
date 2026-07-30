@@ -1,9 +1,8 @@
 //! Port of upstream `packages/agent/test/agent.test.ts`
 //! (pi pinned commit 34239180).
 //!
-//! Each test mirrors one upstream `it(...)` block. Tests that fail against
-//! the current implementation are kept exact and marked
-//! `#[ignore = "patch-N: ..."]` per the WP1/WP4 debt ledger.
+//! Each test mirrors one upstream `it(...)` block. All patch-N debt from
+//! the WP1 port has been repaid by WP4 — no ignored tests remain.
 //! See `tests/PORTING.md` for the full mapping table.
 
 mod common;
@@ -242,12 +241,65 @@ async fn awaits_async_subscribers_before_prompt_resolves() {
     assert!(!agent.state().await.is_streaming);
 }
 
-// TS: "waitForIdle should wait for async subscribers"
-// SKIPPED (patch-5): the Rust `Agent` exposes no `wait_for_idle` API — only
-// the harness crate has one, implemented as a 10ms poll with a start race —
-// so the contract under test ("waitForIdle resolves only after async
-// `agent_end` subscribers settle") cannot be expressed against
-// grain-agent-core today. See tests/PORTING.md.
+/// TS: "waitForIdle should wait for async subscribers"
+///
+/// Translation note: in TS, `agent.prompt(...)` synchronously registers the
+/// active run before `waitForIdle()` is called on the next line. The Rust
+/// prompt runs on a spawned task, so the port first waits for the run to be
+/// observably streaming (the listener blocks the run on the barrier well
+/// before `agent_end`), then asserts the same contract: `wait_for_idle`
+/// resolves only after the async `message_end` subscriber settles and the
+/// run fully finishes.
+#[tokio::test]
+async fn wait_for_idle_waits_for_async_subscribers() {
+    let barrier = Arc::new(Notify::new());
+    let stream = FnStream::new(|_n, _model, _ctx, _opts, _cancel| {
+        done_stream(create_assistant_message(vec![text("ok")], StopReason::Stop))
+    });
+    let agent = Arc::new(Agent::new(options_with(stream)));
+
+    let barrier_capture = barrier.clone();
+    let listener: EventListener = Arc::new(move |event, _signal| {
+        let barrier = barrier_capture.clone();
+        Box::pin(async move {
+            if let AgentEvent::MessageEnd { message } = &event
+                && message.role() == "assistant"
+            {
+                barrier.notified().await;
+            }
+        })
+    });
+    agent.subscribe(listener).await;
+
+    let prompt_agent = agent.clone();
+    let prompt_handle = tokio::spawn(async move { prompt_agent.prompt_text("hello").await });
+
+    // Let the run start; it is now blocked inside the message_end listener.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(agent.state().await.is_streaming);
+
+    let idle_resolved = Arc::new(AtomicBool::new(false));
+    let idle_capture = idle_resolved.clone();
+    let idle_agent = agent.clone();
+    let idle_handle = tokio::spawn(async move {
+        idle_agent.wait_for_idle().await;
+        idle_capture.store(true, Ordering::SeqCst);
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!idle_resolved.load(Ordering::SeqCst));
+    assert!(agent.state().await.is_streaming);
+
+    barrier.notify_one();
+    prompt_handle
+        .await
+        .expect("join failed")
+        .expect("prompt failed");
+    idle_handle.await.expect("join failed");
+
+    assert!(idle_resolved.load(Ordering::SeqCst));
+    assert!(!agent.state().await.is_streaming);
+}
 
 /// TS: "should pass the active abort signal to subscribers"
 #[tokio::test]
@@ -290,7 +342,6 @@ async fn passes_active_abort_signal_to_subscribers() {
 /// behavioural assertions (exactly one update delivered, none after the tool
 /// settles) are kept exact.
 #[tokio::test]
-#[ignore = "patch-4: tool_execution_update emitted via fire-and-forget tokio::spawn (no settle gate, ordering not guaranteed)"]
 async fn ignores_tool_updates_after_execution_settles() {
     let delayed_update: Arc<StdMutex<Option<ToolUpdateCallback>>> = Arc::new(StdMutex::new(None));
     let update_capture = delayed_update.clone();
@@ -307,11 +358,13 @@ async fn ignores_tool_updates_after_execution_settles() {
                     content: vec![UserContent::text("running")],
                     details: json!({ "status": "running" }),
                     terminate: None,
+                    ..Default::default()
                 });
                 Ok(AgentToolResult {
                     content: vec![UserContent::text("ok")],
                     details: json!({ "status": "done" }),
                     terminate: Some(true),
+                    ..Default::default()
                 })
             })
         }),
@@ -339,6 +392,7 @@ async fn ignores_tool_updates_after_execution_settles() {
             content: vec![UserContent::text("late")],
             details: json!({ "status": "late" }),
             terminate: None,
+            ..Default::default()
         });
     }
     tokio::time::sleep(Duration::from_millis(0)).await;
@@ -356,7 +410,6 @@ async fn ignores_tool_updates_after_execution_settles() {
 /// TS: "should ignore a settled parallel tool update while another tool is
 /// still running"
 #[tokio::test]
-#[ignore = "patch-4: tool_execution_update emitted via fire-and-forget tokio::spawn (no settle gate, ordering not guaranteed)"]
 async fn ignores_settled_parallel_tool_update_while_other_tool_running() {
     let slow_started = Arc::new(Notify::new());
     let settled_tool_ended = Arc::new(Notify::new());
@@ -378,6 +431,7 @@ async fn ignores_settled_parallel_tool_update_while_other_tool_running() {
                     content: vec![UserContent::text("done")],
                     details: json!({ "status": "done" }),
                     terminate: Some(true),
+                    ..Default::default()
                 })
             })
         }),
@@ -401,6 +455,7 @@ async fn ignores_settled_parallel_tool_update_while_other_tool_running() {
                     content: vec![UserContent::text("done")],
                     details: json!({ "status": "done" }),
                     terminate: Some(true),
+                    ..Default::default()
                 })
             })
         }),
@@ -449,6 +504,7 @@ async fn ignores_settled_parallel_tool_update_while_other_tool_running() {
             content: vec![UserContent::text("late")],
             details: json!({ "status": "late" }),
             terminate: None,
+            ..Default::default()
         });
     }
     tokio::time::sleep(Duration::from_millis(0)).await;
@@ -732,6 +788,7 @@ async fn prepare_next_turn_receives_run_cancellation_token() {
                     content: vec![UserContent::text("ok")],
                     details: json!({}),
                     terminate: None,
+                    ..Default::default()
                 })
             })
         }),
@@ -774,11 +831,9 @@ async fn prepare_next_turn_receives_run_cancellation_token() {
 
 /// TS: "forwards sessionId to streamFunction options"
 ///
-/// PARTIAL PORT: the TS test also reassigns `agent.sessionId = "session-def"`
-/// mid-life and asserts the next prompt forwards the new id. The Rust `Agent`
-/// has no session-id setter (the field is fixed at construction), so that
-/// half is untranslatable — flagged as an unmapped API divergence in
-/// tests/PORTING.md.
+/// Full port including the mid-life setter half (agent.test.ts:725-730):
+/// `agent.sessionId = "session-def"` re-targets subsequent prompts and the
+/// next stream call receives the new id (patch-11 added the Rust setter).
 #[tokio::test]
 async fn forwards_session_id_to_stream_options() {
     let received_session_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
@@ -796,5 +851,18 @@ async fn forwards_session_id_to_stream_options() {
     assert_eq!(
         received_session_id.lock().unwrap().as_deref(),
         Some("session-abc")
+    );
+
+    // Test setter (agent.test.ts:725-730).
+    agent.set_session_id(Some("session-def".into())).await;
+    assert_eq!(agent.session_id().await.as_deref(), Some("session-def"));
+
+    agent
+        .prompt_text("hello again")
+        .await
+        .expect("prompt failed");
+    assert_eq!(
+        received_session_id.lock().unwrap().as_deref(),
+        Some("session-def")
     );
 }

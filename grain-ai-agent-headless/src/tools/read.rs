@@ -137,6 +137,7 @@ impl AgentTool for ReadTool {
                 "offset": offset,
             }),
             terminate: None,
+            ..Default::default()
         })
     }
 }

@@ -1085,6 +1085,8 @@ mod tests {
             details: serde_json::Value::Null,
             is_error: false,
             timestamp: 0,
+            usage: None,
+            added_tool_names: None,
         };
 
         printer.print(&AgentEvent::AgentStart);
@@ -1117,6 +1119,7 @@ mod tests {
             })],
             details: serde_json::Value::Null,
             terminate: None,
+            ..Default::default()
         };
         printer.print(&AgentEvent::ToolExecutionEnd {
             tool_call_id: "c1".into(),

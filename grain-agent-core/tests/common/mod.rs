@@ -338,6 +338,7 @@ pub fn echo_tool(executed: Arc<StdMutex<Vec<String>>>) -> Arc<dyn AgentTool> {
                     content: vec![UserContent::text(format!("echoed: {value}"))],
                     details: serde_json::json!({ "value": value }),
                     terminate: None,
+                    ..Default::default()
                 })
             })
         }),

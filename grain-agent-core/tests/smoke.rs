@@ -133,6 +133,7 @@ impl AgentTool for EchoTool {
             content: vec![UserContent::text(value)],
             details: serde_json::json!({}),
             terminate: None,
+            ..Default::default()
         })
     }
 }

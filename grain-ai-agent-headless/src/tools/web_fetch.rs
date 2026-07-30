@@ -269,6 +269,7 @@ impl AgentTool for WebFetchTool {
                 "truncatedInTranscript": trunc.truncated,
             }),
             terminate: None,
+            ..Default::default()
         })
     }
 }

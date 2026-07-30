@@ -155,6 +155,7 @@ impl AgentTool for EditTool {
                 "bytesDelta": bytes_delta,
             }),
             terminate: None,
+            ..Default::default()
         })
     }
 }
