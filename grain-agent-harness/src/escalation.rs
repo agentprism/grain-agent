@@ -131,6 +131,7 @@ mod tests {
             usage: Default::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
+            error_code: None,
             timestamp: 0,
         }
     }
@@ -138,6 +139,7 @@ mod tests {
     fn err_assistant() -> AssistantMessage {
         AssistantMessage {
             error_message: Some("boom".into()),
+            error_code: None,
             stop_reason: StopReason::Error,
             ..ok_assistant()
         }

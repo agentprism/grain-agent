@@ -288,6 +288,46 @@ where
     }
 }
 
+/// Machine-readable classification of a loop-terminating failure — the
+/// structured companion to [`AssistantMessage::error_message`]'s free text.
+///
+/// Grain-side extension with no upstream counterpart (same stance as
+/// [`StopReason::Refused`]): upstream pi carries failures as free-text
+/// `errorMessage` only, which forces embedders to classify by substring
+/// matching. This channel lets whatever produced the failure (a provider
+/// adapter, an engine-bridging [`crate::stream::LlmStream`], a hook) attach
+/// a code the embedder can `match` on; the loop preserves it verbatim onto
+/// the final assistant message.
+///
+/// Producers with a reason outside the named variants use
+/// [`ErrorCode::Other`] with their own code string, carried verbatim.
+///
+/// Wire form is a plain string (`"budget_exhausted"`,
+/// `"agent_limit_exceeded"`, or the `Other` string). An `Other` value that
+/// spells a named variant canonicalizes to that variant on round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// A resource budget (tokens, cost) was exhausted.
+    BudgetExhausted,
+    /// An agent/turn count limit was exceeded.
+    AgentLimitExceeded,
+    /// Any other producer-defined code, carried verbatim.
+    #[serde(untagged)]
+    Other(String),
+}
+
+impl ErrorCode {
+    /// The code as a string, however it was produced.
+    pub fn as_str(&self) -> &str {
+        match self {
+            ErrorCode::BudgetExhausted => "budget_exhausted",
+            ErrorCode::AgentLimitExceeded => "agent_limit_exceeded",
+            ErrorCode::Other(code) => code.as_str(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
@@ -300,6 +340,12 @@ pub struct AssistantMessage {
     pub stop_reason: StopReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Structured code for a loop-terminating failure, when the producer
+    /// supplied one (see [`ErrorCode`]). Grain-side extension: absent from
+    /// upstream transcripts and omitted from the wire when `None`, so
+    /// serialized messages round-trip against upstream shapes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<ErrorCode>,
     pub timestamp: i64,
 }
 

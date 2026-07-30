@@ -51,6 +51,7 @@ impl LlmStream for MockStream {
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
                     error_message: None,
+                    error_code: None,
                     timestamp: 0,
                 };
                 vec![
@@ -72,6 +73,7 @@ impl LlmStream for MockStream {
                     usage: Usage::default(),
                     stop_reason: StopReason::Stop,
                     error_message: None,
+                    error_code: None,
                     timestamp: 0,
                 };
                 vec![

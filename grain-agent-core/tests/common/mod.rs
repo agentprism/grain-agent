@@ -58,6 +58,7 @@ pub fn create_assistant_message(
         usage: Usage::default(),
         stop_reason,
         error_message: None,
+        error_code: None,
         timestamp: now_ms(),
     }
 }

@@ -621,7 +621,8 @@ async fn stream_assistant_response(
     let mut event_stream = match stream_result {
         Ok(s) => s,
         Err(err) => {
-            // Loop contract: implementations should not return Err; degrade gracefully.
+            // Loop contract: implementations should not return Err; degrade
+            // gracefully — preserving any structured code the error carries.
             let final_message = AssistantMessage {
                 content: vec![AssistantContent::Text(TextContent::default())],
                 api: config.model.api.clone(),
@@ -630,6 +631,7 @@ async fn stream_assistant_response(
                 usage: Usage::default(),
                 stop_reason: StopReason::Error,
                 error_message: Some(err.to_string()),
+                error_code: err.code().cloned(),
                 timestamp: current_time_ms(),
             };
             context
@@ -732,6 +734,7 @@ async fn stream_assistant_response(
         usage: Usage::default(),
         stop_reason: StopReason::Error,
         error_message: Some("stream ended without terminal event".into()),
+        error_code: None,
         timestamp: current_time_ms(),
     };
     if added_partial {

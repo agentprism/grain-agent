@@ -37,11 +37,14 @@ pub struct StreamOptions {
 }
 ```
 
-`StreamError`: `Other(String)` or `Aborted`. Helper: `StreamError::msg("…")`.
+`StreamError`: `Other(String)`, `Aborted`, or `Coded { code: ErrorCode, message }` (a failure
+carrying a structured [`ErrorCode`](./core-types.md#enums) the loop preserves onto the
+synthesized error message's `error_code`). Helpers: `StreamError::msg("…")`,
+`StreamError::coded(code, "…")`, `err.code()`.
 
 ## Implementation contract (must hold)
 
-1. **Never** use `Err` to report request / model / runtime failures. Surface failures as a **terminal** `AssistantMessageEvent::Error { error, result }` (or `Done { result }`) on the returned stream, with `result.stop_reason` set to `StopReason::Error` / `StopReason::Aborted` and `result.error_message` populated.
+1. **Never** use `Err` to report request / model / runtime failures. Surface failures as a **terminal** `AssistantMessageEvent::Error { error, result }` (or `Done { result }`) on the returned stream, with `result.stop_reason` set to `StopReason::Error` / `StopReason::Aborted` and `result.error_message` populated. When the failure has a machine-readable classification, also set `result.error_code` (see [`ErrorCode`](./core-types.md#enums)) — embedders match on it instead of parsing `error_message`.
 2. The stream MUST end with **exactly one** terminal event (`Done` or `Error`).
 3. Never panic.
 4. `Err(StreamError)` is only for the extreme case where you can't even build a stream; the loop degrades it to a placeholder error terminal. Callers should not rely on this path.
