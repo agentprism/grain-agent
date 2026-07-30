@@ -7,7 +7,7 @@
 //! Chain under test (the full production path, no shortcuts):
 //!
 //! ```text
-//! recorded provider SSE (upstream fixture, byte-faithful)
+//! recorded provider SSE (upstream fixture, frame-faithful)
 //!   → local mock HTTP endpoint
 //!   → genai 0.6.5 real client + provider streamer
 //!   → genai ChatStreamEvents
@@ -132,11 +132,12 @@ async fn run_vector(
 ) -> (Vec<AssistantMessageEvent>, String) {
     let (base_url, request_handle) = serve_sse_once(sse_body).await;
 
-    let target_resolver = move |mut target: ServiceTarget| -> genai::resolver::Result<ServiceTarget> {
-        target.endpoint = Endpoint::from_owned(base_url.clone());
-        target.auth = AuthData::from_single("seam-test-key");
-        Ok(target)
-    };
+    let target_resolver =
+        move |mut target: ServiceTarget| -> genai::resolver::Result<ServiceTarget> {
+            target.endpoint = Endpoint::from_owned(base_url.clone());
+            target.auth = AuthData::from_single("seam-test-key");
+            Ok(target)
+        };
     let client = genai::Client::builder()
         .with_auth_resolver_fn(|_| Ok(Some(AuthData::from_single("seam-test-key"))))
         .with_service_target_resolver_fn(target_resolver)
@@ -144,7 +145,12 @@ async fn run_vector(
     let stream_impl = GenaiStream::with_client_and_options(client, baseline_chat_options());
 
     let mut stream = stream_impl
-        .stream(model, ctx, &StreamOptions::default(), CancellationToken::new())
+        .stream(
+            model,
+            ctx,
+            &StreamOptions::default(),
+            CancellationToken::new(),
+        )
         .await
         .expect("GenaiStream::stream never errors for runtime failures");
 
@@ -296,7 +302,8 @@ fn assert_events(vector: &str, actual: &[AssistantMessageEvent], expected: &[Exp
                 Expect::ToolcallEnd(idx),
             ) => {
                 assert_eq!(
-                    content_index, idx,
+                    content_index,
+                    idx,
                     "[{vector}] event #{i} ({}): content_index mismatch.\nActual:\n  {dump}",
                     event_tag(a)
                 );
@@ -426,10 +433,15 @@ fn usage_of(input: u64, output: u64, total: u64) -> Usage {
     }
 }
 
-/// Byte-faithful port of upstream `createSseResponse`
+/// Frame-faithful port of upstream `createSseResponse`
 /// (`test/anthropic-sse-parsing.test.ts`): `event: <e>\ndata: <d>\n` blocks
 /// joined with `\n`, **no** trailing blank line — genai's SSE splitter must
 /// flush the final `message_stop` on EOF, exactly like upstream's parser.
+/// Frame payloads built with `serde_json::json!` carry alphabetized object
+/// keys (serde_json without `preserve_order`), which is semantically
+/// identical JSON; the one payload where byte order matters — AV-1's
+/// malformed frame, whose brokenness IS the fixture — is a raw string and
+/// byte-exact.
 fn anthropic_sse(events: &[(&str, String)]) -> String {
     events
         .iter()
@@ -588,7 +600,11 @@ async fn av1_anthropic_repairs_malformed_sse_and_tool_json() {
             "required": ["path", "text"]
         }),
     )];
-    let model = model_of("anthropic/claude-haiku-4-5", "anthropic-messages", "anthropic");
+    let model = model_of(
+        "anthropic/claude-haiku-4-5",
+        "anthropic-messages",
+        "anthropic",
+    );
     let (events, request_line) = run_vector(&model, &ctx, sse).await;
     assert!(
         request_line.contains("/messages"),
@@ -653,7 +669,11 @@ async fn av2_anthropic_preserves_refusal_stop_details() {
         anthropic_message_stop(),
     ]);
 
-    let model = model_of("anthropic/claude-fable-5", "anthropic-messages", "anthropic");
+    let model = model_of(
+        "anthropic/claude-fable-5",
+        "anthropic-messages",
+        "anthropic",
+    );
     let (events, _) = run_vector(&model, &user_ctx("blocked request"), sse).await;
 
     // Upstream: stopReason "error", errorMessage = stop_details.explanation,
@@ -701,7 +721,11 @@ async fn av3_anthropic_sensitive_stop_reason() {
         anthropic_message_stop(),
     ]);
 
-    let model = model_of("anthropic/claude-haiku-4-5", "anthropic-messages", "anthropic");
+    let model = model_of(
+        "anthropic/claude-haiku-4-5",
+        "anthropic-messages",
+        "anthropic",
+    );
     let (events, _) = run_vector(&model, &user_ctx("blocked request"), sse).await;
 
     assert_events(
@@ -739,7 +763,11 @@ async fn av4_anthropic_message_delta_without_usage_is_noop() {
         .collect();
     let sse = anthropic_sse(&events_fixture);
 
-    let model = model_of("anthropic/claude-haiku-4-5", "anthropic-messages", "anthropic");
+    let model = model_of(
+        "anthropic/claude-haiku-4-5",
+        "anthropic-messages",
+        "anthropic",
+    );
     let (events, request_line) = run_vector(&model, &user_ctx("Say hello."), sse).await;
     assert!(
         request_line.contains("/messages"),
@@ -780,7 +808,11 @@ async fn av5_anthropic_ignores_unknown_events_after_message_stop() {
     events_fixture.push(("proxy.stats", "not json".to_string()));
     let sse = anthropic_sse(&events_fixture);
 
-    let model = model_of("anthropic/claude-haiku-4-5", "anthropic-messages", "anthropic");
+    let model = model_of(
+        "anthropic/claude-haiku-4-5",
+        "anthropic-messages",
+        "anthropic",
+    );
     let (events, _) = run_vector(&model, &user_ctx("Say hello."), sse).await;
 
     // Upstream: stopReason "stop", content [text "Hello"], no error; usage
@@ -1076,7 +1108,11 @@ async fn ov6_openai_reasoning_details_attach_to_tool_call() {
             Expect::ToolcallDelta(0, "{\"path\":\"README.md\"}".to_string()),
             Expect::ToolcallEnd(0),
             Expect::Done(Terminal {
-                content: vec![tool_call_block("call_1", "read", json!({"path": "README.md"}))],
+                content: vec![tool_call_block(
+                    "call_1",
+                    "read",
+                    json!({"path": "README.md"}),
+                )],
                 stop: StopReason::ToolUse,
                 error_message: None,
                 usage: usage_of(0, 0, 0),
@@ -1139,9 +1175,11 @@ async fn gv1_google_malformed_function_call_is_error() {
 /// errors" (SAFETY). PASS since adapter fix AB-1.
 ///
 /// Upstream drives this through the google-vertex transport; the wire shape
-/// (GenerateContentResponse SSE) is identical, and genai 0.6.5 has a single
-/// Gemini adapter, so the vertex leg collapses onto the gemini wire here —
-/// documented in SEAM-VECTORS.md.
+/// (GenerateContentResponse SSE) is identical. genai 0.6.5 does have a
+/// dedicated Vertex adapter (`AdapterKind::Vertex`), but grain routes all
+/// google models through the gemini namespace (`ProviderRouter`:
+/// `google → gemini`), so at this seam the vertex leg collapses onto the
+/// gemini wire — documented in SEAM-VECTORS.md.
 #[tokio::test]
 async fn gv2_google_vertex_safety_is_error() {
     let sse = gemini_sse(&[json!({
@@ -1154,7 +1192,11 @@ async fn gv2_google_vertex_safety_is_error() {
         }
     })]);
 
-    let model = model_of("google/gemini-3-flash-preview", "google-vertex", "google-vertex");
+    let model = model_of(
+        "google/gemini-3-flash-preview",
+        "google-vertex",
+        "google-vertex",
+    );
     let (events, _) = run_vector(&model, &user_ctx("hello"), sse).await;
 
     assert_events(

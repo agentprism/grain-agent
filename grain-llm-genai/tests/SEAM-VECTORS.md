@@ -12,7 +12,7 @@ standard.
 ## 1. Chain under test
 
 ```
-recorded provider SSE (upstream fixture, byte-faithful)
+recorded provider SSE (upstream fixture, frame-faithful)
   → local mock HTTP endpoint (tests/seam_vectors.rs::serve_sse_once)
   → genai 0.6.5 real client + provider streamer   (production code)
   → genai ChatStreamEvents                        (the seam)
@@ -24,18 +24,25 @@ Only the endpoint URL and auth are overridden (via genai's
 `ServiceTargetResolver` / `AuthResolver`, the same hooks production
 `GenaiStreamBuilder` uses). Adapter selection, URL construction, request
 building, SSE parsing, and stream accumulation are all real genai code;
-each vector asserts the request line (`POST /messages`,
-`POST /chat/completions`,
-`POST /models/<m>:streamGenerateContent?alt=sse`) to prove it.
+one representative vector per adapter family (4 of 13: AV-1 and AV-4 for
+anthropic, OV-1 for openai, GV-1 for gemini) asserts the request line
+(`POST /messages`, `POST /chat/completions`,
+`POST /models/<m>:streamGenerateContent?alt=sse`) to prove it — the other
+vectors share the same adapter paths.
 
 Wire reconstruction: upstream's Anthropic fixtures are already raw SSE and
-are served **byte-faithfully** (including the absence of a trailing blank
-line — genai's splitter must flush the final `message_stop` on EOF, and
-does). Upstream's OpenAI and Google fixtures mock the SDK layer with
-wire-shaped chunk objects; the SDKs parse SSE `data:` frames 1:1 into those
-objects, so the reconstruction (`data: <chunk>` frames, plus the
-`data: [DONE]` sentinel the OpenAI SDK consumes internally) is the exact
-production wire format.
+are served **frame-faithfully** — same event framing, same
+`event:`/`data:` lines, same absence of a trailing blank line (genai's
+splitter must flush the final `message_stop` on EOF, and does). Frame
+payloads rebuilt with `serde_json::json!` carry alphabetized object keys
+(serde_json without `preserve_order`), which is semantically identical
+JSON; the one payload where byte order/content is load-bearing — AV-1's
+malformed `content_block_delta`, whose brokenness IS the fixture — is a
+raw string and **byte-exact**. Upstream's OpenAI and Google fixtures mock
+the SDK layer with wire-shaped chunk objects; the SDKs parse SSE `data:`
+frames 1:1 into those objects, so the reconstruction (`data: <chunk>`
+frames, plus the `data: [DONE]` sentinel the OpenAI SDK consumes
+internally) is the exact production wire format.
 
 ## 2. Event-mapping table (upstream → grain)
 
@@ -64,8 +71,8 @@ Grain protocol: `grain-agent-core::AssistantMessageEvent`.
 | `rawStopReason` | — none | **AB-R1** (info crosses genai; grain drops it) |
 | `errorMessage` | `error_message` | mapped |
 | `usage.input` (cache-**exclusive**) | `usage.input` (cache-**inclusive**, see `Cost::cost_for`) | convention differs; numerically equal whenever cache counters are 0 (all vectors here) |
-| `usage.output/cacheRead/cacheWrite/totalTokens` | `output/cache_read/cache_write/total_tokens` | mapped (total via AB-2 fallback when the wire omits it) |
-| `usage.reasoning` | — none | **AB-R2** (crosses genai via `completion_tokens_details.reasoning_tokens`) |
+| `usage.output/cacheRead/cacheWrite/totalTokens` | `output/cache_read/cache_write/total_tokens` | mapped (total via AB-2 fallback when the wire omits it; see AB-2 divergence notes in §5) |
+| `usage.reasoning` | `usage.reasoning: Option<u64>` | mapped (**AB-R2 closed** after the WP4 rebase gave grain the field). Nuance: genai's `zero_as_none` deserialization turns a wire `reasoning_tokens: 0` into `None`, so upstream's `Some(0)` for openai-completions/google is not reproducible — wire zero and absent field are indistinguishable at this seam |
 | `responseId` | — none | **S-2** |
 | `responseModel` | — none | **S-6** |
 | `model`/`api`/`provider` | same names | grain echoes its own namespaced config (`anthropic/claude-…`); excluded from comparison |
@@ -74,13 +81,21 @@ Grain protocol: `grain-agent-core::AssistantMessageEvent`.
 Stop-reason resolution at the seam (adapter fix AB-1,
 `src/mapping/inbound.rs::resolve_stop_reason`): genai's
 `StreamEnd::captured_stop_reason` preserves the raw provider string inside
-each variant; grain maps `Completed/StopSequence → Stop` (with the
-Gemini-parity `→ ToolUse` override when tool calls streamed),
+each variant; grain maps `Completed/StopSequence → Stop`,
 `MaxTokens → Length`, `ToolCall → ToolUse`, `ContentFilter/Other → Error`
 with upstream-parity messages (`Provider finish_reason: <raw>` for
 `openai*` APIs, `Provider stopped with: <raw>` otherwise;
-`Other("pause_turn") → Stop` and `Other("refusal")` → anthropic's
-no-details refusal message, per upstream `mapStopReason` tables).
+`Other("pause_turn") → Stop` unconditionally and `Other("refusal")` →
+anthropic's no-details refusal message, per upstream `mapStopReason`
+tables). The tool-call `→ ToolUse` override on `Completed/StopSequence` is
+scoped to the google API family exactly as upstream scopes it
+(`google-generative-ai.ts:231-235`, `google-vertex.ts:231-235`); anthropic
+and openai map `end_turn`/`stop`/`stop_sequence` to `Stop` verbatim even
+with tool-call content streamed — we mirror upstream per provider rather
+than generalizing over it. Pinned by unit tests in `tests/inbound.rs`
+(`gemini_completed_with_tool_calls_overrides_to_tool_use`,
+`anthropic_end_turn_with_tool_calls_stays_stop`,
+`captured_pause_turn_is_resubmittable_stop`).
 
 ## 3. Comparison scope
 
@@ -124,7 +139,7 @@ explicit `structural gap` panic naming the unrepresentable field.
 | OV-5 | openai-completions | `openai-completions-response-model.test.ts` | ignores empty or missing chunk.model | **PASS** | Two text deltas aggregate; usage total 3 via AB-2 |
 | OV-6 | openai-completions (openrouter-flavored) | `openai-completions-reasoning-details.test.ts` | preserves reasoning_details that arrive before their matching tool call | **STRUCTURAL** | S-7: `delta.reasoning_details` never crosses genai; grain `ToolCall` has no signature slot. Representable remainder (toolcall events, args, toolUse stop) passes |
 | GV-1 | google-generative-ai | `google-raw-stop-reason.test.ts` | preserves raw Gemini finish reasons for Google Generative AI errors (`MALFORMED_FUNCTION_CALL`) | **PASS** | Fixed by AB-1 (was: silent `Done/Stop`). Error + `Provider stopped with: MALFORMED_FUNCTION_CALL`, usage 1/0/1 exact. `rawStopReason` → AB-R1 |
-| GV-2 | google-vertex | `google-raw-stop-reason.test.ts` | preserves raw Gemini finish reasons for Google Vertex errors (`SAFETY`) | **PASS** | Fixed by AB-1. Upstream drives this through the vertex transport; the wire (GenerateContentResponse SSE) is identical and genai 0.6.5 has a single Gemini adapter, so the vertex leg collapses onto the gemini wire here |
+| GV-2 | google-vertex | `google-raw-stop-reason.test.ts` | preserves raw Gemini finish reasons for Google Vertex errors (`SAFETY`) | **PASS** | Fixed by AB-1. Upstream drives this through the vertex transport; the wire (GenerateContentResponse SSE) is identical. genai 0.6.5 does have a dedicated Vertex adapter (`AdapterKind::Vertex`) — the collapse onto the gemini wire is grain's routing (`ProviderRouter`: `google → gemini`; no grain models route to the Vertex adapter today) |
 
 ## 5. Summary
 
@@ -150,9 +165,28 @@ Adapter bugs found while building the vectors:
   components. Fixed in `src/mapping/usage.rs` (fallback
   `input + output + cache_write`, respecting grain's cache-inclusive
   `input` convention; a provider-supplied total still wins). Cited by
-  OV-4, OV-5.
+  OV-4, OV-5. Known divergences from upstream, accepted and documented:
+  - the fallback adds `cache_write` on top of `input`; for a provider that
+    already reports cache-write tokens *inside* `prompt_tokens`, the
+    fallback overcounts by that share (upstream computes from its
+    cache-exclusive components and cannot). No vector at the pin exercises
+    a nonzero `cache_write`;
+  - grain lets a nonzero provider-supplied total win, whereas upstream's
+    openai-completions path *always* computes
+    `totalTokens = input + output + cacheRead + cacheWrite` and ignores
+    any wire total. A provider whose wire total disagrees with its
+    components will differ across the seam.
+- **AB-R2 (closed on rebase)** — `usage.reasoning` was dropped: the count
+  crosses genai (`completion_tokens_details.reasoning_tokens`; the Gemini
+  adapter even normalizes `thoughtsTokenCount` into it) but grain's
+  `Usage` had no field at the time of measurement. The WP4 merge added
+  `Usage::reasoning: Option<u64>`; now wired through in `map_usage`
+  (unit-tested in `tests/inbound.rs`). Residual nuance: genai's
+  `zero_as_none` turns a wire `reasoning_tokens: 0` into `None`, so
+  upstream's `Some(0)` is not reproducible. Not asserted by any vector at
+  the pin (fixtures carry 0).
 
-**Reported, not fixed (require grain-agent-core type changes, out of
+**Reported, not fixed (requires a grain-agent-core type change, out of
 adapter scope):**
 
 - **AB-R1** — `rawStopReason` is dropped. The raw provider string *does*
@@ -163,11 +197,6 @@ adapter scope):**
   core-type change (every struct literal in the workspace + the pi-compat
   serialization surface). Upstream asserts it on OV-1, OV-2, AV-2, AV-3,
   GV-1, GV-2.
-- **AB-R2** — `usage.reasoning` is dropped. Reasoning-token counts cross
-  genai (`completion_tokens_details.reasoning_tokens`; the Gemini adapter
-  even normalizes `thoughtsTokenCount` into it) but grain's `Usage` has no
-  field. Not asserted by any vector at the pin (fixtures carry 0), but the
-  info-flow gap is real.
 
 ## 6. Structural gap list
 
@@ -248,9 +277,18 @@ stream-parsing fixture at the pin is used. Not used, and why:
   `azure-openai-responses-*.test.ts` — OpenAI **Responses** API event
   protocol. grain-llm-genai routes no models to genai's `OpenAIResp`
   adapter today; out of the WP5 minimum scope.
-- `mistral-raw-stop-reason.test.ts`, `bedrock-raw-stop-reason.test.ts`,
-  `cloudflare-stream.test.ts`, `xai-responses.test.ts` — providers outside
-  the WP5 minimum (bedrock/cloudflare have no genai adapter at all).
+- `mistral-raw-stop-reason.test.ts`, `cloudflare-stream.test.ts` —
+  providers outside the WP5 minimum, and genai 0.6.5 has no Mistral or
+  Cloudflare adapter at all.
+- `bedrock-raw-stop-reason.test.ts` — provider outside the WP5 minimum.
+  genai 0.6.5 *does* have Bedrock Converse adapters
+  (`AdapterKind::BedrockApi` / `BedrockSigv4`), but grain-llm-genai routes
+  no models to them today, and the upstream fixture mocks the AWS SDK's
+  Converse-stream object layer (`messageStart`/`messageStop` events), not
+  recorded wire data.
+- `xai-responses.test.ts` — xAI via the OpenAI **Responses** API
+  (`response.completed` events): same Responses-protocol exclusion as
+  `openai-responses-*` above, and outside the WP5 minimum.
 - `stream.test.ts`, `text.test.ts`, `interleaved-thinking.test.ts`,
   `unicode-surrogate.test.ts`, `tool-call-id-normalization.test.ts`,
   `overflow.test.ts`, `abort.test.ts`, cross-provider handoff/e2e suites —

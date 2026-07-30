@@ -63,7 +63,14 @@ fn end_normal() -> ChatStreamEvent {
 fn run(
     events: impl IntoIterator<Item = ChatStreamEvent>,
 ) -> (Vec<AssistantMessageEvent>, InboundState) {
-    let mut state = InboundState::new(&model());
+    run_with_model(&model(), events)
+}
+
+fn run_with_model(
+    model: &Model,
+    events: impl IntoIterator<Item = ChatStreamEvent>,
+) -> (Vec<AssistantMessageEvent>, InboundState) {
+    let mut state = InboundState::new(model);
     let mut all = Vec::new();
     for ev in events {
         all.extend(state.on_event(ev));
@@ -774,18 +781,73 @@ fn captured_completed_maps_to_stop() {
     }
 }
 
+fn google_model() -> Model {
+    Model {
+        id: "google/gemini-2.5-flash".into(),
+        name: "Gemini 2.5 Flash".into(),
+        api: "google-generative-ai".into(),
+        provider: "google".into(),
+        ..Default::default()
+    }
+}
+
 #[test]
-fn captured_completed_with_tool_calls_overrides_to_tool_use() {
-    // Gemini reports STOP alongside functionCall parts; upstream
-    // google-generative-ai.ts forces toolUse when tool calls are present.
+fn gemini_completed_with_tool_calls_overrides_to_tool_use() {
+    // Upstream scopes the tool-call override to the google modules ONLY
+    // (google-generative-ai.ts:231-235, google-vertex.ts:231-235): Gemini
+    // reports STOP alongside functionCall parts, so toolUse is forced.
+    use genai::chat::StopReason as G;
+    let (events, _) = run_with_model(
+        &google_model(),
+        [
+            ChatStreamEvent::Start,
+            tool_call("call_1", "echo", serde_json::json!({"value": "ping"})),
+            end_with_stop(G::Completed("STOP".into())),
+        ],
+    );
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::ToolUse);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn gemini_wire_name_api_also_gets_the_override() {
+    // grain production populates Model::api from ApiKind::Gemini's wire
+    // name "gemini" (grain-llm-models descriptor), not upstream's
+    // "google-generative-ai" — both must scope into the override.
+    use genai::chat::StopReason as G;
+    let mut m = google_model();
+    m.api = "gemini".into();
+    let (events, _) = run_with_model(
+        &m,
+        [
+            ChatStreamEvent::Start,
+            tool_call("call_1", "echo", serde_json::json!({"value": "ping"})),
+            end_with_stop(G::Completed("STOP".into())),
+        ],
+    );
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::ToolUse);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn anthropic_end_turn_with_tool_calls_stays_stop() {
+    // anthropic-messages.ts mapStopReason: end_turn → stop, verbatim —
+    // upstream does NOT apply the google tool-call override outside the
+    // google modules, and neither do we (fidelity over generalization).
     use genai::chat::StopReason as G;
     let (events, _) = run([
         ChatStreamEvent::Start,
-        tool_call("call_1", "echo", serde_json::json!({"value": "ping"})),
-        end_with_stop(G::Completed("STOP".into())),
+        tool_call("toolu_1", "echo", serde_json::json!({"value": "ping"})),
+        end_with_stop(G::Completed("end_turn".into())),
     ]);
     if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
-        assert_eq!(result.stop_reason, StopReason::ToolUse);
+        assert_eq!(result.stop_reason, StopReason::Stop);
     } else {
         panic!("expected Done, got {:?}", events.last());
     }
@@ -821,7 +883,10 @@ fn captured_content_filter_yields_error_terminal_with_upstream_phrasing() {
         AssistantMessageEvent::Error { error, result } => {
             assert_eq!(error, "Provider stopped with: SAFETY");
             assert_eq!(result.stop_reason, StopReason::Error);
-            assert_eq!(result.error_message.as_deref(), Some("Provider stopped with: SAFETY"));
+            assert_eq!(
+                result.error_message.as_deref(),
+                Some("Provider stopped with: SAFETY")
+            );
             // Accumulated content is preserved on the error terminal
             // (upstream's error event carries the partial message).
             assert_eq!(result.content.len(), 1);
@@ -832,11 +897,13 @@ fn captured_content_filter_yields_error_terminal_with_upstream_phrasing() {
 
 #[test]
 fn captured_pause_turn_is_resubmittable_stop() {
-    // anthropic-messages.ts mapStopReason: pause_turn → stop.
+    // anthropic-messages.ts mapStopReason: pause_turn → stop,
+    // unconditionally — even with tool-call content streamed, upstream's
+    // table does not consult content. Pinned with a tool call present.
     use genai::chat::StopReason as G;
     let (events, _) = run([
         ChatStreamEvent::Start,
-        chunk("thinking about it"),
+        tool_call("toolu_1", "echo", serde_json::json!({"value": "ping"})),
         end_with_stop(G::Other("pause_turn".into())),
     ]);
     if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
@@ -851,7 +918,10 @@ fn captured_refusal_uses_upstream_default_message() {
     // genai never parses stop_details (structural gap S-4), so only
     // upstream's no-details default message is reachable.
     use genai::chat::StopReason as G;
-    let (events, _) = run([ChatStreamEvent::Start, end_with_stop(G::Other("refusal".into()))]);
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        end_with_stop(G::Other("refusal".into())),
+    ]);
     match events.last().unwrap() {
         AssistantMessageEvent::Error { error, result } => {
             assert_eq!(error, "The model refused to complete the request");
@@ -915,6 +985,56 @@ fn usage_provider_supplied_total_wins_over_fallback() {
     let (events, _) = run([ChatStreamEvent::Start, chunk("hi"), end]);
     if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
         assert_eq!(result.usage.total_tokens, 99);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn usage_reasoning_tokens_map_into_grain_reasoning_field() {
+    // WP5 AB-R2, closed after the WP4 rebase gave grain's Usage a
+    // `reasoning` field: genai's completion_tokens_details.reasoning_tokens
+    // maps through as Option. genai's zero_as_none deserialization means a
+    // wire `reasoning_tokens: 0` arrives here as None — indistinguishable
+    // from an absent breakdown (documented in map_usage).
+    let usage = genai::chat::Usage {
+        prompt_tokens: Some(10),
+        completion_tokens: Some(50),
+        total_tokens: Some(60),
+        completion_tokens_details: Some(genai::chat::CompletionTokensDetails {
+            reasoning_tokens: Some(40),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let end = ChatStreamEvent::End(StreamEnd {
+        captured_usage: Some(usage),
+        ..StreamEnd::default()
+    });
+    let (events, _) = run([ChatStreamEvent::Start, chunk("hi"), end]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.usage.reasoning, Some(40));
+        assert_eq!(result.usage.output, 50, "reasoning is a subset of output");
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn usage_without_reasoning_breakdown_leaves_reasoning_none() {
+    let usage = genai::chat::Usage {
+        prompt_tokens: Some(10),
+        completion_tokens: Some(5),
+        total_tokens: Some(15),
+        ..Default::default()
+    };
+    let end = ChatStreamEvent::End(StreamEnd {
+        captured_usage: Some(usage),
+        ..StreamEnd::default()
+    });
+    let (events, _) = run([ChatStreamEvent::Start, chunk("hi"), end]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.usage.reasoning, None);
     } else {
         panic!("expected Done, got {:?}", events.last());
     }

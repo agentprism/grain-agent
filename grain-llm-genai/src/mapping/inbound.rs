@@ -523,20 +523,26 @@ impl StopResolution {
 ///
 /// | genai variant           | grain outcome                                        |
 /// |-------------------------|------------------------------------------------------|
-/// | `Completed(_)`          | `Stop` (→ `ToolUse` when tool calls streamed)        |
-/// | `StopSequence(_)`       | `Stop` (upstream: "should never happen", maps stop)  |
+/// | `Completed(_)`          | `Stop`; google APIs only: → `ToolUse` when tool calls streamed |
+/// | `StopSequence(_)`       | `Stop` (upstream: "should never happen", maps stop; same google-only override) |
 /// | `MaxTokens(_)`          | `Length`                                             |
 /// | `ToolCall(_)`           | `ToolUse`                                            |
 /// | `ContentFilter(raw)`    | `Error` + provider-stop message                      |
-/// | `Other("pause_turn")`   | `Stop` (anthropic: resubmittable pause)              |
+/// | `Other("pause_turn")`   | `Stop`, unconditionally (anthropic: resubmittable pause) |
 /// | `Other("refusal")`      | `Error` + anthropic's no-details refusal message     |
 /// | `Other(raw)`            | `Error` + provider-stop message                      |
 /// | `None` (not captured)   | infer from content (pre-WP5 behavior)                |
 ///
-/// The `Stop` → `ToolUse` content override mirrors
-/// `google-generative-ai.ts` (Gemini reports `STOP` even when the chunk
-/// carried functionCall parts) and preserves this adapter's historical
-/// inference for providers genai reports as plain completion.
+/// The `Stop` → `ToolUse` content override is scoped to the google API
+/// family exactly as upstream scopes it: both google modules apply it
+/// after mapping the finish reason (`google-generative-ai.ts:231-235`,
+/// `google-vertex.ts:231-235` — Gemini reports `STOP` even when the chunk
+/// carried functionCall parts), while `anthropic-messages.ts` and
+/// `openai-completions.ts` trust the provider's reason verbatim —
+/// `end_turn` / `stop` / `stop_sequence` map to `stop` even if tool-call
+/// content streamed. We mirror upstream per provider rather than
+/// generalizing the override, since the adapter knows the API family from
+/// the model descriptor.
 ///
 /// Error-message phrasing follows the upstream API family owning the
 /// vector: `openai-*` APIs phrase as `Provider finish_reason: <raw>`
@@ -560,15 +566,23 @@ fn resolve_stop_reason(
     match captured {
         GenaiStop::Completed(_) | GenaiStop::StopSequence(_) => {
             // Gemini reports `STOP` alongside functionCall parts; upstream
-            // forces toolUse whenever tool calls are present.
-            StopResolution::ok(infer_stop_reason(content))
+            // forces toolUse whenever tool calls are present — but ONLY in
+            // the two google modules. Anthropic/OpenAI map their completed
+            // reasons to `stop` verbatim, tool-call content or not.
+            if is_google_api(api) {
+                StopResolution::ok(infer_stop_reason(content))
+            } else {
+                StopResolution::ok(StopReason::Stop)
+            }
         }
         GenaiStop::MaxTokens(_) => StopResolution::ok(StopReason::Length),
         GenaiStop::ToolCall(_) => StopResolution::ok(StopReason::ToolUse),
         GenaiStop::ContentFilter(raw) => StopResolution::error(provider_stop_message(api, raw)),
         GenaiStop::Other(raw) => match raw.as_str() {
-            // anthropic-messages.ts: pause_turn → "stop is good enough, resubmit".
-            "pause_turn" => StopResolution::ok(infer_stop_reason(content)),
+            // anthropic-messages.ts: pause_turn → "stop is good enough,
+            // resubmit". Hard-mapped to Stop, no content inference —
+            // upstream's table is unconditional.
+            "pause_turn" => StopResolution::ok(StopReason::Stop),
             // anthropic-messages.ts: refusal → stopDetails.explanation ||
             // default message. genai never parses `stop_details`
             // (structural gap S-4), so only the default is reachable.
@@ -578,6 +592,16 @@ fn resolve_stop_reason(
             _ => StopResolution::error(provider_stop_message(api, raw)),
         },
     }
+}
+
+/// The google/Gemini API family — the only modules where upstream applies
+/// the tool-call `ToolUse` override after finish-reason mapping
+/// (`google-generative-ai.ts`, `google-vertex.ts`). Matches both upstream's
+/// api ids (`google-generative-ai`, `google-vertex`, `google`) and grain's
+/// production wire name (`grain_llm_models::ApiKind::Gemini` →
+/// `Model::api == "gemini"`).
+fn is_google_api(api: &str) -> bool {
+    api.starts_with("google") || api == "gemini"
 }
 
 /// Upstream-parity phrasing for error-class provider stop reasons. See
