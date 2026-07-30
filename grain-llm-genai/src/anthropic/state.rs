@@ -134,8 +134,23 @@ impl AnthropicState {
                 api: model.api.clone(),
                 provider: model.provider.clone(),
                 model: model.id.clone(),
+                // WP19 mechanical fill only, matching the sibling genai path
+                // in `mapping::inbound::empty_assistant`. This transport
+                // *does* capture both values (see `Self::response_id` /
+                // `Self::response_model`, populated from `message_start`),
+                // and WP19 has since added the slots to carry them — but
+                // landing them here is a live behavior change on a transport
+                // that is opt-in and not yet live-verified, so it stays with
+                // the transport owner (WP24) rather than riding in on a
+                // build fix. Wiring these three closes G12/G13.
+                response_id: None,
+                response_model: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                // Likewise: `Self::stop_reason` holds the provider's verbatim
+                // stop string and is exactly what this slot wants. Left None
+                // for the same reason as above.
+                raw_stop_reason: None,
                 error_message: None,
                 error_code: None,
                 timestamp: now_ms(),
@@ -294,6 +309,11 @@ impl AnthropicState {
                     id: str_at(block, "id").unwrap_or_default().to_string(),
                     name: str_at(block, "name").unwrap_or_default().to_string(),
                     arguments: Value::Object(Default::default()),
+                    // Anthropic does not emit a thought signature on the tool
+                    // call itself (it carries one on `thinking` blocks, which
+                    // this transport already maps to `ThinkingContent`), so
+                    // there is genuinely nothing to supply here.
+                    thought_signature: None,
                 }));
                 let idx = self.blocks.len() - 1;
                 self.open.insert(wire_index, OpenBlock::ToolCall(idx));
