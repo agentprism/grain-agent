@@ -2014,6 +2014,7 @@ fn rhai_before_tool_call_hook(
                             return Ok(Some(BeforeToolCallResult {
                                 block: true,
                                 reason: Some(reason),
+                                ..Default::default()
                             }));
                         }
                     }

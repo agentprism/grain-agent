@@ -146,6 +146,7 @@ pub fn before_tool_call_hook(registry: Arc<HookRegistry>) -> Option<BeforeToolCa
                     return Ok(Some(BeforeToolCallResult {
                         block: true,
                         reason: Some(reason),
+                        ..Default::default()
                     }));
                 }
             }

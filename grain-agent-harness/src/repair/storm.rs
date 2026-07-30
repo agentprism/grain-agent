@@ -104,6 +104,7 @@ fn decide_storm(
         Some(BeforeToolCallResult {
             block: true,
             reason: Some(reason),
+            ..Default::default()
         })
     } else {
         None

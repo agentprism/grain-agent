@@ -381,10 +381,11 @@ async fn does_not_execute_tool_calls_from_length_truncated_message() {
 ///
 /// Upstream mutates the shared `args` object inside `beforeToolCall`, and the
 /// tool then executes with the mutated value (no revalidation). The Rust hook
-/// receives a cloned `args` value and `BeforeToolCallResult` has no channel to
-/// return rewritten args (patch-3), so the rewrite is currently lost.
+/// receives a cloned `args` value, so the rewrite goes through the explicit
+/// `BeforeToolCallResult::args` override channel (patch-3). The tool schema
+/// requires `value` to be a string; the hook rewrites it to the number `123`
+/// and `execute` observes `123` — proof that no second validation pass runs.
 #[tokio::test]
-#[ignore = "patch-3: beforeToolCall cannot rewrite args"]
 async fn executes_mutated_before_tool_call_args_without_revalidation() {
     let executed: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
     let executed_capture = executed.clone();
@@ -420,13 +421,15 @@ async fn executes_mutated_before_tool_call_args_without_revalidation() {
     let mut config = AgentLoopConfig::new(create_model(), identity_converter());
     config.before_tool_call = Some(Arc::new(|ctx, _cancel| {
         Box::pin(async move {
-            // Upstream: `args.value = 123` on the shared object. The closest
-            // Rust expression mutates the received copy; the assertion below
-            // pins the upstream semantic (execute sees the rewritten value).
+            // Upstream: `args.value = 123` on the shared object
+            // (agent-loop.test.ts:471-475). The Rust equivalent returns the
+            // rewritten args through the override channel.
             let mut args = ctx.args.clone();
             args["value"] = json!(123);
-            let _ = args;
-            Ok(None)
+            Ok(Some(grain_agent_core::BeforeToolCallResult {
+                args: Some(args),
+                ..Default::default()
+            }))
         })
     }));
 

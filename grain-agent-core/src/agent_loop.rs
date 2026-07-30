@@ -50,6 +50,17 @@ pub struct BeforeToolCallContext {
 pub struct BeforeToolCallResult {
     pub block: bool,
     pub reason: Option<String>,
+    /// Replacement tool arguments.
+    ///
+    /// Upstream `beforeToolCall` receives the validated `args` object by
+    /// reference and may mutate it in place; the tool then executes with the
+    /// mutated arguments **without revalidation** (prepareToolCall keeps the
+    /// same `validatedArgs` object, agent-loop.ts:619-656; pinned by the
+    /// upstream "should execute mutated beforeToolCall args without
+    /// revalidation" test). Rust hooks receive a clone, so the rewrite is an
+    /// explicit override channel: `Some(new_args)` replaces the prepared
+    /// arguments as-is — no second validation pass.
+    pub args: Option<serde_json::Value>,
 }
 
 /// Pre-tool-execution hook.
@@ -997,7 +1008,7 @@ async fn prepare_tool_call(
         Ok(v) => v,
         Err(e) => return Preparation::Immediate(AgentToolResult::error(e.to_string()), true),
     };
-    let validated_args = match tool.validate_arguments(prepared_args) {
+    let mut validated_args = match tool.validate_arguments(prepared_args) {
         Ok(v) => v,
         Err(e) => return Preparation::Immediate(AgentToolResult::error(e.to_string()), true),
     };
@@ -1022,13 +1033,19 @@ async fn prepare_tool_call(
         if cancel.is_cancelled() {
             return Preparation::Immediate(AgentToolResult::error("Operation aborted"), true);
         }
-        if let Some(result) = outcome
-            && result.block
-        {
-            let reason = result
-                .reason
-                .unwrap_or_else(|| "Tool execution was blocked".into());
-            return Preparation::Immediate(AgentToolResult::error(reason), true);
+        if let Some(result) = outcome {
+            if result.block {
+                let reason = result
+                    .reason
+                    .unwrap_or_else(|| "Tool execution was blocked".into());
+                return Preparation::Immediate(AgentToolResult::error(reason), true);
+            }
+            // patch-3 args-override channel: upstream mutates the shared
+            // `validatedArgs` object in place and the tool executes with the
+            // mutated value without revalidation (agent-loop.ts:619-656).
+            if let Some(new_args) = result.args {
+                validated_args = new_args;
+            }
         }
     }
 
