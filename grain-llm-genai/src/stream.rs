@@ -105,14 +105,27 @@ impl GenaiStream {
 ///   onto genai's `ReasoningEffort` variants 1:1 by name; see
 ///   [`thinking_level_to_effort`]).
 ///
-/// **Not yet honored** (the genai 0.5 API doesn't expose per-call slots
-/// for these, so wiring them up requires a fuller refactor of the client
-/// builder; see the M-2 code-review entry):
+/// **Always enforced**, regardless of what the builder-provided base
+/// options say:
+/// - `capture_usage`: the `LlmStream` terminal contract maps
+///   `StreamEnd::captured_usage` into the final message's `Usage`; without
+///   the flag genai never populates it.
+/// - `capture_tool_calls`: genai 0.6.5's OpenAI streamer only merges
+///   tool-call fragments into id-stable cumulative chunks when this is on
+///   (`adapter/adapters/openai/streamer.rs::capture_tool_call`); with it
+///   off, follow-up fragments arrive under a synthetic `call_{index}` id
+///   and the inbound accumulator would treat them as new calls.
+///
+/// **Not yet honored** (verified against genai 0.6.5: `ChatOptions` has no
+/// per-call slots for these — auth goes through the client-build-time
+/// `AuthResolver`, and transport/retry config is fixed on the client — so
+/// wiring them up requires a fuller refactor of the client builder; see the
+/// M-2 code-review entry):
 /// - `api_key`: would need a dynamic auth resolver per-call.
 /// - `session_id` / `transport`: provider-specific transport knobs.
 /// - `max_retry_delay_ms`: WebConfig is set at client build time.
 fn chat_options_with_runtime(base: ChatOptions, options: &StreamOptions) -> ChatOptions {
-    let mut chat = base;
+    let mut chat = base.with_capture_usage(true).with_capture_tool_calls(true);
     if let Some(level) = options.reasoning
         && let Some(effort) = thinking_level_to_effort(level)
     {
@@ -136,10 +149,11 @@ fn chat_options_with_runtime(base: ChatOptions, options: &StreamOptions) -> Chat
 /// genai additionally offers `ReasoningEffort::Max` and
 /// `ReasoningEffort::Budget(u32)`, which have no grain-side counterpart
 /// yet — they stay unmapped until a later WP adds the corresponding
-/// `ThinkingLevel` variants. (The historical `XHigh` → `High` collapse
-/// dated from genai 0.5, which had no band above `High`; genai 0.6
-/// supports `XHigh` natively, so the user's intent now passes through
-/// unchanged.)
+/// `ThinkingLevel` variants. (The historical `XHigh` → `High` collapse was
+/// stale adapter code: every genai release this adapter has pinned —
+/// 0.6.0-beta.20 onward — already had `ReasoningEffort::XHigh`, so the
+/// collapse silently downgraded the user's intent for no reason. It was
+/// removed in the 0.6.5 migration; `XHigh` now passes through unchanged.)
 ///
 /// Forward-compat note: the genai 0.7 line renames `ReasoningEffort::None`
 /// to `ReasoningEffort::Zero` (with `#[serde(alias = "None")]`), so on that
@@ -187,6 +201,14 @@ impl LlmStream for GenaiStream {
         let model_for_state = model.clone();
         let inner = stream_resp.stream;
 
+        // Terminal contract audit (WP3): every exit from the loop below
+        // yields exactly one terminal event carrying the assistant message —
+        // `Done` from the state machine on `ChatStreamEvent::End`, or an
+        // `Error` synthesized via `into_aborted` / `into_error_msg`, both of
+        // which preserve all content accumulated so far (mirroring upstream
+        // pi-ai, whose error event carries the partial AssistantMessage).
+        // The transport-failure path above returns a one-shot Error stream
+        // with an empty (nothing streamed yet) message for the same reason.
         let out = async_stream::stream! {
             let mut state = InboundState::new(&model_for_state);
             let mut inner = inner;
@@ -232,5 +254,50 @@ impl LlmStream for GenaiStream {
         };
 
         Ok(Box::pin(out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_options_enforce_usage_and_tool_call_capture() {
+        // Even when a caller supplies bare ChatOptions via the builder
+        // (dropping the baseline capture flags), the per-request projection
+        // must re-enable the captures the adapter's correctness depends on.
+        let bare = ChatOptions::default();
+        let projected = chat_options_with_runtime(bare, &StreamOptions::default());
+        assert_eq!(projected.capture_usage, Some(true));
+        assert_eq!(projected.capture_tool_calls, Some(true));
+    }
+
+    #[test]
+    fn runtime_options_override_explicit_false_capture_flags() {
+        // A builder-supplied ChatOptions that explicitly disables the
+        // capture flags (Some(false), not merely unset) must still be
+        // overridden — the terminal-usage contract and the cumulative
+        // tool-chunk accumulator are not opt-outs.
+        let base = ChatOptions::default()
+            .with_capture_usage(false)
+            .with_capture_tool_calls(false);
+        let projected = chat_options_with_runtime(base, &StreamOptions::default());
+        assert_eq!(projected.capture_usage, Some(true));
+        assert_eq!(projected.capture_tool_calls, Some(true));
+    }
+
+    #[test]
+    fn runtime_options_map_thinking_level() {
+        let projected = chat_options_with_runtime(
+            ChatOptions::default(),
+            &StreamOptions {
+                reasoning: Some(ThinkingLevel::XHigh),
+                ..StreamOptions::default()
+            },
+        );
+        assert!(matches!(
+            projected.reasoning_effort,
+            Some(ReasoningEffort::XHigh)
+        ));
     }
 }
