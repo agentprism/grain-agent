@@ -443,15 +443,23 @@ async fn run_loop(
             has_more_tool_calls = false;
 
             if !tool_calls.is_empty() {
-                let batch = execute_tool_calls(
-                    context,
-                    &assistant,
-                    tool_calls,
-                    config,
-                    &emit,
-                    cancel.clone(),
-                )
-                .await;
+                // agent-loop.ts:208-214 — a "length" stop means the output
+                // was cut off by the token limit, so every tool call in the
+                // message may carry truncated arguments. Fail them all
+                // instead of executing potentially borked calls.
+                let batch = if assistant.stop_reason == StopReason::Length {
+                    fail_tool_calls_from_truncated_message(tool_calls, &emit).await
+                } else {
+                    execute_tool_calls(
+                        context,
+                        &assistant,
+                        tool_calls,
+                        config,
+                        &emit,
+                        cancel.clone(),
+                    )
+                    .await
+                };
                 tool_results = batch.messages;
                 has_more_tool_calls = !batch.terminate;
 
@@ -762,6 +770,51 @@ struct FinalizedCall {
     tool_call: ToolCall,
     result: AgentToolResult,
     is_error: bool,
+}
+
+/// Fail all tool calls from an assistant message that was truncated by the
+/// output token limit.
+///
+/// Port of `failToolCallsFromTruncatedMessage` (agent-loop.ts:374-406):
+/// streamed tool-call arguments are finalized with a best-effort JSON
+/// salvage parser, so a truncated message can yield tool calls whose
+/// arguments parse and validate but are silently incomplete. None of them
+/// are safe to execute; report each as an error so the model can re-issue
+/// them. The batch never terminates the loop.
+async fn fail_tool_calls_from_truncated_message(
+    tool_calls: Vec<ToolCall>,
+    emit: &EventSink,
+) -> ExecutedBatch {
+    let mut messages: Vec<ToolResultMessage> = Vec::new();
+    for tool_call in tool_calls {
+        emit_now(
+            emit,
+            AgentEvent::ToolExecutionStart {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                args: tool_call.arguments.clone(),
+            },
+        )
+        .await;
+        // Exact upstream copy (agent-loop.ts:396).
+        let finalized = FinalizedCall {
+            result: AgentToolResult::error(format!(
+                "Tool call \"{}\" was not executed: the response hit the output token limit, \
+                 so its arguments may be truncated. Re-issue the tool call with complete arguments.",
+                tool_call.name
+            )),
+            is_error: true,
+            tool_call,
+        };
+        emit_tool_execution_end(&finalized, emit).await;
+        let trm = make_tool_result_message(&finalized);
+        emit_tool_result_message(&trm, emit).await;
+        messages.push(trm);
+    }
+    ExecutedBatch {
+        messages,
+        terminate: false,
+    }
 }
 
 async fn execute_tool_calls(

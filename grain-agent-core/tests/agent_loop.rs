@@ -310,7 +310,6 @@ async fn handles_tool_calls_and_results() {
 
 /// TS: "should not execute tool calls from a length-truncated assistant message"
 #[tokio::test]
-#[ignore = "patch-6: stopReason==\"length\" does not fail the tool batch"]
 async fn does_not_execute_tool_calls_from_length_truncated_message() {
     let executed: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
     let context = AgentContext {
