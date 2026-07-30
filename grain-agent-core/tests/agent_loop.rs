@@ -1555,12 +1555,11 @@ async fn continue_allows_custom_message_as_last_message() {
 
 /// Upstream's `createUserMessage` fixture produces `{ role: "user",
 /// content: "<string>", timestamp }` — string content is a first-class
-/// `UserMessage` shape in pi-ai and every loop test runs on it. The Rust
-/// `UserMessage` only accepts structured content, so deserializing the
-/// upstream wire shape falls through `AgentMessage`'s untagged enum into
-/// `Custom` and the default converter then drops it.
+/// `UserMessage` shape in pi-ai (types.ts:393-397) and every loop test runs
+/// on it. Patch-7 normalizes the string form into a single text block on
+/// deserialization instead of letting it fall through `AgentMessage`'s
+/// untagged enum into `Custom`.
 #[test]
-#[ignore = "patch-7: UserMessage string content falls through to Custom and is dropped"]
 fn user_message_string_content_wire_format() {
     let wire = json!({
         "role": "user",
@@ -1572,4 +1571,10 @@ fn user_message_string_content_wire_format() {
         matches!(parsed, AgentMessage::Standard(Message::User(_))),
         "string-content user message must deserialize as a standard user message, got {parsed:?}"
     );
+    // The string normalizes to the structured single-text-block form.
+    let AgentMessage::Standard(Message::User(user)) = &parsed else {
+        unreachable!()
+    };
+    assert_eq!(user.content, vec![UserContent::text("Hello")]);
+    assert_eq!(user.timestamp, 1700000000000i64);
 }

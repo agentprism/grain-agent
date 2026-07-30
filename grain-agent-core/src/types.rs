@@ -214,8 +214,38 @@ pub enum QueueMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct UserMessage {
+    /// Message content blocks.
+    ///
+    /// The upstream wire format admits `content: string |
+    /// (TextContent | ImageContent)[]` (pi-ai types.ts:393-397): a bare
+    /// string is a first-class user-message shape and deserializes as a
+    /// single text block; a missing/null content normalizes to `[]`
+    /// (upstream's `content ?? []` treatment). Serialization always emits
+    /// the structured array form, which upstream equally accepts.
+    #[serde(default, deserialize_with = "deserialize_user_content_list")]
     pub content: Vec<UserContent>,
     pub timestamp: i64,
+}
+
+/// Deserializer for [`UserMessage::content`]: accepts a bare string, the
+/// structured block array, or null (patch-7; upstream wire format per pi-ai
+/// types.ts:395).
+fn deserialize_user_content_list<'de, D>(deserializer: D) -> Result<Vec<UserContent>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(text) => Ok(vec![UserContent::Text(TextContent { text })]),
+        serde_json::Value::Array(_) => {
+            serde_json::from_value(value).map_err(D::Error::custom)
+        }
+        serde_json::Value::Null => Ok(Vec::new()),
+        other => Err(D::Error::custom(format!(
+            "invalid user message content: expected string, array, or null, got {other}"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
