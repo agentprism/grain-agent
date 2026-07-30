@@ -59,6 +59,11 @@ pub enum OauthError {
 
     #[error("opening browser failed: {0}")]
     BrowserOpen(String),
+
+    /// No application data directory could be determined, so there is nowhere
+    /// to persist tokens. See [`crate::data_dir`] for the per-platform rules.
+    #[error("{0}")]
+    DataDir(#[from] crate::data_dir::DataDirError),
 }
 
 // ---------------------------------------------------------------------------
@@ -216,54 +221,22 @@ fn base64_encode(data: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Returns the path to the token JSON file for a profile.
-pub fn token_store_path(profile_name: &str) -> PathBuf {
-    let mut p = dirs_data_dir();
+///
+/// Fails only where no application data directory can be determined and the
+/// embedder supplied none — see [`crate::data_dir`], which documents the
+/// per-platform reasoning. On Linux, macOS, Windows and iOS this is
+/// infallible in practice.
+pub fn token_store_path(profile_name: &str) -> Result<PathBuf, OauthError> {
+    let mut p = crate::data_dir::data_dir()?;
     p.push("oauth");
     p.push(format!("{}.json", profile_name));
-    p
-}
-
-fn dirs_data_dir() -> PathBuf {
-    // Prefer XDG data dir on Linux, standard dirs on macOS / Windows.
-    if let Ok(d) = std::env::var("GRAIN_CONFIG_DIR") {
-        return PathBuf::from(d);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            return PathBuf::from(xdg);
-        }
-    }
-    let home = dirs_next();
-    #[cfg(target_os = "macos")]
-    {
-        home.join("Library")
-            .join("Application Support")
-            .join("grain")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        home.join(".config").join("grain")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("grain");
-        }
-        home.join(".config").join("grain")
-    }
-}
-
-fn dirs_next() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+    Ok(p)
 }
 
 /// Load persisted tokens for a profile. Returns `None` if the file doesn't
 /// exist or can't be parsed.
 pub fn load_tokens(profile_name: &str) -> Result<Option<StoredTokens>, OauthError> {
-    let path = token_store_path(profile_name);
+    let path = token_store_path(profile_name)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -276,7 +249,7 @@ pub fn load_tokens(profile_name: &str) -> Result<Option<StoredTokens>, OauthErro
 
 /// Persist tokens with `0o600` permissions on Unix.
 pub fn save_tokens(profile_name: &str, tokens: &StoredTokens) -> Result<(), OauthError> {
-    let path = token_store_path(profile_name);
+    let path = token_store_path(profile_name)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| OauthError::Store(profile_name.to_string(), format!("mkdir: {e}")))?;

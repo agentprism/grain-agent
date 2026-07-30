@@ -10,11 +10,15 @@
 //! - [`stream`] — `GenaiStream`, the [`LlmStream`] implementation.
 //! - [`builder`] — `GenaiStreamBuilder`: env-var API-key resolver, OpenAI-compat
 //!   endpoint routing, optional [`grain_llm_models::Registry`] wiring.
+//! - [`data_dir`] — cross-platform application data directory resolution
+//!   (std-only by design so mobile targets can be compile-checked without an
+//!   NDK or Apple SDK).
 //! - [`config`] — small config types ([`EnvKeyResolver`],
 //!   [`OpenAiCompatEndpoint`], [`OpenAiCompatPreset`], [`ProviderRouter`]).
 
 pub mod builder;
 pub mod config;
+pub mod data_dir;
 pub mod mapping;
 pub mod oauth;
 pub mod provider;
