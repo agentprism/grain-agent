@@ -977,20 +977,25 @@ async fn prepare_tool_call(
         }
     };
 
+    // agent-loop.ts:616-618 — prepare, then validate/coerce. The validated
+    // (coerced) arguments are what `beforeToolCall` and `execute` receive
+    // (prepareToolCall's `validatedArgs`); a preparation or validation
+    // failure becomes an immediate error tool result without executing.
     let prepared_args = match tool.prepare_arguments(tool_call.arguments.clone()) {
         Ok(v) => v,
         Err(e) => return Preparation::Immediate(AgentToolResult::error(e.to_string()), true),
     };
-    if let Err(e) = tool.validate_arguments(&prepared_args) {
-        return Preparation::Immediate(AgentToolResult::error(e.to_string()), true);
-    }
+    let validated_args = match tool.validate_arguments(prepared_args) {
+        Ok(v) => v,
+        Err(e) => return Preparation::Immediate(AgentToolResult::error(e.to_string()), true),
+    };
 
     if let Some(hook) = config.before_tool_call.clone() {
         let ctx_snapshot = Arc::new(context.clone());
         let before_ctx = BeforeToolCallContext {
             assistant_message: assistant.clone(),
             tool_call: tool_call.clone(),
-            args: prepared_args.clone(),
+            args: validated_args.clone(),
             context: ctx_snapshot,
         };
         let outcome = hook(before_ctx, cancel.clone()).await;
@@ -1014,7 +1019,7 @@ async fn prepare_tool_call(
     Preparation::Prepared(PreparedToolCall {
         tool_call,
         tool,
-        args: prepared_args,
+        args: validated_args,
     })
 }
 

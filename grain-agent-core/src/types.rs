@@ -371,11 +371,24 @@ pub trait AgentTool: Send + Sync {
         Ok(args)
     }
 
-    /// Validates arguments against the tool schema. Default impl accepts anything.
-    /// Implementations can use the JSON value in `definition().parameters`.
-    fn validate_arguments(&self, args: &serde_json::Value) -> Result<(), AgentToolError> {
-        let _ = args;
-        Ok(())
+    /// Validates arguments against the tool's JSON schema and returns the
+    /// (potentially coerced) arguments the loop must pass to hooks and
+    /// [`Self::execute`].
+    ///
+    /// The default implementation ports upstream `validateToolArguments`
+    /// (pi-ai `utils/validation.ts:278-310`): schema-driven coercion followed
+    /// by full JSON-Schema validation. Malformed arguments become an error
+    /// tool result without the tool executing (agent-loop.ts:616-663).
+    fn validate_arguments(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, AgentToolError> {
+        crate::validation::validate_tool_arguments(
+            &self.definition().name,
+            &self.definition().parameters,
+            args,
+        )
+        .map_err(AgentToolError::Message)
     }
 
     async fn execute(

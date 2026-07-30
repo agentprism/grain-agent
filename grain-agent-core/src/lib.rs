@@ -20,6 +20,7 @@ pub mod agent;
 pub mod agent_loop;
 pub mod stream;
 pub mod types;
+pub mod validation;
 
 pub use agent::{Agent, AgentError, AgentOptions, EventListener, Unsubscribe};
 pub use agent_loop::{
