@@ -30,11 +30,14 @@ pub use agent_loop::{
     PrepareNextTurnFn, ShouldStopAfterTurnContext, ShouldStopAfterTurnFn, TransformContextFn,
     run_agent_loop, run_agent_loop_continue,
 };
-pub use stream::{AssistantStream, LlmStream, StreamError, StreamFn, StreamOptions};
+pub use stream::{
+    AssistantStream, LlmStream, OnPayloadFn, OnResponseFn, ProviderResponse, StreamError,
+    StreamFn, StreamOptions,
+};
 pub use types::{
     AgentContext, AgentEvent, AgentMessage, AgentState, AgentTool, AgentToolError, AgentToolResult,
     AssistantContent, AssistantMessage, AssistantMessageEvent, Cost, ImageContent, LlmContext,
-    Message, Model, QueueMode, StopReason, TextContent, ThinkingContent, ThinkingLevel, ToolCall,
-    ToolDefinition, ToolExecutionMode, ToolResultMessage, ToolUpdateCallback, Usage, UserContent,
-    UserMessage,
+    Message, Model, QueueMode, StopReason, TextContent, ThinkingBudgets, ThinkingContent,
+    ThinkingLevel, ToolCall, ToolDefinition, ToolExecutionMode, ToolResultMessage,
+    ToolUpdateCallback, Usage, UserContent, UserMessage,
 };

@@ -191,6 +191,22 @@ pub enum ThinkingLevel {
     XHigh,
 }
 
+/// Token budgets for each thinking level (token-based providers only).
+///
+/// Port of the pi-ai `ThinkingBudgets` (`types.ts:92-98` @ 34239180).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingBudgets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimal: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub medium: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolExecutionMode {

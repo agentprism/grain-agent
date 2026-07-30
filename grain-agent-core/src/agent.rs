@@ -11,7 +11,7 @@ use crate::agent_loop::{
     self, AfterToolCallFn, AgentLoopConfig, BeforeToolCallFn, ConvertToLlmFn, EventSink,
     GetApiKeyFn, MessagesProviderFn, PrepareNextTurnFn, TransformContextFn,
 };
-use crate::stream::{StreamFn, StreamOptions};
+use crate::stream::{OnPayloadFn, OnResponseFn, StreamFn, StreamOptions};
 use crate::types::*;
 
 // ---------------------------------------------------------------------------
@@ -141,6 +141,12 @@ pub struct AgentOptions {
     pub stream_fn: StreamFn,
     /// Dynamic API-key provider.
     pub get_api_key: Option<GetApiKeyFn>,
+    /// Provider-payload inspection/replacement callback forwarded in stream
+    /// requests (TS `AgentOptions.onPayload`, agent.ts:103 @ 34239180).
+    pub on_payload: Option<OnPayloadFn>,
+    /// Response-received callback forwarded in stream requests
+    /// (TS `AgentOptions.onResponse`, agent.ts:104).
+    pub on_response: Option<OnResponseFn>,
     /// Pre-tool-execution hook (e.g. storm suppression).
     pub before_tool_call: Option<BeforeToolCallFn>,
     /// Post-tool-execution hook (e.g. result truncation).
@@ -154,6 +160,9 @@ pub struct AgentOptions {
     pub follow_up_mode: QueueMode,
     /// Opaque session id forwarded in stream requests.
     pub session_id: Option<String>,
+    /// Per-level thinking token budgets forwarded in stream requests
+    /// (TS `AgentOptions.thinkingBudgets`, agent.ts:117).
+    pub thinking_budgets: Option<ThinkingBudgets>,
     /// Transport identifier forwarded in stream requests.
     pub transport: Option<String>,
     /// Max retry backoff forwarded in stream requests.
@@ -176,12 +185,15 @@ impl AgentOptions {
             transform_context: None,
             stream_fn,
             get_api_key: None,
+            on_payload: None,
+            on_response: None,
             before_tool_call: None,
             after_tool_call: None,
             prepare_next_turn: None,
             steering_mode: QueueMode::OneAtATime,
             follow_up_mode: QueueMode::OneAtATime,
             session_id: None,
+            thinking_budgets: None,
             transport: None,
             max_retry_delay_ms: None,
             tool_execution: ToolExecutionMode::Parallel,
@@ -223,10 +235,13 @@ pub struct Agent {
     convert_to_llm: ConvertToLlmFn,
     transform_context: Option<TransformContextFn>,
     get_api_key: Option<GetApiKeyFn>,
+    on_payload: Option<OnPayloadFn>,
+    on_response: Option<OnResponseFn>,
     before_tool_call: Option<BeforeToolCallFn>,
     after_tool_call: Option<AfterToolCallFn>,
     prepare_next_turn: Option<PrepareNextTurnFn>,
     session_id: Option<String>,
+    thinking_budgets: Option<ThinkingBudgets>,
     transport: Option<String>,
     max_retry_delay_ms: Option<u64>,
     tool_execution: ToolExecutionMode,
@@ -262,10 +277,13 @@ impl Agent {
                 .unwrap_or_else(default_convert_to_llm),
             transform_context: options.transform_context,
             get_api_key: options.get_api_key,
+            on_payload: options.on_payload,
+            on_response: options.on_response,
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
             prepare_next_turn: options.prepare_next_turn,
             session_id: options.session_id,
+            thinking_budgets: options.thinking_budgets,
             transport: options.transport,
             max_retry_delay_ms: options.max_retry_delay_ms,
             tool_execution: options.tool_execution,
@@ -686,10 +704,16 @@ impl Agent {
             let g = self.inner.lock().await;
             (g.thinking_level, g.model.clone())
         };
+        // Mirrors TS createLoopConfig (agent.ts:434-469): sessionId,
+        // onPayload, onResponse, thinkingBudgets, transport and
+        // maxRetryDelayMs all flow into the per-request stream options.
         let stream_options = StreamOptions {
             session_id: self.session_id.clone(),
             transport: self.transport.clone(),
             max_retry_delay_ms: self.max_retry_delay_ms,
+            on_payload: self.on_payload.clone(),
+            on_response: self.on_response.clone(),
+            thinking_budgets: self.thinking_budgets,
             reasoning: if thinking_level == ThinkingLevel::Off {
                 None
             } else {

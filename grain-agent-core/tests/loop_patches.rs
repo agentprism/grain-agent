@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use common::*;
 use grain_agent_core::{
-    AgentContext, AgentEvent, AgentLoopConfig, AgentToolError, AgentToolResult, StopReason,
-    UserContent, run_agent_loop,
+    Agent, AgentContext, AgentEvent, AgentLoopConfig, AgentOptions, AgentToolError,
+    AgentToolResult, StopReason, ThinkingBudgets, UserContent, run_agent_loop,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -398,4 +398,92 @@ async fn prepared_arguments_are_validated_and_coerced() {
     .expect("loop failed");
 
     assert_eq!(*executed_args.lock().unwrap(), vec![json!({ "count": 5 })]);
+}
+
+// ---------------------------------------------------------------------------
+// patch-8: AgentOptions → StreamOptions provider extras
+// (upstream: AgentOptions.onPayload/.onResponse/.thinkingBudgets,
+//  agent.ts:103-104,117 → createLoopConfig agent.ts:434-469 →
+//  streamAssistantResponse spreads config into stream options,
+//  agent-loop.ts:308-312; option shapes per pi-ai types.ts:92-98,143-152)
+// ---------------------------------------------------------------------------
+
+/// on_payload / on_response / thinking_budgets set on `AgentOptions` are
+/// forwarded into the per-request `StreamOptions` the stream fn receives.
+#[tokio::test]
+async fn forwards_provider_extras_to_stream_options() {
+    use grain_agent_core::{OnPayloadFn, OnResponseFn, ProviderResponse, StreamOptions};
+
+    let captured: Arc<StdMutex<Option<StreamOptions>>> = Arc::new(StdMutex::new(None));
+    let capture = captured.clone();
+    let stream = FnStream::new(move |_n, _model, _ctx, opts, _cancel| {
+        *capture.lock().unwrap() = Some(opts.clone());
+        done_stream(create_assistant_message(vec![text("ok")], StopReason::Stop))
+    });
+
+    let payload_seen: Arc<StdMutex<Option<serde_json::Value>>> = Arc::new(StdMutex::new(None));
+    let payload_capture = payload_seen.clone();
+    let on_payload: OnPayloadFn = Arc::new(move |payload, _model| {
+        let seen = payload_capture.clone();
+        Box::pin(async move {
+            *seen.lock().unwrap() = Some(payload);
+            // Replace the payload (upstream: returning a value swaps it in).
+            Some(json!({ "replaced": true }))
+        })
+    });
+
+    let response_seen = Arc::new(AtomicBool::new(false));
+    let response_capture = response_seen.clone();
+    let on_response: OnResponseFn = Arc::new(move |response, _model| {
+        let seen = response_capture.clone();
+        Box::pin(async move {
+            assert_eq!(response.status, 200);
+            seen.store(true, Ordering::SeqCst);
+        })
+    });
+
+    let budgets = ThinkingBudgets {
+        minimal: Some(512),
+        low: Some(1024),
+        medium: Some(4096),
+        high: Some(16384),
+    };
+
+    let mut options = AgentOptions::new(create_model(), stream);
+    options.on_payload = Some(on_payload);
+    options.on_response = Some(on_response);
+    options.thinking_budgets = Some(budgets);
+
+    let agent = Agent::new(options);
+    agent.prompt_text("hello").await.expect("prompt failed");
+
+    let opts = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("stream fn must have been called");
+
+    // thinkingBudgets forwarded verbatim.
+    assert_eq!(opts.thinking_budgets, Some(budgets));
+
+    // The forwarded callbacks are the configured ones: invoking them runs
+    // the caller-supplied logic (this is what a provider adapter does).
+    let forwarded_on_payload = opts.on_payload.expect("on_payload must be forwarded");
+    let replaced = forwarded_on_payload(json!({ "model": "mock" }), create_model()).await;
+    assert_eq!(replaced, Some(json!({ "replaced": true })));
+    assert_eq!(
+        payload_seen.lock().unwrap().clone(),
+        Some(json!({ "model": "mock" }))
+    );
+
+    let forwarded_on_response = opts.on_response.expect("on_response must be forwarded");
+    forwarded_on_response(
+        ProviderResponse {
+            status: 200,
+            headers: Default::default(),
+        },
+        create_model(),
+    )
+    .await;
+    assert!(response_seen.load(Ordering::SeqCst));
 }
