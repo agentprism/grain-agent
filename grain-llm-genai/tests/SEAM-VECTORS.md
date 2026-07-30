@@ -11,8 +11,9 @@ standard.
 
 **WP25 status (this revision).** The Anthropic vectors now run through the
 **native Anthropic transport** (`src/anthropic/`), a second `LlmStream`
-behind the same seam, built because the WP21 measurement below proved the gaps
-unfixable above genai. **AV-1, AV-2, AV-3 and AV-5 are un-ignored and pass**;
+behind the same seam, built because the WP21 measurement below showed the gaps
+unreachable from `ChatStreamEvent` and the one alternative route (an
+endpoint-tee relay, costed in §6) more expensive than owning the transport. **AV-1, AV-2, AV-3 and AV-5 are un-ignored and pass**;
 counts moved from 7 PASS / 6 STRUCTURAL to **11 PASS / 2 STRUCTURAL**. No
 vector was weakened or deleted — the upstream expectations are unchanged, a
 better backend now meets them. genai remains the **default** backend and its
@@ -22,8 +23,8 @@ recorded fixtures only, **never against the live Anthropic API** — see
 `src/anthropic/stream.rs`.
 
 **WP21 status (prior revision).** Every structural gap in §6 was re-examined
-against the question "is this closable in `grain-llm-genai`, above genai's
-public API?" The answer is **no for all eight** — with one partial exception,
+against the question "is this closable in `grain-llm-genai`, from what genai's
+streaming API delivers?" The answer is **no for all eight** — with one partial exception,
 the tool-argument half of S-5, which was closed (adapter fix AB-3, §5). The
 blocker is a single architectural fact, not eight separate ones: genai's
 streaming seam is `ChatStreamEvent`, and everything the provider sent beyond
@@ -418,7 +419,7 @@ family. Everything the Anthropic wire actually carries now reaches the loop.
   | `message_start` 12, `message_delta` repeats 12 | 12 | 24 |
   | `message_start` 24, `message_delta` has no `usage` | 24 | 24 |
 
-  Any correction applied above genai is a function of what crosses, so it
+  Any correction applied to `StreamEnd` is a function of what crosses, so it
   must return the *same* answer for both — and exactly one of those answers
   is then wrong. Halving unconditionally would fix the first and corrupt the
   second, and the second is not hypothetical: it is upstream's own
@@ -527,6 +528,13 @@ family. Everything the Anthropic wire actually carries now reaches the loop.
   by an upstream fixture at the pin, so neither carries a seam vector — they
   are recorded here because the `error`-event half is a live user-facing
   defect on the default path, not a measurement artifact.
+
+  **Closed on the native Anthropic transport (WP25):** `error` frames
+  terminate the turn carrying the provider's own message
+  (`state.rs`, pinned by `provider_error_event_terminates_with_its_message`),
+  and `signature_delta` is read directly into the thinking block, so neither
+  defect applies to opted-in callers. S-9 remains open for the genai default
+  path, which is where most callers are.
 
 ## 7. Upstream fixtures at the pin that were not used
 

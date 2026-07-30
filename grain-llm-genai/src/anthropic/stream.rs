@@ -4,7 +4,9 @@
 //! # Status: opt-in, fixture-verified, **not live-verified**
 //!
 //! This backend exists because several structural gaps at the genai seam are
-//! unfixable above it — see `tests/SEAM-VECTORS.md` §6 and
+//! unreachable from `ChatStreamEvent`, and the one alternative that does
+//! reach them (proxying the transport and re-parsing the wire) costs more
+//! than owning it — see `tests/SEAM-VECTORS.md` §6 and
 //! `../UPSTREAM-GENAI.md`. It is **not** the default: [`crate::GenaiStream`]
 //! still routes Anthropic through genai unless the native transport is
 //! explicitly selected via

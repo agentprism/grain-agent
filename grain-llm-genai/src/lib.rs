@@ -14,8 +14,9 @@
 //!   [`OpenAiCompatEndpoint`], [`OpenAiCompatPreset`], [`ProviderRouter`]).
 //! - [`anthropic`] — an **opt-in** native Anthropic Messages transport, a
 //!   second `LlmStream` behind the same seam. It exists because several
-//!   structural gaps (notably the S-3 usage double-count) cannot be fixed
-//!   above genai. genai remains the default; see [`anthropic`] for the full
+//!   structural gaps (notably the S-3 usage double-count) are unreachable
+//!   from genai's streaming event API. genai remains the default; see
+//!   [`anthropic`] for the full
 //!   rationale and the fixture-verified-but-not-live-verified caveat.
 
 pub mod anthropic;

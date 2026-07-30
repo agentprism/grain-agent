@@ -94,8 +94,10 @@ impl GenaiStreamBuilder {
     /// Anthropic usage — they add `message_delta.usage` onto
     /// `message_start.usage` where the wire semantics are per-field
     /// *replacement* — which inflates billed prompt tokens by roughly 2x. That
-    /// defect cannot be corrected above genai (proven in
-    /// `tests/genai_seam_limits.rs`), which is why this backend exists. It
+    /// defect cannot be corrected from genai's streaming event API (proven in
+    /// `tests/genai_seam_limits.rs`), and the one route that would reach it —
+    /// proxying the transport and re-parsing the wire — costs more than owning
+    /// the transport outright, which is why this backend exists. It
     /// additionally recovers Anthropic refusal explanations, true content-block
     /// boundaries, and malformed-frame repair.
     ///

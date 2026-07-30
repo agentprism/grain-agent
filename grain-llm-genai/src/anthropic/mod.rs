@@ -4,15 +4,20 @@
 //! # Why this exists
 //!
 //! Six of the eight structural gaps measured in `tests/SEAM-VECTORS.md` are
-//! unfixable *above* genai: `ChatStreamEvent` is the entire seam, and
+//! unreachable from `ChatStreamEvent`: it is the entire streaming seam, and
 //! everything else the provider sent is consumed inside genai's streamer with
-//! no public carrier and no extension point below it. The decisive case is
-//! **S-3**, the Anthropic usage double-count: genai adds
-//! `message_delta.usage` onto `message_start.usage` where the wire semantics
-//! are *replacement*, and the corrective term is destroyed before anything is
-//! observable — proven in `tests/genai_seam_limits.rs`.
+//! no public carrier. The decisive case is **S-3**, the Anthropic usage
+//! double-count: genai adds `message_delta.usage` onto `message_start.usage`
+//! where the wire semantics are *replacement*, and the corrective term is
+//! destroyed before anything the streaming API exposes — proven in
+//! `tests/genai_seam_limits.rs`.
 //!
-//! Owning the transport is the only way to close it. Because the harness bills
+//! Owning the transport is not the *only* conceivable fix — genai lets the
+//! caller choose the endpoint, so a recording relay could tee the wire and
+//! re-derive usage. It is the only *reasonable* one: teeing means
+//! re-implementing Anthropic SSE parsing anyway, at which point keeping genai
+//! in the path buys nothing. `SEAM-VECTORS.md` §6 costs that alternative and
+//! rejects it explicitly. Because the harness bills
 //! token budgets and reports cost from what crosses this seam, the inflation
 //! is a user-visible wrong number, not a cosmetic gap.
 //!
