@@ -81,8 +81,9 @@ pub use retry_overflow::{
     OverflowDetector, RetryNotify, RetryOnOverflowConfig, RetryOnOverflowStream,
 };
 pub use session::{
-    InMemorySessionRepo, InMemorySessionStorage, Session, SessionContext, SessionError,
-    SessionMetadata, SessionRepo, SessionStorage, SessionTreeEntry, SessionTreeEntryKind, uuidv7,
+    ForkPosition, InMemorySessionRepo, InMemorySessionStorage, Session, SessionContext,
+    SessionError, SessionMetadata, SessionRepo, SessionStorage, SessionTreeEntry,
+    SessionTreeEntryKind, uuidv7,
 };
 pub use session_jsonl::{JsonlSessionRepo, JsonlSessionStorage};
 pub use system_prompt::{Skill, format_skill_invocation, format_skills_for_system_prompt};

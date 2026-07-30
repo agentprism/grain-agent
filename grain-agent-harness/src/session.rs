@@ -113,6 +113,33 @@ impl SessionMetadata {
         }
     }
 
+    /// Record which session this one was forked from.
+    ///
+    /// Upstream's JSONL header carries `parentSession`
+    /// (`harness/session/jsonl-storage.ts:21`, set on fork at
+    /// `jsonl-repo.ts:150-155` @ 34239180) so a fork's lineage is
+    /// recoverable. Grain has no typed slot, so it rides the flattened
+    /// `extra` map under the same key and lands in the same place on disk.
+    pub fn with_parent_session(mut self, parent_id: impl Into<String>) -> Self {
+        let parent = serde_json::Value::String(parent_id.into());
+        match &mut self.extra {
+            serde_json::Value::Object(map) => {
+                map.insert("parentSession".into(), parent);
+            }
+            other => {
+                let mut map = serde_json::Map::new();
+                map.insert("parentSession".into(), parent);
+                *other = serde_json::Value::Object(map);
+            }
+        }
+        self
+    }
+
+    /// The session this one was forked from, when it was a fork.
+    pub fn parent_session(&self) -> Option<&str> {
+        self.extra.get("parentSession")?.as_str()
+    }
+
     pub fn with_id(id: impl Into<String>) -> Self {
         SessionMetadata {
             id: id.into(),
@@ -918,11 +945,13 @@ impl SessionRepo for InMemorySessionRepo {
                 .clone()
         };
         let fork_entries = entries_to_fork(&*storage, entry_id, position).await?;
+        // A fork records its origin, as upstream's JSONL header does.
         let metadata = if let Some(id) = id {
             SessionMetadata::with_id(id)
         } else {
             SessionMetadata::new()
-        };
+        }
+        .with_parent_session(source.id.clone());
         let new_storage = Arc::new(InMemorySessionStorage::with_entries(
             metadata.clone(),
             fork_entries,

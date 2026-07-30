@@ -578,3 +578,41 @@ fn unknown_thinking_level_tag_degrades_to_off() {
         ThinkingLevel::Off
     );
 }
+
+/// A fork records which session it came from, so a forked worker's lineage is
+/// recoverable from its metadata alone.
+#[tokio::test]
+async fn fork_records_its_parent_session() {
+    use grain_agent_harness::{ForkPosition, SessionMetadata};
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+    let source = repo.create(Some("origin".into())).await.unwrap();
+    source.append_message(user("a")).await.unwrap();
+    let b = source.append_message(user("b")).await.unwrap();
+    let meta = source.metadata().await;
+    drop(source);
+
+    let forked = repo
+        .fork(&meta, Some(&b), ForkPosition::At, Some("child".into()))
+        .await
+        .unwrap();
+    assert_eq!(forked.metadata().await.parent_session(), Some("origin"));
+    drop(forked);
+
+    // And it survives a restart, since it rides the persisted metadata.
+    let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+    let reopened = repo.open(&SessionMetadata::with_id("child")).await.unwrap();
+    assert_eq!(reopened.metadata().await.parent_session(), Some("origin"));
+
+    // A session that was never forked has no parent.
+    assert_eq!(
+        repo.open(&SessionMetadata::with_id("origin"))
+            .await
+            .unwrap()
+            .metadata()
+            .await
+            .parent_session(),
+        None
+    );
+}

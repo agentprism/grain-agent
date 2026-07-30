@@ -92,14 +92,25 @@ impl JsonlSessionStorage {
             _ => SessionError::Storage(format!("{}: {e}", lock_path.display())),
         })?;
 
+        // On-disk metadata wins when it exists. Callers routinely open a
+        // session from a synthetic `SessionMetadata::with_id(...)`, which
+        // carries nothing but the id; trusting that over the persisted record
+        // silently dropped everything else the session had recorded about
+        // itself (fork lineage, creation time, backend extras). The file is
+        // the truth — the argument is only a seed for a session that does not
+        // exist yet.
         let meta_path = dir.join(META_FILE);
-        if !meta_path.exists() {
-            let s = serde_json::to_string_pretty(&metadata)
-                .map_err(|e| SessionError::Storage(e.to_string()))?;
-            tokio::fs::write(&meta_path, s)
-                .await
-                .map_err(io_err(meta_path.display().to_string()))?;
-        }
+        let metadata = match tokio::fs::read_to_string(&meta_path).await {
+            Ok(raw) => serde_json::from_str::<SessionMetadata>(&raw).unwrap_or(metadata),
+            Err(_) => {
+                let s = serde_json::to_string_pretty(&metadata)
+                    .map_err(|e| SessionError::Storage(e.to_string()))?;
+                tokio::fs::write(&meta_path, s)
+                    .await
+                    .map_err(io_err(meta_path.display().to_string()))?;
+                metadata
+            }
+        };
 
         let entries_path = dir.join(ENTRIES_FILE);
         let mut entries: Vec<SessionTreeEntry> = Vec::new();
@@ -499,11 +510,13 @@ impl SessionRepo for JsonlSessionRepo {
         let src_storage = JsonlSessionStorage::open_or_init(src_dir, source.clone()).await?;
         let fork_entries = compute_fork_entries(&src_storage, entry_id, position).await?;
 
+        // A fork records its origin, as upstream's JSONL header does.
         let metadata = if let Some(id) = id {
             SessionMetadata::with_id(id)
         } else {
             SessionMetadata::new()
-        };
+        }
+        .with_parent_session(source.id.clone());
         let dir = self.session_dir(&metadata.id);
         let storage = JsonlSessionStorage::open_or_init(dir, metadata).await?;
         for entry in fork_entries {
