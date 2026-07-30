@@ -9,6 +9,20 @@ standard.
 - genai version under measurement: **0.6.5** (workspace pin).
 - Harness: `tests/seam_vectors.rs`.
 
+**WP21 status (this revision).** Every structural gap in §6 was re-examined
+against the question "is this closable in `grain-llm-genai`, above genai's
+public API?" The answer is **no for all eight** — with one partial exception,
+the tool-argument half of S-5, which was closed (adapter fix AB-3, §5). The
+blocker is a single architectural fact, not eight separate ones: genai's
+streaming seam is `ChatStreamEvent`, and everything the provider sent beyond
+those variants is consumed inside the streamer with no public carrier and no
+extension point below it. §6 documents this once and annotates each gap with
+what specifically is destroyed and where; `tests/genai_seam_limits.rs` proves
+it empirically against genai's real client. **No previously-`#[ignore]`d
+vector became passable, so the counts in §5 are unchanged (7 PASS / 6
+STRUCTURAL).** The S-3 defect is written up upstream-ready in
+`../UPSTREAM-GENAI.md` (unfiled; still unfixed at genai `0.7.0-beta.15`).
+
 ## 1. Chain under test
 
 ```
@@ -176,6 +190,30 @@ Adapter bugs found while building the vectors:
     `totalTokens = input + output + cacheRead + cacheWrite` and ignores
     any wire total. A provider whose wire total disagrees with its
     components will differ across the seam.
+- **AB-3 (WP21)** — malformed tool-argument JSON dropped the whole tool
+  call. `parse_tool_args` used a bare `serde_json::from_str` and stored the
+  raw text as `Value::String` on failure — which is exactly the shape the
+  outbound corrupt-args guard (`collect_corrupt_tool_call_ids`) treats as
+  corrupt, so one unescaped TAB or one stray `\H` anywhere in a tool's
+  arguments silently cost the user the entire tool call *and* its paired
+  `tool_result`, with no error surfaced. Fixed in
+  `src/mapping/json_repair.rs`: a statement-for-statement port of upstream's
+  `repairJson` / `parseJsonWithRepair`
+  (`packages/ai/src/utils/json-parse.ts`), wired into `parse_tool_args`.
+  This is the **adapter-reachable half of S-5** — the accumulated buffer
+  does cross the seam (`ToolCallChunk.fn_arguments` as `Value::String`;
+  genai's OpenAI streamer keeps the string verbatim when its own parse
+  fails). It does **not** un-ignore AV-1, whose failure is at the SSE-frame
+  layer inside genai (see §6 S-5). Proven by `tests/tool_arg_repair.rs`
+  (round trip: repaired call survives into the next request) plus 15 unit
+  tests including upstream's exact AV-1 argument payload.
+  Deliberate divergence, accepted and documented: upstream's
+  truncation-tolerant tier (`parseStreamingJson` → the `partial-json`
+  package) is **not** ported. Coercing a cut-off buffer into a partial
+  object would replay a tool call with silently truncated arguments — a
+  file-write whose `content` lost its tail — where grain currently drops it.
+  No vector at the pin forces that, so the safer behavior is kept; a
+  truncated buffer stays `Value::String` and is still dropped.
 - **AB-R2 (closed on rebase)** — `usage.reasoning` was dropped: the count
   crosses genai (`completion_tokens_details.reasoning_tokens`; the Gemini
   adapter even normalizes `thoughtsTokenCount` into it) but grain's
@@ -204,17 +242,106 @@ Exact information gaps at the genai seam. **This list defines the measured
 scope for a potential pi-ai-shaped `StreamFn` backend** (product decision
 out of WP5 scope; this is the measurement).
 
+### WP21 verdict: reachable-from-the-seam vs reachable-at-any-cost
+
+WP21 re-examined every gap below against the question "can this be closed in
+`grain-llm-genai`, from what genai's streaming API delivers?" The answer is
+**no for all eight**, for one shared reason:
+
+> `genai::chat::ChatStreamEvent` is the entire seam. Its only payload-bearing
+> terminal is `End(StreamEnd)`, whose fields are `captured_usage`,
+> `captured_stop_reason`, `captured_content`, `captured_reasoning_content`,
+> `captured_response_id`. `ChatStreamResponse` carries only `stream` and
+> `model_iden`. `ChatOptions::capture_raw_body` exists but **no streaming
+> path consults it** — it is honored only on the non-streaming and embedding
+> paths. Everything else the provider sent is consumed inside the streamer
+> and has no representation at all.
+
+There is likewise no extension point that lets us *decode* the response
+differently in place: `genai::webc` exports only `Error`
+(`EventSourceStream`, `WebStream`, `WebClient` are all `pub(crate)`),
+`genai::adapter` exports only `AdapterKind` (the adapter modules are
+`pub(super)`, so `AnthropicStreamer` is unreachable and no custom adapter can
+be registered), and `ClientBuilder::with_reqwest` accepts a bare
+`reqwest::Client`, which has no response-body middleware hook.
+
+#### The endpoint-tee relay: possible, costed, rejected
+
+What genai *does* expose is control over **where it connects**. The full set
+of public hooks that can redirect a request is larger than a first pass
+suggests:
+
+- `ClientBuilder::with_service_target_resolver_fn` → `Endpoint::from_owned`
+  (this crate already installs one in production, `builder.rs:286-289`);
+- `ClientBuilder::with_web_config` → `WebConfig::with_proxy` / the public
+  `proxy` field;
+- `AuthData::RequestOverride { url, headers }` — a public variant with public
+  fields that overrides the request URL (`client_impl.rs:188-195`);
+- `ModelSpec::Target`.
+
+So a consumer *can* recover the truth without forking genai or patching
+`Cargo.toml`: interpose a recording relay between genai and the provider, tee
+the SSE body, and re-derive usage from the raw `message_start` /
+`message_delta` frames. This is demonstrated working, and it is not exotic —
+genai's own test suite ships such a proxy
+(`tests/support/yakbak/server.rs`), and this repository already uses the same
+redirect mechanism in `tests/genai_seam_limits.rs` and in
+`../UPSTREAM-GENAI.md` §1.4.
+
+**We reject it on cost, not on possibility.** Re-deriving usage from the wire
+means re-implementing Anthropic's SSE parsing on our side of the relay — which
+is most of a provider backend already — and then maintaining it in lockstep
+with genai's, while paying a proxy hop, a second socket, and a place for the
+API key to transit on every request. Having paid for the SSE parser, keeping
+genai in the path buys nothing: the honest version of that design is simply to
+own the transport. So the conclusion the gap list needs is not "impossible"
+but a cost judgement: **closing any of these means owning the provider
+transport — the pi-ai-shaped-backend decision — because every cheaper route
+ends up there anyway.**
+
+Each gap below is annotated with what specifically is unavailable and where.
+Where a gap says "not reachable from `ChatStreamEvent`", read it as a
+statement about the streaming API's surface, **not** a claim that no
+adapter-side mechanism exists at any cost.
+
+Evidence: `tests/genai_seam_limits.rs` drives genai's real Anthropic client
+against recorded wire and asserts genai's current behavior directly at the
+seam (no grain code in between). Those tests are tripwires — each fails
+loudly if a genai bump changes the seam, which is the signal to re-measure
+the gap and un-`#[ignore]` its vector.
+
+The one exception is the **tool-argument half of S-5**, which *is* reachable
+because genai lets the accumulated buffer cross as a `Value::String`. It was
+closed by adapter fix AB-3 (§5). It does not un-ignore AV-1.
+
 - **S-1 — per-event usage.** Upstream partials carry running usage from
   `message_start` / per-chunk `usage` onward; genai only surfaces usage on
   `ChatStreamEvent::End(StreamEnd::captured_usage)`. genai would need to
   attach usage to stream events (or emit an early usage event) for grain
   partials to match upstream partials. (This is why partial-usage is
   excluded from per-event comparison rather than failing every vector.)
+  **WP21 verdict — not reachable from `ChatStreamEvent`.** `End` is the
+  only `ChatStreamEvent` variant with a usage payload; nothing earlier
+  carries one, so grain partials cannot mirror upstream's running usage
+  (upstream sets it while handling `message_start`, before any content event
+  is emitted). Pinned by
+  `tests/genai_seam_limits.rs::s1_usage_crosses_only_at_end`. Note the
+  upstream shape is subtler than "per-event": pi-ai's `partial` is a *live
+  reference* to one mutating object, mutated only at `message_start` and
+  `message_delta`, so a live consumer observes message_start-era usage on
+  every content event and final usage on `done`/`error`.
 - **S-2 — responseId.** Upstream captures the provider message/chunk id
   on every message. genai's `InterStreamEnd.captured_response_id` field
   exists but all three streamers (anthropic, openai, gemini) hard-code it
   to `None` in 0.6.5; grain's `AssistantMessage` also has no field. genai
   would need to populate `captured_response_id` (and grain grow a slot).
+  **WP21 verdict — not reachable from `ChatStreamEvent`, and doubly
+  blocked.** genai never populates the field (`streamer.rs:234` sets
+  `captured_response_id: None` although `message_start.message.id` was
+  parsed moments earlier), *and* grain-agent-core has no `response_id` slot
+  to carry it — a core type change that is not WP21's to make and is not in
+  WP19's scope either. Pinned by
+  `tests/genai_seam_limits.rs::s2_response_id_never_crosses`.
 - **S-3 — Anthropic usage accumulation defect.** genai's anthropic
   streamer *adds* `message_delta.usage.input_tokens` onto the
   `message_start` count (`capture_usage`: `*val += input_tokens`); the
@@ -223,25 +350,83 @@ out of WP5 scope; this is the measurement).
   `input_tokens` — which the live API does — reaches grain with inflated
   input/total (measured: 24/24 vs 12/12 on AV-3; 24/29 vs 12/17 on AV-5).
   genai would need replace semantics. [AV-2, AV-3, AV-5]
+
+  **WP21 verdict — not reachable from `ChatStreamEvent`, and provably so.**
+  Not merely awkward: the corrective term is *destroyed*, not just hidden.
+  `capture_usage` folds `message_start` and `message_delta` into one
+  accumulator before anything is observable, so these two streams are
+  byte-identical at `StreamEnd`:
+
+  | wire | provider truth | genai `StreamEnd` |
+  |---|---|---|
+  | `message_start` 12, `message_delta` repeats 12 | 12 | 24 |
+  | `message_start` 24, `message_delta` has no `usage` | 24 | 24 |
+
+  Any correction applied above genai is a function of what crosses, so it
+  must return the *same* answer for both — and exactly one of those answers
+  is then wrong. Halving unconditionally would fix the first and corrupt the
+  second, and the second is not hypothetical: it is upstream's own
+  "message_delta without usage" case, pinned green today as **AV-4**. There
+  is no discriminator anywhere else on the seam either — `prompt_tokens_details`
+  is populated from `message_start` only, `total_tokens` is recomputed from
+  the already-inflated components at `message_stop`
+  (`streamer.rs:217`), and `capture_raw_body` is inert while streaming.
+
+  Pinned empirically by
+  `tests/genai_seam_limits.rs::s3_double_count_is_indistinguishable_at_the_seam`,
+  which runs both streams through genai's real client and asserts the
+  outputs are equal — a statement about `StreamEnd`, not about the adapter as
+  a whole: the endpoint-tee relay described above *does* recover the true 12
+  vs 24, and is rejected on cost rather than feasibility. Reported
+  upstream-ready in `UPSTREAM-GENAI.md` §1
+  (still unfixed at genai `0.7.0-beta.15`). Closing it requires replace
+  semantics inside the streamer, or owning the Anthropic transport.
 - **S-4 — Anthropic `stop_details` dropped.** genai captures only
   `delta.stop_reason`; `delta.stop_details` (refusal category +
   explanation, surfaced by upstream as `errorMessage`) is never parsed.
   genai would need to parse and expose it on `StreamEnd`. [AV-2]
+  **WP21 verdict — not reachable from `ChatStreamEvent`.** Only the bare
+  reason string survives, inside `StopReason::Other("refusal")`; the
+  explanation and category appear nowhere on `StreamEnd`. Pinned by
+  `tests/genai_seam_limits.rs::s4_stop_details_never_crosses`, which
+  serializes the whole terminal payload and asserts neither string occurs in
+  it. grain *does* have the destination slot (`error_message`), so unlike
+  S-2/S-6/S-7 this one is blocked solely by genai. AV-2 additionally needs
+  S-3, so it stays ignored regardless.
 - **S-5 — no malformed-JSON repair.** genai serde-parses every SSE frame
   and every accumulated tool-argument buffer; a malformed frame aborts the
   stream with `Error::StreamParse`. Upstream repairs both malformed SSE
   JSON and malformed streamed tool JSON (`parseStreamingJson` et al.) and
   completes the turn. genai would need equivalent lenient parsing. [AV-1]
+  **WP21 verdict — split.** The *tool-argument* half **is** adapter-reachable
+  and was closed (adapter fix AB-3, §5): the accumulated buffer crosses the
+  seam as `ToolCallChunk.fn_arguments`, so upstream's repair can be applied
+  above genai. The *SSE-frame* half is not reachable from the seam: genai
+  `serde_json::from_str`s each frame inside its own `poll_next` and returns
+  `Err(Error::StreamParse)`, so the malformed bytes never reach us and the
+  stream is already dead when we learn of it. AV-1's fixture fails at the
+  frame layer, so it stays ignored even though its inner payload now
+  repairs correctly (proven in `tests/tool_arg_repair.rs`).
 - **S-6 — `chunk.model` / responseModel not captured.** genai's openai
   streamer never reads `chunk.model`, so routed model ids (OpenRouter
   `auto` etc.) cannot be surfaced. genai would need e.g.
   `captured_response_model` on `StreamEnd` (and grain a field). [OV-3]
+  **WP21 verdict — not reachable from `ChatStreamEvent`, and doubly
+  blocked** (genai never reads the field; grain has no `response_model`
+  slot, a core change outside WP21 and not in WP19's scope).
 - **S-7 — `delta.reasoning_details` not captured.** genai's openai
   streamer reads only `delta.content` / `delta.reasoning_content` /
   `delta.reasoning`; OpenRouter-style encrypted reasoning details (which
   upstream attaches to the matching toolCall as `thoughtSignature` for
   replay) are dropped. genai would need to surface them on tool-call
   chunks — and grain's `ToolCall` needs a signature slot. [OV-6]
+  **WP21 verdict — not reachable from `ChatStreamEvent`, and doubly
+  blocked.** genai reads only `delta.content` / `delta.reasoning_content` /
+  `delta.reasoning`, so `delta.reasoning_details` never crosses. WP19 is
+  adding `ToolCall.thought_signature` to core, which closes the *grain* half
+  — but even with that field landed the value to put in it does not exist at
+  this seam, so OV-6 stays ignored until genai surfaces the details. See the
+  WP21 report for the exact wiring that remains.
 - **S-8 — block boundaries are synthesized.** genai has no block
   open/close events (Anthropic `content_block_start/stop` are consumed
   internally); grain infers block transitions from event-kind changes and
@@ -250,6 +435,42 @@ out of WP5 scope; this is the measurement).
   end, and a provider block opened and closed without any delta would
   vanish entirely. Not exercised as a failure by the fixtures at the pin;
   recorded for completeness.
+  **WP21 verdict — not reachable from `ChatStreamEvent`.** Confirmed
+  sharper than "recorded for completeness": a text block opened and closed
+  with no delta produces *no seam event at all* — the whole stream reduces
+  to `Start, End` — so the adapter cannot synthesize the `text_start` /
+  `text_end` pair upstream emits. Pinned by
+  `tests/genai_seam_limits.rs::s8_empty_block_vanishes_at_the_seam`.
+- **S-9 — Anthropic `error` events and thought signatures dropped at the
+  genai seam (WP25 audit; not exercised by any vector at the pin).** Two
+  defects found while auditing genai for the transport work, both in
+  `adapter/adapters/anthropic/streamer.rs`:
+  - **Mid-stream provider errors vanish.** The event match ends with
+    `other => tracing::warn!("UNKNOWN MESSAGE TYPE: {other}")` (line 242).
+    Anthropic's documented event set includes `error`, emitted mid-stream for
+    `overloaded_error` / `api_error`. It matches no arm, so it is logged and
+    discarded; the streamer polls to end-of-body, never sees `message_stop`,
+    and returns `Poll::Ready(None)`. Our adapter then reports
+    `"stream ended without terminal event"` — so a user hitting an overloaded
+    provider sees a generic truncation message instead of the provider's
+    actual, actionable error, with no way to distinguish the two.
+    **This one affects anyone on the genai default path today.**
+  - **`captured_thought_signatures` is hard-coded `None`** (line 233), even
+    though the same streamer emits `ThoughtSignatureChunk` for
+    `signature_delta`. Signatures stream chunk by chunk but are absent from
+    the terminal aggregate, unlike text / reasoning / tool calls. genai's own
+    `into_assistant_message_for_tool_use()` therefore silently loses the
+    signatures Anthropic requires on replay. The Gemini path populates the
+    field, so this reads as an oversight rather than an asymmetry by design.
+    grain is insulated: our inbound state machine attaches signatures from the
+    chunk events (`mapping::inbound::attach_thought_signature`) rather than
+    from the aggregate, and the native transport reads `signature_delta`
+    directly.
+
+  Both are reported in `../UPSTREAM-GENAI.md` §2.6 / §2.7. Neither is covered
+  by an upstream fixture at the pin, so neither carries a seam vector — they
+  are recorded here because the `error`-event half is a live user-facing
+  defect on the default path, not a measurement artifact.
 
 ## 7. Upstream fixtures at the pin that were not used
 
@@ -304,4 +525,22 @@ cargo test -p grain-llm-genai --test seam_vectors
 
 # STRUCTURAL vectors (intentionally red — the red IS the measurement):
 cargo test -p grain-llm-genai --test seam_vectors -- --ignored
+
+# WP21: what genai does and does not deliver at the seam. These consume
+# genai::chat::ChatStreamEvent directly (no grain code in between) and pin
+# genai's current, defective behavior — they are the evidence behind the
+# §6 verdicts and the tripwires that fire when a genai bump changes it:
+cargo test -p grain-llm-genai --test genai_seam_limits
+
+# WP21: the adapter-reachable half of S-5 (adapter fix AB-3), end to end:
+cargo test -p grain-llm-genai --test tool_arg_repair
 ```
+
+### When a genai bump changes the seam
+
+`tests/genai_seam_limits.rs` fails rather than silently passing when genai
+starts delivering something it previously dropped. That failure is the
+signal to (a) re-measure the affected gap in §6, (b) un-`#[ignore]` its
+vector in `seam_vectors.rs`, and (c) update the counts in §5. Do not
+"repair" those tests by relaxing them — like the STRUCTURAL vectors, their
+red is the measurement.

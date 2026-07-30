@@ -655,13 +655,27 @@ fn raw_tool_args(v: &serde_json::Value) -> String {
 /// - Empty accumulation → empty object (upstream starts toolCall blocks with
 ///   `arguments: {}`).
 /// - Complete JSON → parsed value.
-/// - Partial JSON (mid-stream) → kept as `Value::String`; the outbound
-///   layer's corrupt-args guard recognizes that shape if it ever escapes a
-///   terminal (e.g. aborted stream), and the final chunk's complete JSON
-///   replaces it on the happy path.
+/// - JSON malformed only in its **string literals** (an invalid escape such
+///   as `\H`, or a raw control character like a TAB that the provider failed
+///   to escape) → repaired and parsed, mirroring upstream pi-ai's
+///   `parseJsonWithRepair` (see [`crate::mapping::json_repair`]). Before
+///   WP21 these fell through to the `Value::String` branch below, where the
+///   outbound corrupt-args guard
+///   ([`crate::mapping::outbound::to_chat_request`]) dropped the entire tool
+///   call — one stray escape anywhere in the arguments silently cost the
+///   user the whole call. This is the adapter-reachable half of structural
+///   gap S-5.
+/// - Partial / truncated JSON (mid-stream, or a stream that ended early) →
+///   kept as `Value::String`; the outbound layer's corrupt-args guard
+///   recognizes that shape if it ever escapes a terminal (e.g. aborted
+///   stream), and the final chunk's complete JSON replaces it on the happy
+///   path. Upstream additionally coerces truncated buffers into a partial
+///   object; grain deliberately does not — see the scope note in
+///   [`crate::mapping::json_repair`].
 fn parse_tool_args(raw: &str) -> serde_json::Value {
     if raw.is_empty() {
         return serde_json::Value::Object(Default::default());
     }
-    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+    crate::mapping::json_repair::parse_json_with_repair(raw)
+        .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
 }

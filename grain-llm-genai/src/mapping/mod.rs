@@ -5,10 +5,13 @@
 //! - [`inbound`] — `genai::chat::ChatStreamEvent` → `AssistantMessageEvent`,
 //!   accumulating an `AssistantMessage` as events flow.
 //! - [`usage`] — shared scalar conversions (usage tokens, stop reason).
+//! - [`json_repair`] — upstream-parity lenient parsing for streamed
+//!   tool-call arguments (structural gap S-5, adapter-reachable half).
 //!
 //! Each direction is a pure function / state machine with no I/O so they can
 //! be exercised by unit tests without spinning up an LLM.
 
 pub mod inbound;
+pub mod json_repair;
 pub mod outbound;
 pub mod usage;
