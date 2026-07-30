@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesOrdered, StreamExt};
 use tokio_util::sync::CancellationToken;
@@ -1065,6 +1064,21 @@ struct ExecutedOutcome {
     is_error: bool,
 }
 
+/// Shared state behind the tool-update callback: the accepting-updates
+/// latch plus the in-flight update-event tasks.
+///
+/// Port of `executePreparedToolCall`'s `acceptingUpdates` flag and
+/// `updateEvents` promise array (agent-loop.ts:666-707, introduced by
+/// upstream commit daab056a): updates are delivered as they arrive, but the
+/// callback is scoped to the current `execute()` invocation — once the tool
+/// settles, the latch closes and later calls are ignored. Latch check and
+/// task registration happen under one lock so a concurrently-arriving update
+/// can never slip in after settlement drained the list.
+struct UpdateEventState {
+    accepting: bool,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
 async fn execute_prepared(
     prepared: &PreparedToolCall,
     cancel: CancellationToken,
@@ -1075,6 +1089,12 @@ async fn execute_prepared(
     let name = prepared.tool_call.name.clone();
     let args = prepared.tool_call.arguments.clone();
 
+    let state = Arc::new(std::sync::Mutex::new(UpdateEventState {
+        accepting: true,
+        tasks: Vec::new(),
+    }));
+
+    let state_for_callback = state.clone();
     let on_update: ToolUpdateCallback = Arc::new(move |partial: AgentToolResult| {
         let event = AgentEvent::ToolExecutionUpdate {
             tool_call_id: id.clone(),
@@ -1082,24 +1102,17 @@ async fn execute_prepared(
             args: args.clone(),
             partial_result: partial,
         };
-        // Fire-and-forget: emit asynchronously without awaiting from the tool
-        // body. tokio's spawn keeps semantics close to the TS implementation
-        // which accumulates promises and awaits them after execute resolves.
-        //
-        // Wrap in `catch_unwind` so a panicking subscriber surfaces as a
-        // stderr log instead of silently disappearing into the spawn — the
-        // JoinHandle is dropped, so without this the panic is fully eaten.
-        let fut = std::panic::AssertUnwindSafe((emit_cloned)(event)).catch_unwind();
-        tokio::spawn(async move {
-            if let Err(panic) = fut.await {
-                let msg = panic
-                    .downcast_ref::<&'static str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "<non-string panic>".into());
-                eprintln!("[warn] ToolExecutionUpdate listener panicked: {msg}");
-            }
-        });
+        let mut state = state_for_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // agent-loop.ts:680 — `if (!acceptingUpdates) return;`
+        if !state.accepting {
+            return;
+        }
+        // agent-loop.ts:681-691 — start the emission immediately and track
+        // its settlement; the settle path below awaits every tracked task
+        // before the tool call finalizes.
+        state.tasks.push(tokio::spawn((emit_cloned)(event)));
     });
 
     let exec = prepared
@@ -1111,6 +1124,23 @@ async fn execute_prepared(
             on_update,
         )
         .await;
+
+    // agent-loop.ts:694-706 — on both success and failure: close the latch,
+    // then await all pending update events before returning.
+    let tasks = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.accepting = false;
+        std::mem::take(&mut state.tasks)
+    };
+    for task in tasks {
+        if let Err(join_err) = task.await {
+            // A panicking subscriber must not be silently eaten (nor abort
+            // the tool call); surface it like the previous implementation.
+            eprintln!("[warn] ToolExecutionUpdate listener panicked: {join_err}");
+        }
+    }
 
     match exec {
         Ok(result) => ExecutedOutcome {

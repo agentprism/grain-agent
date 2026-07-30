@@ -290,7 +290,6 @@ async fn passes_active_abort_signal_to_subscribers() {
 /// behavioural assertions (exactly one update delivered, none after the tool
 /// settles) are kept exact.
 #[tokio::test]
-#[ignore = "patch-4: tool_execution_update emitted via fire-and-forget tokio::spawn (no settle gate, ordering not guaranteed)"]
 async fn ignores_tool_updates_after_execution_settles() {
     let delayed_update: Arc<StdMutex<Option<ToolUpdateCallback>>> = Arc::new(StdMutex::new(None));
     let update_capture = delayed_update.clone();
@@ -356,7 +355,6 @@ async fn ignores_tool_updates_after_execution_settles() {
 /// TS: "should ignore a settled parallel tool update while another tool is
 /// still running"
 #[tokio::test]
-#[ignore = "patch-4: tool_execution_update emitted via fire-and-forget tokio::spawn (no settle gate, ordering not guaranteed)"]
 async fn ignores_settled_parallel_tool_update_while_other_tool_running() {
     let slow_started = Arc::new(Notify::new());
     let settled_tool_ended = Arc::new(Notify::new());
