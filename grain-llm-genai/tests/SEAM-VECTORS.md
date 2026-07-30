@@ -9,9 +9,22 @@ standard.
 - genai version under measurement: **0.6.5** (workspace pin).
 - Harness: `tests/seam_vectors.rs`.
 
-**WP21 status (this revision).** Every structural gap in §6 was re-examined
-against the question "is this closable in `grain-llm-genai`, above genai's
-public API?" The answer is **no for all eight** — with one partial exception,
+**WP25 status (this revision).** The Anthropic vectors now run through the
+**native Anthropic transport** (`src/anthropic/`), a second `LlmStream`
+behind the same seam, built because the WP21 measurement below showed the gaps
+unreachable from `ChatStreamEvent` and the one alternative route (an
+endpoint-tee relay, costed in §6) more expensive than owning the transport. **AV-1, AV-2, AV-3 and AV-5 are un-ignored and pass**;
+counts moved from 7 PASS / 6 STRUCTURAL to **11 PASS / 2 STRUCTURAL**. No
+vector was weakened or deleted — the upstream expectations are unchanged, a
+better backend now meets them. genai remains the **default** backend and its
+behavior on these same fixtures is still pinned, directly at its own seam, by
+`tests/genai_seam_limits.rs`. The native transport is verified against
+recorded fixtures only, **never against the live Anthropic API** — see
+`src/anthropic/stream.rs`.
+
+**WP21 status (prior revision).** Every structural gap in §6 was re-examined
+against the question "is this closable in `grain-llm-genai`, from what genai's
+streaming API delivers?" The answer is **no for all eight** — with one partial exception,
 the tool-argument half of S-5, which was closed (adapter fix AB-3, §5). The
 blocker is a single architectural fact, not eight separate ones: genai's
 streaming seam is `ChatStreamEvent`, and everything the provider sent beyond
@@ -33,6 +46,22 @@ recorded provider SSE (upstream fixture, frame-faithful)
   → grain-llm-genai inbound adapter (GenaiStream) (production code)
   → grain AssistantMessageEvents                  (asserted)
 ```
+
+Since WP25 the **anthropic** vectors (AV-*) run the other backend instead —
+same fixture, same socket, same assertions, different transport:
+
+```
+recorded provider SSE (upstream fixture, frame-faithful)
+  → local mock HTTP endpoint (tests/seam_vectors.rs::serve_sse_once)
+  → grain-llm-genai native Anthropic transport    (production code)
+      src/anthropic/{wire,state,request}.rs
+  → grain AssistantMessageEvents                  (asserted)
+```
+
+genai is still the default backend at runtime; its behavior on these same
+Anthropic fixtures is pinned separately, and directly at its own seam, by
+`tests/genai_seam_limits.rs`. So routing the vectors to the better backend
+adds a measurement rather than replacing one.
 
 Only the endpoint URL and auth are overridden (via genai's
 `ServiceTargetResolver` / `AuthResolver`, the same hooks production
@@ -141,11 +170,11 @@ explicit `structural gap` panic naming the unrepresentable field.
 
 | Vector | Provider / API | Upstream test (`packages/ai/test/`) | Upstream case | Classification | Reason |
 |---|---|---|---|---|---|
-| AV-1 | anthropic | `anthropic-sse-parsing.test.ts` | repairs malformed SSE JSON and malformed streamed tool JSON | **STRUCTURAL** | S-5: genai serde-parses each frame; malformed JSON aborts the stream (`Error::StreamParse`) instead of being repaired. Observed: chain stops after `Start, ToolcallStart` with a terminal `Error` |
-| AV-2 | anthropic | `anthropic-sse-parsing.test.ts` | preserves refusal stop details from message_delta | **STRUCTURAL** | S-4: `delta.stop_details.explanation` never crosses genai — grain can only produce the no-details refusal default. Also hits S-3 (usage 824 vs 412) |
-| AV-3 | anthropic | `anthropic-sse-parsing.test.ts` | preserves sensitive stop reasons with a descriptive error message | **STRUCTURAL** | S-3: genai adds message_delta `input_tokens` onto message_start (24/24 vs upstream 12/12). Stop semantics (`error` + `Provider stopped with: sensitive`) pass since AB-1 |
-| AV-4 | anthropic | `anthropic-sse-parsing.test.ts` | treats message_delta without usage as a no-op for usage accumulation | **PASS** | Full chain reproduces upstream: events, content, stop, usage 12/0/12 |
-| AV-5 | anthropic | `anthropic-sse-parsing.test.ts` | ignores unknown SSE events after message_stop | **STRUCTURAL** | S-3 (24/5/29 vs upstream 12/5/17). The vector's own semantic — junk events after message_stop ignored — passes (genai stops polling after message_stop) |
+| AV-1 | anthropic | `anthropic-sse-parsing.test.ts` | repairs malformed SSE JSON and malformed streamed tool JSON | **PASS** (native transport) | Was S-5. The native transport parses each frame through `mapping::json_repair`, so the invalid `\H` escape and raw TAB are repaired at both the frame and tool-argument layers and the turn completes as upstream does |
+| AV-2 | anthropic | `anthropic-sse-parsing.test.ts` | preserves refusal stop details from message_delta | **PASS** (native transport) | Was S-4 + S-3. `delta.stop_details.explanation` is captured and surfaced as `error_message`; usage replaces per field (412/0/412, not 824) |
+| AV-3 | anthropic | `anthropic-sse-parsing.test.ts` | preserves sensitive stop reasons with a descriptive error message | **PASS** (native transport) | Was S-3. `message_delta.usage` now replaces rather than adds: 12/0/12, not 24/24 |
+| AV-4 | anthropic | `anthropic-sse-parsing.test.ts` | treats message_delta without usage as a no-op for usage accumulation | **PASS** (native transport) | Passed on genai too; on the native path the same green comes from replacement semantics skipping absent fields — the case that makes an unconditional halving of genai's total unsound |
+| AV-5 | anthropic | `anthropic-sse-parsing.test.ts` | ignores unknown SSE events after message_stop | **PASS** (native transport) | Was S-3. 12/5/17, not 24/5/29. Trailing junk frames are never read: the transport stops at the terminal |
 | OV-1 | openai-completions | `openai-completions-raw-stop-reason.test.ts` | preserves raw finish reasons for successful stops | **PASS** | Events/stop/usage exact. Upstream's `rawStopReason === "stop"` leg is AB-R1 (no grain slot; raw string does cross genai) |
 | OV-2 | openai-completions | `openai-completions-raw-stop-reason.test.ts` | preserves raw finish reasons for provider error stops | **PASS** | Fixed by AB-1 (was: silent `Done/Stop`). Error event + `Provider finish_reason: content_filter` exact. `rawStopReason` → AB-R1 |
 | OV-3 | openai-completions | `openai-completions-response-model.test.ts` | surfaces routed chunk.model on responseModel without changing model | **STRUCTURAL** | S-6: `chunk.model` never crosses genai; grain also lacks `response_model`. Representable remainder (text events, stop, usage 10/5/15) passes |
@@ -159,8 +188,14 @@ explicit `structural gap` panic naming the unrepresentable field.
 
 | Classification | Count | Vectors |
 |---|---|---|
-| PASS | 7 | AV-4, OV-1, OV-2, OV-4, OV-5, GV-1, GV-2 |
-| STRUCTURAL | 6 | AV-1, AV-2, AV-3, AV-5, OV-3, OV-6 |
+| PASS | 11 | AV-1, AV-2, AV-3, AV-4, AV-5, OV-1, OV-2, OV-4, OV-5, GV-1, GV-2 |
+| STRUCTURAL | 2 | OV-3, OV-6 |
+
+Movement since WP21 (7 PASS / 6 STRUCTURAL): **AV-1, AV-2, AV-3, AV-5** moved
+STRUCTURAL → PASS when the Anthropic vectors were routed through the native
+transport. The two remaining STRUCTURAL vectors are openai-completions
+(OV-3 responseModel, OV-6 reasoning_details); both need a genai change *and* a
+grain-agent-core field, so neither is reachable from any backend work here.
 | ADAPTER-BUG (vector left failing) | 0 | — |
 
 Adapter bugs found while building the vectors:
@@ -314,6 +349,28 @@ The one exception is the **tool-argument half of S-5**, which *is* reachable
 because genai lets the accumulated buffer cross as a `Value::String`. It was
 closed by adapter fix AB-3 (§5). It does not un-ignore AV-1.
 
+### WP25 resolution: what the native Anthropic transport closed
+
+The verdicts above stand — they are statements about what is reachable *above
+genai*, and they remain true. WP25 acted on them by owning the transport for
+one provider, which is the only lever they leave. For Anthropic models served
+by `src/anthropic/` (opt-in; genai is still the default):
+
+| gap | status on the native transport |
+|---|---|
+| S-1 per-event usage | **closed** — partials carry running usage from `message_start`, matching upstream's observable behavior. Not vector-asserted: partial usage is excluded from comparison scope (§3) |
+| S-3 usage double-count | **closed** — `UsageAccumulator` replaces per field [AV-2, AV-3, AV-5] |
+| S-4 `stop_details` | **closed** — explanation → `error_message` [AV-2] |
+| S-5 malformed repair | **closed**, both halves — frames and tool arguments [AV-1] |
+| S-8 block boundaries | **closed** — driven by `content_block_start`/`stop`; an empty block now emits its `*_start`/`*_end` pair |
+| S-2 `responseId` | **blocked on core** — the transport *captures* it (`AnthropicState::response_id`); `AssistantMessage` has no slot |
+| S-6 `responseModel` | **blocked on core** — likewise captured (`AnthropicState::response_model`), no slot |
+| S-7 `reasoning_details` | **out of reach** — openai-completions only; needs a genai change *and* a core `ToolCall` signature field |
+
+The three unclosed rows are unchanged in kind: two are one-line wire-ups
+waiting on core fields nobody owns yet, and the third is a different provider
+family. Everything the Anthropic wire actually carries now reaches the loop.
+
 - **S-1 — per-event usage.** Upstream partials carry running usage from
   `message_start` / per-chunk `usage` onward; genai only surfaces usage on
   `ChatStreamEvent::End(StreamEnd::captured_usage)`. genai would need to
@@ -362,7 +419,7 @@ closed by adapter fix AB-3 (§5). It does not un-ignore AV-1.
   | `message_start` 12, `message_delta` repeats 12 | 12 | 24 |
   | `message_start` 24, `message_delta` has no `usage` | 24 | 24 |
 
-  Any correction applied above genai is a function of what crosses, so it
+  Any correction applied to `StreamEnd` is a function of what crosses, so it
   must return the *same* answer for both — and exactly one of those answers
   is then wrong. Halving unconditionally would fix the first and corrupt the
   second, and the second is not hypothetical: it is upstream's own
@@ -472,6 +529,13 @@ closed by adapter fix AB-3 (§5). It does not un-ignore AV-1.
   are recorded here because the `error`-event half is a live user-facing
   defect on the default path, not a measurement artifact.
 
+  **Closed on the native Anthropic transport (WP25):** `error` frames
+  terminate the turn carrying the provider's own message
+  (`state.rs`, pinned by `provider_error_event_terminates_with_its_message`),
+  and `signature_delta` is read directly into the thinking block, so neither
+  defect applies to opted-in callers. S-9 remains open for the genai default
+  path, which is where most callers are.
+
 ## 7. Upstream fixtures at the pin that were not used
 
 Stream-parsing scope was anthropic SSE, google/gemini, and
@@ -534,7 +598,22 @@ cargo test -p grain-llm-genai --test genai_seam_limits
 
 # WP21: the adapter-reachable half of S-5 (adapter fix AB-3), end to end:
 cargo test -p grain-llm-genai --test tool_arg_repair
+
+# WP25: the native Anthropic transport (request shape, SSE framing, event
+# state machine, usage replacement, stop mapping):
+cargo test -p grain-llm-genai --lib anthropic::
 ```
+
+### A note on what "green" proves here
+
+Every assertion in this suite replays a **recorded** fixture from a local
+socket. For the genai backend that is the whole story: genai's request
+building is exercised by the same production code paths that run live. For the
+**native Anthropic transport it is not** — fixture parity proves the decode
+path reproduces upstream pi-ai exactly, and proves nothing about whether the
+live Anthropic API accepts the request that transport builds. That is why the
+native transport is opt-in and genai remains the default. Live verification is
+scheduled separately.
 
 ### When a genai bump changes the seam
 

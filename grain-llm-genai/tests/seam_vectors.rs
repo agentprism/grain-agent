@@ -36,7 +36,9 @@ use grain_agent_core::{
     AssistantContent, AssistantMessageEvent, LlmContext, LlmStream, Message, Model, StopReason,
     StreamOptions, TextContent, ToolCall, ToolDefinition, Usage, UserContent, UserMessage,
 };
-use grain_llm_genai::{GenaiStream, baseline_chat_options};
+use grain_llm_genai::{
+    AnthropicStream, AnthropicTransportConfig, GenaiStream, baseline_chat_options,
+};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -153,6 +155,50 @@ async fn run_vector(
         )
         .await
         .expect("GenaiStream::stream never errors for runtime failures");
+
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        let terminal = ev.is_terminal();
+        events.push(ev);
+        if terminal {
+            break;
+        }
+    }
+
+    let request_line = request_handle.await.expect("mock server task");
+    (events, request_line)
+}
+
+/// Run one Anthropic vector through the **native Anthropic transport**
+/// (`grain_llm_genai::anthropic`) instead of genai.
+///
+/// Same recorded upstream fixture, same local socket, same assertions — only
+/// the backend differs. The genai backend's behavior on these very fixtures is
+/// pinned separately in `tests/genai_seam_limits.rs`, which asserts the
+/// defects directly at genai's seam (the S-3 double count, the dropped
+/// `stop_details`, the vanishing empty block), so switching these vectors to
+/// the native path measures the better backend without losing the measurement
+/// of the default one.
+async fn run_anthropic_vector(
+    model: &Model,
+    ctx: &LlmContext,
+    sse_body: String,
+) -> (Vec<AssistantMessageEvent>, String) {
+    let (base_url, request_handle) = serve_sse_once(sse_body).await;
+
+    let stream_impl = AnthropicStream::new(
+        AnthropicTransportConfig::with_api_key("seam-test-key").with_base_url(base_url),
+    );
+
+    let mut stream = stream_impl
+        .stream(
+            model,
+            ctx,
+            &StreamOptions::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("AnthropicStream::stream never errors for runtime failures");
 
     let mut events = Vec::new();
     while let Some(ev) = stream.next().await {
@@ -555,7 +601,6 @@ fn gemini_sse(chunks: &[serde_json::Value]) -> String {
 /// `Error::StreamParse`, so the grain chain terminates with an `Error`
 /// event instead of the repaired `Done`.
 #[tokio::test]
-#[ignore = "structural: genai 0.6.5 has no malformed-JSON repair — the anthropic streamer serde-parses each SSE frame and a parse failure aborts the stream (adapter/adapters/anthropic/streamer.rs, content_block_delta arm), while upstream pi-ai repairs both the SSE frame and the streamed tool JSON (anthropic-messages.ts parseStreamingJson). genai would need equivalent lenient parsing/repair before the seam can reproduce this vector"]
 async fn av1_anthropic_repairs_malformed_sse_and_tool_json() {
     let malformed_tool_json_delta = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"A\\H\\\",\\\"text\\\":\\\"col1\tcol2\\\"}\"}}".to_string();
 
@@ -606,7 +651,7 @@ async fn av1_anthropic_repairs_malformed_sse_and_tool_json() {
         "anthropic-messages",
         "anthropic",
     );
-    let (events, request_line) = run_vector(&model, &ctx, sse).await;
+    let (events, request_line) = run_anthropic_vector(&model, &ctx, sse).await;
     assert!(
         request_line.contains("/messages"),
         "expected the real anthropic adapter URL, got {request_line:?}"
@@ -642,7 +687,6 @@ async fn av1_anthropic_repairs_malformed_sse_and_tool_json() {
 const REFUSAL_EXPLANATION: &str = "This request triggered restrictions on violative cyber content and was blocked under Anthropic's Usage Policy. To learn more, provide feedback, or request an exemption based on how you use Claude, visit our help center: https://support.claude.com/en/articles/14604842-real-time-cyber-safeguards-on-claude.";
 
 #[tokio::test]
-#[ignore = "structural: genai's anthropic streamer captures only delta.stop_reason and drops delta.stop_details (adapter/adapters/anthropic/streamer.rs, message_delta arm), so the refusal explanation upstream surfaces as errorMessage never crosses ChatStreamEvent — genai would need to parse stop_details and expose it on StreamEnd. Additionally hits structural gap S-3 (message_delta usage.input_tokens added onto message_start instead of replacing: 824 vs upstream 412)"]
 async fn av2_anthropic_preserves_refusal_stop_details() {
     let sse = anthropic_sse(&[
         anthropic_message_start("msg_01XFUDYJgAACzvnptvVoYEL", 412),
@@ -675,7 +719,7 @@ async fn av2_anthropic_preserves_refusal_stop_details() {
         "anthropic-messages",
         "anthropic",
     );
-    let (events, _) = run_vector(&model, &user_ctx("blocked request"), sse).await;
+    let (events, _) = run_anthropic_vector(&model, &user_ctx("blocked request"), sse).await;
 
     // Upstream: stopReason "error", errorMessage = stop_details.explanation,
     // usage replaced per-field (input 412, output 0, total 412).
@@ -701,7 +745,6 @@ async fn av2_anthropic_preserves_refusal_stop_details() {
 /// (`Other("sensitive")` → Error + "Provider stopped with: sensitive");
 /// the residual failure is genai's usage accumulation.
 #[tokio::test]
-#[ignore = "structural: genai's anthropic streamer ADDS message_delta usage.input_tokens onto the message_start count (adapter/adapters/anthropic/streamer.rs capture_usage `*val += input_tokens`), reporting input=24/total=24 where upstream pi-ai replaces per-field (anthropic-messages.ts message_delta handler) and expects input=12/total=12. genai would need replace semantics for message_delta usage. The vector's stop-reason semantics pass since adapter fix AB-1"]
 async fn av3_anthropic_sensitive_stop_reason() {
     let sse = anthropic_sse(&[
         anthropic_message_start("msg_sensitive", 12),
@@ -727,7 +770,7 @@ async fn av3_anthropic_sensitive_stop_reason() {
         "anthropic-messages",
         "anthropic",
     );
-    let (events, _) = run_vector(&model, &user_ctx("blocked request"), sse).await;
+    let (events, _) = run_anthropic_vector(&model, &user_ctx("blocked request"), sse).await;
 
     assert_events(
         "AV-3",
@@ -769,7 +812,7 @@ async fn av4_anthropic_message_delta_without_usage_is_noop() {
         "anthropic-messages",
         "anthropic",
     );
-    let (events, request_line) = run_vector(&model, &user_ctx("Say hello."), sse).await;
+    let (events, request_line) = run_anthropic_vector(&model, &user_ctx("Say hello."), sse).await;
     assert!(
         request_line.contains("/messages"),
         "expected the real anthropic adapter URL, got {request_line:?}"
@@ -802,7 +845,6 @@ async fn av4_anthropic_message_delta_without_usage_is_noop() {
 /// parsed); the residual failure is the same S-3 usage accumulation as
 /// AV-3, because this fixture's message_delta carries usage.
 #[tokio::test]
-#[ignore = "structural: same genai anthropic usage accumulation defect as AV-3 (S-3) — message_delta usage input 12/output 5 is added onto message_start's input 12, yielding input=24/total=29 where upstream expects input=12/total=17. The trailing-unknown-events semantic itself passes (genai's streamer stops polling after message_stop)"]
 async fn av5_anthropic_ignores_unknown_events_after_message_stop() {
     let mut events_fixture = minimal_anthropic_events();
     events_fixture.push(("done", "[DONE]".to_string()));
@@ -814,7 +856,7 @@ async fn av5_anthropic_ignores_unknown_events_after_message_stop() {
         "anthropic-messages",
         "anthropic",
     );
-    let (events, _) = run_vector(&model, &user_ctx("Say hello."), sse).await;
+    let (events, _) = run_anthropic_vector(&model, &user_ctx("Say hello."), sse).await;
 
     // Upstream: stopReason "stop", content [text "Hello"], no error; usage
     // replaced per-field by message_delta → input 12, output 5, total 17.
