@@ -2,9 +2,8 @@
 //! (pi pinned commit 34239180).
 //!
 //! Each test mirrors one upstream `it(...)` block and asserts the same
-//! semantics: event sequences, orderings, and edge cases. Tests that fail
-//! against the current loop are kept exact and marked
-//! `#[ignore = "patch-N: ..."]` per the WP1/WP4 debt ledger.
+//! semantics: event sequences, orderings, and edge cases. All patch-N debt
+//! from the WP1 port has been repaid by WP4 — no ignored tests remain.
 //! See `tests/PORTING.md` for the full mapping table.
 
 mod common;

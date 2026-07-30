@@ -1,4 +1,4 @@
-# pi-agent-core loop test port (WP1)
+# pi-agent-core loop test port (WP1 → WP4)
 
 This directory carries the executable spec of the agent-loop semantics: a
 faithful port of the upstream TypeScript loop test-suite into Rust.
@@ -11,6 +11,10 @@ faithful port of the upstream TypeScript loop test-suite into Rust.
   - shared fixtures (`createModel`, `createAssistantMessage`,
     `createUserMessage`, `identityConverter`, `MockAssistantStream`) →
     `tests/common/mod.rs`
+- **Fresh WP4 vectors:** `tests/loop_patches.rs` — behaviors in the WP4
+  divergence ledger with no covering vector in the two ported files
+  (patch-1, patch-2, patch-8, patch-9 serde/wire vectors), derived directly
+  from the upstream sources and cited per test.
 
 ## Rules of this suite
 
@@ -19,13 +23,10 @@ faithful port of the upstream TypeScript loop test-suite into Rust.
   make a test pass.
 - A faithfully-ported test that fails against the current loop stays exact and
   is marked `#[ignore = "patch-N: <reason>"]`, where `patch-N` refers to the
-  WP4 divergence ledger. `cargo test -p grain-agent-core` is green because
-  ignored tests do not run by default; `cargo test -- --ignored` shows the
-  open debt.
+  WP4 divergence ledger. **As of WP4 the ledger is repaid: no ignored tests
+  remain** (`cargo test -p grain-agent-core -- --ignored` runs nothing).
 - A TS test that exercises a TS-only mechanism is **skipped** (not ported,
   not approximated) and documented below.
-- When WP4 lands a patch, un-ignore the corresponding tests; they are the
-  acceptance criteria for that patch.
 
 ## Mapping table — `agent-loop.test.ts` → `tests/agent_loop.rs`
 
@@ -35,9 +36,9 @@ faithful port of the upstream TypeScript loop test-suite into Rust.
 | should emit events with AgentMessage types | `emits_events_with_agent_message_types` | passing |
 | should handle custom message types via convertToLlm | `handles_custom_message_types_via_convert_to_llm` | passing |
 | should apply transformContext before convertToLlm | `applies_transform_context_before_convert_to_llm` | passing |
-| should handle tool calls and results | `handles_tool_calls_and_results` | passing — **partial** (usage assertions untranslatable: patch-9, see notes) |
-| should not execute tool calls from a length-truncated assistant message | `does_not_execute_tool_calls_from_length_truncated_message` | ignored (patch-6) |
-| should execute mutated beforeToolCall args without revalidation | `executes_mutated_before_tool_call_args_without_revalidation` | ignored (patch-3) |
+| should handle tool calls and results | `handles_tool_calls_and_results` | passing — **full port** (patch-9 restored the tool-result usage plumbing; the previously dropped usage assertions are now included) |
+| should not execute tool calls from a length-truncated assistant message | `does_not_execute_tool_calls_from_length_truncated_message` | passing (patch-6) |
+| should execute mutated beforeToolCall args without revalidation | `executes_mutated_before_tool_call_args_without_revalidation` | passing (patch-3: hook rewrites args via the `BeforeToolCallResult::args` override channel; assertion unchanged — execute sees `123`) |
 | should prepare tool arguments for validation | `prepares_tool_arguments_for_validation` | passing |
 | should emit tool_execution_end in completion order but persist tool results in source order | `emits_tool_execution_end_in_completion_order_persists_results_in_source_order` | passing |
 | should inject queued messages after all tool calls complete | `injects_queued_messages_after_all_tool_calls_complete` | passing |
@@ -52,7 +53,7 @@ faithful port of the upstream TypeScript loop test-suite into Rust.
 | agentLoopContinue › should throw when context has no messages | `continue_errors_when_context_has_no_messages` | passing |
 | agentLoopContinue › should continue from existing context without emitting user message events | `continue_from_existing_context_without_user_message_events` | passing |
 | agentLoopContinue › should allow custom message types as last message (caller responsibility) | `continue_allows_custom_message_as_last_message` | passing |
-| *(fixture-derived, no named TS test)* upstream `createUserMessage` wire shape (`content: "<string>"`) | `user_message_string_content_wire_format` | ignored (patch-7) |
+| *(fixture-derived, no named TS test)* upstream `createUserMessage` wire shape (`content: "<string>"`) | `user_message_string_content_wire_format` | passing (patch-7) |
 
 ## Mapping table — `agent.test.ts` → `tests/agent.rs`
 
@@ -64,10 +65,10 @@ faithful port of the upstream TypeScript loop test-suite into Rust.
 | should subscribe to events | `subscribe_to_events` | passing |
 | emits full lifecycle events for thrown run failures | `emits_full_lifecycle_events_for_thrown_run_failures` | passing (TS sync throw expressed as `Err` from `LlmStream::stream`) |
 | should await async subscribers before prompt resolves | `awaits_async_subscribers_before_prompt_resolves` | passing |
-| waitForIdle should wait for async subscribers | — | skipped (patch-5: `Agent` exposes no `wait_for_idle`; only the harness crate has one, a 10ms poll with a start race — the contract cannot be expressed against grain-agent-core) |
+| waitForIdle should wait for async subscribers | `wait_for_idle_waits_for_async_subscribers` | passing (patch-5: `Agent::wait_for_idle` resolves only after the run and all awaited `agent_end` subscribers settle; see translation note) |
 | should pass the active abort signal to subscribers | `passes_active_abort_signal_to_subscribers` | passing (`AbortSignal` ↔ `CancellationToken`) |
-| should ignore tool updates after the tool execution settles | `ignores_tool_updates_after_execution_settles` | ignored (patch-4) |
-| should ignore a settled parallel tool update while another tool is still running | `ignores_settled_parallel_tool_update_while_other_tool_running` | ignored (patch-4) |
+| should ignore tool updates after the tool execution settles | `ignores_tool_updates_after_execution_settles` | passing (patch-4) |
+| should ignore a settled parallel tool update while another tool is still running | `ignores_settled_parallel_tool_update_while_other_tool_running` | passing (patch-4) |
 | should update state with mutators | `updates_state_with_mutators` | passing — **partial** (reference-identity / live-array-push checks are TS-only, see notes) |
 | should support steering message queue | `supports_steering_message_queue` | passing |
 | should support follow-up message queue | `supports_follow_up_message_queue` | passing |
@@ -77,18 +78,19 @@ faithful port of the upstream TypeScript loop test-suite into Rust.
 | continue() should process queued follow-up messages after an assistant turn | `continue_processes_queued_follow_up_after_assistant_turn` | passing |
 | continue() should keep one-at-a-time steering semantics from assistant tail | `continue_keeps_one_at_a_time_steering_from_assistant_tail` | passing |
 | keeps legacy prepareNextTurn signal callback behavior | `prepare_next_turn_receives_run_cancellation_token` | passing (legacy vs. with-context signature split is TS-only; Rust has one `prepare_next_turn(context, cancel)` hook) |
-| forwards sessionId to streamFunction options | `forwards_session_id_to_stream_options` | passing — **partial** (mid-life `agent.sessionId = …` setter half untranslatable: **unmapped divergence**, see below) |
+| forwards sessionId to streamFunction options | `forwards_session_id_to_stream_options` | passing — **full port** (patch-11 added `Agent::set_session_id`; the mid-life setter half is now included) |
 
 ## Counts
 
 - TS tests found: 21 (`agent-loop.test.ts`) + 20 (`agent.test.ts`) = **41**
-- Ported: **38** (3 of them partial: see notes) + 1 fixture-derived extra
-- Passing: **34**
-- Ignored: **5** — patch-3 ×1, patch-4 ×2, patch-6 ×1, patch-7 ×1
-- Skipped: **3** — 2× TS-only `setDefaultStreamFn`, 1× patch-5 (`wait_for_idle` API absent)
-
-All five ignored tests were run with `-- --ignored` and fail exactly for the
-documented patch reason (none fail for an unrelated cause).
+- Ported: **39** (1 of them partial: see notes) + 1 fixture-derived extra
+- Passing: **40** (39 ports + the fixture-derived wire vector)
+- Ignored: **0** — the WP1 patch-3/4/6/7 debt and the patch-5 skip are repaid
+- Skipped: **2** — both TS-only `setDefaultStreamFn` mechanisms
+- Fresh WP4 vectors: `tests/loop_patches.rs` (9 tests: patch-1 ×3, patch-2
+  ×2, patch-8 ×1, patch-9 ×3) plus harness-side patch-10 vectors in
+  `grain-agent-harness` (`session.rs` / `messages.rs` test modules) and
+  validation unit vectors in `src/validation.rs`
 
 ## Translation notes
 
@@ -100,28 +102,33 @@ documented patch reason (none fail for an unrelated cause).
 - **`setTimeout(() => release(), 20)`** → `release_after(notify, 20)`
   (spawned `tokio::time::sleep` + `Notify`). Deferred promises → `Notify`;
   shared flags → atomics.
-- **`handles_tool_calls_and_results` (patch-9 partial).** Upstream asserts:
+- **`handles_tool_calls_and_results` (patch-9, now full).** Upstream asserts:
   `tool.execute` returns `usage`, `afterToolCall` observes `result.usage`
   (equal to the tool's reading) and replaces it via `{ usage: patched }`, and
-  the persisted toolResult message carries the patched usage. Rust
-  `AgentToolResult`, `AfterToolCallResult`, and `ToolResultMessage` have no
-  `usage` field (patch-9 type drift: `AgentToolResult.usage` merge), so those
-  assertions cannot be written today. The port keeps the hook in the loop and
-  asserts it observed the executed result; WP4's patch-9 must restore the
-  usage plumbing and extend this test with the dropped assertions.
+  the persisted toolResult message carries the patched usage. WP4's patch-9
+  added `AgentToolResult.usage`, `AfterToolCallResult.usage`, and
+  `ToolResultMessage.usage` with the upstream spread-merge
+  (agent-loop.ts:734-741, 773-787), and the previously dropped assertions are
+  now part of the ported test.
 - **`executes_mutated_before_tool_call_args_without_revalidation`
-  (patch-3).** Upstream mutates the shared `args` object inside
-  `beforeToolCall`. Rust hooks receive a cloned `serde_json::Value` and
-  `BeforeToolCallResult` has no args-override channel, so the rewrite is
-  structurally impossible today. The ported test performs the closest
-  expression (mutating its copy) and pins the observable semantic
-  (`execute` sees `123`). WP4's patch-3 will need an explicit args-override
-  channel; update the hook body to use it, keep the assertion.
-- **`user_message_string_content_wire_format` (patch-7).** Not a named TS
-  test: it pins the upstream `createUserMessage` fixture shape
-  (`content: "<string>"`), which every upstream loop test runs on. The typed
-  Rust ports necessarily use the structured single-text-block form, so this
-  serde vector carries the string-content semantic explicitly.
+  (patch-3, now passing).** Upstream mutates the shared `args` object inside
+  `beforeToolCall` by reference. Rust hooks receive a cloned
+  `serde_json::Value`, so the rewrite goes through the explicit
+  `BeforeToolCallResult::args` override channel; the tool executes with the
+  returned args without revalidation. The observable assertion is unchanged:
+  `execute` sees `123` (a number, against a string-typed schema — proof no
+  second validation pass runs now that patch-1 made validation real).
+- **`wait_for_idle_waits_for_async_subscribers` (patch-5, now ported).** In
+  TS, `agent.prompt(...)` synchronously registers the active run before
+  `waitForIdle()` is called on the next line. The Rust prompt runs on a
+  spawned task, so the port first waits for the run to be observably
+  streaming (the listener blocks the run on a barrier well before
+  `agent_end`), then asserts the same contract.
+- **`user_message_string_content_wire_format` (patch-7, now passing).** Not a
+  named TS test: it pins the upstream `createUserMessage` fixture shape
+  (`content: "<string>"`), which every upstream loop test runs on. Patch-7
+  normalizes string content into the structured single-text-block form on
+  deserialization (and `null`/missing content to `[]`).
 - **`updates_state_with_mutators` (partial).** The TS assertions
   `expect(state.tools).not.toBe(tools)` (defensive copy identity) and
   `state.messages.push(...)` appending to live agent state depend on the TS
@@ -137,27 +144,28 @@ documented patch reason (none fail for an unrelated cause).
 - **`shouldStopAfterTurn` message-role assertion.** TS asserts
   `message.role === "assistant"`; in Rust the hook's `message` is typed
   `AssistantMessage`, so the assertion holds by construction.
+- **Validation error copy (patch-1).** The Rust default validator mirrors
+  upstream `validateToolArguments` (pi-ai `utils/validation.ts:278-310`):
+  same coercion pipeline, same failure shape (`Validation failed for tool
+  "<name>":\n  - <path>: <message>\n\nReceived arguments:\n<json>`). The
+  per-keyword `<message>` text comes from the `jsonschema` crate rather than
+  typebox, so the human-readable copy of individual validation errors
+  differs; vectors assert the structural shape and the exact upstream
+  behavioural semantics (no execution, isError result, loop continues).
 
-## Unmapped divergences (not in the patch-1…10 ledger)
+## Repaid divergences (WP4)
 
-- **`Agent.sessionId` setter missing.** Upstream `agent.sessionId =
-  "session-def"` re-targets subsequent prompts mid-life and the test asserts
-  the next stream call receives the new id. The Rust `Agent` stores
-  `session_id` privately at construction with no setter, so the second half of
-  "forwards sessionId to streamFunction options" cannot be ported. This does
-  not map to any listed patch (patch-8 covers `on_payload` / `on_response` /
-  `thinking_budgets`, not the session-id setter) — flagging as a candidate
-  addition to the WP4 ledger.
+The WP1 ledger entries patch-1 … patch-11 have all landed; see the
+`wp4/loop-patches` commit series for the per-patch citations. The previously
+"unmapped divergence" (`Agent.sessionId` setter) landed as patch-11.
 
-## Patches with no covering upstream test
+## Behaviors covered only by fresh vectors
 
-For the record, these WP4 ledger entries have **no** vector in the two ported
-files (upstream does not test them there): patch-1 (schema
-validation/coercion no-op — only indirectly touched via
-`prepares_tool_arguments_for_validation`, which passes either way), patch-2
-(hook throw → isError containment), patch-8 (`on_payload` / `on_response` /
-`thinking_budgets` plumbing), patch-10 (session entry kinds — lives in
-pi-coding-agent, out of scope for `packages/agent`), and most of patch-9
-(StopReason::Pending, `cache_write_1h` / `reasoning` usage fields,
-ThinkingLevel::Max). WP4 should add fresh vectors for those alongside the
-fixes.
+Upstream has no test in the two ported files for: patch-1 (schema
+validation/coercion), patch-2 (hook throw → isError containment), patch-8
+(`on_payload` / `on_response` / `thinking_budgets` plumbing), patch-9's wire
+names (`pending`, `max`, `cacheWrite1h`, `reasoning`, `addedToolNames`) and
+patch-10 (session entry kinds — lives outside `packages/agent`'s loop tests).
+Those are pinned by `tests/loop_patches.rs`, `src/validation.rs` unit
+vectors, and the `grain-agent-harness` session/messages test modules, each
+citing the upstream source lines they mirror.
