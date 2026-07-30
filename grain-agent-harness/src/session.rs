@@ -146,6 +146,15 @@ pub enum SessionTreeEntryKind {
         #[serde(rename = "modelId")]
         model_id: String,
     },
+    /// Records a change to the active tool set.
+    ///
+    /// Port of the upstream `ActiveToolsChangeEntry`
+    /// (`packages/agent/src/harness/types.ts:398-401` @ 34239180); wire
+    /// field name matches the TS `activeToolNames`.
+    ActiveToolsChange {
+        #[serde(rename = "activeToolNames")]
+        active_tool_names: Vec<String>,
+    },
     Compaction {
         summary: String,
         first_kept_entry_id: String,
@@ -191,6 +200,7 @@ impl SessionTreeEntryKind {
             SessionTreeEntryKind::Message { .. } => "message",
             SessionTreeEntryKind::ThinkingLevelChange { .. } => "thinking_level_change",
             SessionTreeEntryKind::ModelChange { .. } => "model_change",
+            SessionTreeEntryKind::ActiveToolsChange { .. } => "active_tools_change",
             SessionTreeEntryKind::Compaction { .. } => "compaction",
             SessionTreeEntryKind::Custom { .. } => "custom",
             SessionTreeEntryKind::CustomMessage { .. } => "custom_message",
@@ -206,6 +216,11 @@ pub struct SessionContext {
     pub messages: Vec<AgentMessage>,
     pub thinking_level: String,
     pub model: Option<(String, String)>,
+    /// Active tool names derived from the last `active_tools_change` entry
+    /// on the branch, or `None` when no such entry exists (mirrors upstream
+    /// `deriveSessionContextState`, harness/session/session.ts:39-57
+    /// @ 34239180).
+    pub active_tool_names: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +405,19 @@ impl Session {
         Ok(entry.id)
     }
 
+    /// Record a change to the active tool set (mirrors upstream
+    /// `Session.appendActiveToolsChange`, harness/session/session.ts:250-258
+    /// @ 34239180).
+    pub async fn append_active_tools_change(
+        &self,
+        active_tool_names: Vec<String>,
+    ) -> Result<String, SessionError> {
+        let entry = self
+            .next_entry(SessionTreeEntryKind::ActiveToolsChange { active_tool_names })
+            .await?;
+        Ok(entry.id)
+    }
+
     /// Record a compaction event: which entries were dropped and why.
     pub async fn append_compaction(
         &self,
@@ -524,6 +552,7 @@ pub struct MoveToSummary {
 pub fn build_session_context(path_entries: &[SessionTreeEntry]) -> SessionContext {
     let mut thinking_level = "off".to_string();
     let mut model: Option<(String, String)> = None;
+    let mut active_tool_names: Option<Vec<String>> = None;
     let mut compaction_idx: Option<usize> = None;
 
     for (i, entry) in path_entries.iter().enumerate() {
@@ -535,6 +564,13 @@ pub fn build_session_context(path_entries: &[SessionTreeEntry]) -> SessionContex
             }
             SessionTreeEntryKind::ModelChange { provider, model_id } => {
                 model = Some((provider.clone(), model_id.clone()));
+            }
+            // Last one wins, mirroring upstream deriveSessionContextState
+            // (harness/session/session.ts:51-53).
+            SessionTreeEntryKind::ActiveToolsChange {
+                active_tool_names: names,
+            } => {
+                active_tool_names = Some(names.clone());
             }
             SessionTreeEntryKind::Message { message } => {
                 if let Some(asst) = message.as_assistant() {
@@ -619,6 +655,7 @@ pub fn build_session_context(path_entries: &[SessionTreeEntry]) -> SessionContex
         messages,
         thinking_level,
         model,
+        active_tool_names,
     }
 }
 
@@ -973,5 +1010,45 @@ mod tests {
         let ctx = session.build_context().await;
         // Expect: compaction summary + "kept" + "after compaction" (3 entries).
         assert_eq!(ctx.messages.len(), 3);
+    }
+
+    /// patch-10: `active_tools_change` entries persist, round-trip with the
+    /// upstream wire shape, and the last one on the branch drives
+    /// `SessionContext.active_tool_names` (mirrors upstream
+    /// appendActiveToolsChange + deriveSessionContextState,
+    /// harness/session/session.ts:39-57, 250-258 @ 34239180).
+    #[tokio::test]
+    async fn active_tools_change_persists_and_derives_context_state() {
+        let repo = InMemorySessionRepo::new();
+        let session = repo.create(None).await.unwrap();
+
+        session.append_message(user("hello")).await.unwrap();
+        // No entry yet: activeToolNames is null (upstream state default).
+        assert_eq!(session.build_context().await.active_tool_names, None);
+
+        session
+            .append_active_tools_change(vec!["read".into(), "bash".into()])
+            .await
+            .unwrap();
+        session
+            .append_active_tools_change(vec!["read".into()])
+            .await
+            .unwrap();
+
+        let ctx = session.build_context().await;
+        // Last one wins.
+        assert_eq!(ctx.active_tool_names, Some(vec!["read".to_string()]));
+        // The entry contributes no context messages.
+        assert_eq!(ctx.messages.len(), 1);
+
+        // Wire shape matches the TS ActiveToolsChangeEntry.
+        let entries = session.entries().await;
+        let entry = entries
+            .iter()
+            .find(|e| e.kind.type_tag() == "active_tools_change")
+            .expect("expected an active_tools_change entry");
+        let wire = serde_json::to_value(entry).unwrap();
+        assert_eq!(wire["type"], "active_tools_change");
+        assert_eq!(wire["activeToolNames"], serde_json::json!(["read", "bash"]));
     }
 }

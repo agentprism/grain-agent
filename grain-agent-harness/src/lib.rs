@@ -55,8 +55,9 @@ pub use escalation::{
     EscalationConfig, EscalationState, count_failures, decide_escalation, failure_escalation_hook,
 };
 pub use messages::{
-    BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, BranchSummaryMessage, COMPACTION_SUMMARY_PREFIX,
-    COMPACTION_SUMMARY_SUFFIX, CompactionSummaryMessage, CustomMessage, branch_summary_message,
+    BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, BashExecutionMessage, BranchSummaryMessage,
+    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, CompactionSummaryMessage, CustomMessage,
+    bash_execution_message, bash_execution_to_text, branch_summary_message,
     compaction_summary_message, convert_to_llm, custom_message,
 };
 pub use prefix_pin::{PinnedSystemPrompt, append_only_guard};

@@ -15,6 +15,63 @@ pub const BRANCH_SUMMARY_PREFIX: &str =
     "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
 pub const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
 
+/// Record of a user-initiated shell execution surfaced in the transcript.
+///
+/// Port of the upstream `BashExecutionMessage`
+/// (`packages/agent/src/harness/messages.ts:19-29` @ 34239180).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BashExecutionMessage {
+    /// Always `"bashExecution"`.
+    pub role: String,
+    pub command: String,
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_output_path: Option<String>,
+    pub timestamp: i64,
+    /// When true, the execution stays visible in the transcript but is
+    /// dropped from the LLM context (messages.ts:124-126).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_from_context: Option<bool>,
+}
+
+/// Build an [`AgentMessage::Custom`] carrying a bash execution record.
+pub fn bash_execution_message(msg: BashExecutionMessage) -> AgentMessage {
+    AgentMessage::Custom(serde_json::to_value(msg).expect("bash execution serialises"))
+}
+
+/// Render a bash execution as the text shown to the model.
+///
+/// Port of `bashExecutionToText` (messages.ts:63-79), matching the upstream
+/// copy exactly.
+pub fn bash_execution_to_text(msg: &BashExecutionMessage) -> String {
+    let mut text = format!("Ran `{}`\n", msg.command);
+    if !msg.output.is_empty() {
+        text.push_str(&format!("```\n{}\n```", msg.output));
+    } else {
+        text.push_str("(no output)");
+    }
+    if msg.cancelled {
+        text.push_str("\n\n(command cancelled)");
+    } else if let Some(code) = msg.exit_code
+        && code != 0
+    {
+        text.push_str(&format!("\n\nCommand exited with code {code}"));
+    }
+    if msg.truncated
+        && let Some(path) = &msg.full_output_path
+    {
+        text.push_str(&format!("\n\n[Output truncated. Full output: {path}]"));
+    }
+    text
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchSummaryMessage {
@@ -132,6 +189,20 @@ fn convert_custom(value: serde_json::Value) -> Option<Message> {
     let timestamp = value.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
 
     match role {
+        // messages.ts:124-132 — excluded executions are dropped from the LLM
+        // context; the rest become plain user messages with the rendered
+        // command transcript.
+        "bashExecution" => {
+            let msg: BashExecutionMessage = serde_json::from_value(value).ok()?;
+            if msg.exclude_from_context == Some(true) {
+                return None;
+            }
+            let text = bash_execution_to_text(&msg);
+            Some(Message::User(UserMessage {
+                content: vec![UserContent::Text(TextContent { text })],
+                timestamp: msg.timestamp,
+            }))
+        }
         "branchSummary" => {
             let summary = value.get("summary").and_then(|s| s.as_str()).unwrap_or("");
             let text = format!(
@@ -165,5 +236,87 @@ fn convert_custom(value: serde_json::Value) -> Option<Message> {
             Some(Message::User(UserMessage { content, timestamp }))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bash_msg() -> BashExecutionMessage {
+        BashExecutionMessage {
+            role: "bashExecution".into(),
+            command: "ls".into(),
+            output: "a.txt".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            timestamp: 42,
+            exclude_from_context: None,
+        }
+    }
+
+    /// patch-10: bashExecution converts to a plain user message carrying
+    /// the rendered transcript (upstream convertToLlm, messages.ts:124-132
+    /// @ 34239180).
+    #[test]
+    fn bash_execution_converts_to_user_message() {
+        let converted = convert_to_llm(vec![bash_execution_message(bash_msg())]);
+        assert_eq!(converted.len(), 1);
+        let Message::User(user) = &converted[0] else {
+            panic!("expected a user message, got {:?}", converted[0]);
+        };
+        assert_eq!(user.timestamp, 42);
+        let UserContent::Text(text) = &user.content[0] else {
+            panic!("expected text content");
+        };
+        assert_eq!(text.text, "Ran `ls`\n```\na.txt\n```");
+    }
+
+    /// patch-10: excludeFromContext drops the execution from the LLM
+    /// context entirely (messages.ts:124-126).
+    #[test]
+    fn bash_execution_exclude_from_context_is_dropped() {
+        let mut msg = bash_msg();
+        msg.exclude_from_context = Some(true);
+        let converted = convert_to_llm(vec![bash_execution_message(msg)]);
+        assert!(converted.is_empty());
+    }
+
+    /// Upstream bashExecutionToText copy: no output, non-zero exit code,
+    /// cancellation, and truncation notes (messages.ts:63-79).
+    #[test]
+    fn bash_execution_to_text_matches_upstream_copy() {
+        let mut msg = bash_msg();
+        msg.output = String::new();
+        msg.exit_code = Some(2);
+        assert_eq!(
+            bash_execution_to_text(&msg),
+            "Ran `ls`\n(no output)\n\nCommand exited with code 2"
+        );
+
+        let mut msg = bash_msg();
+        msg.cancelled = true;
+        // Cancellation suppresses the exit-code note.
+        msg.exit_code = Some(130);
+        assert_eq!(
+            bash_execution_to_text(&msg),
+            "Ran `ls`\n```\na.txt\n```\n\n(command cancelled)"
+        );
+
+        let mut msg = bash_msg();
+        msg.truncated = true;
+        msg.full_output_path = Some("/tmp/full.log".into());
+        assert_eq!(
+            bash_execution_to_text(&msg),
+            "Ran `ls`\n```\na.txt\n```\n\n[Output truncated. Full output: /tmp/full.log]"
+        );
+
+        // exitCode undefined → no exit-code note (msg.exitCode !== null &&
+        // !== undefined guard upstream).
+        let mut msg = bash_msg();
+        msg.exit_code = None;
+        assert_eq!(bash_execution_to_text(&msg), "Ran `ls`\n```\na.txt\n```");
     }
 }
