@@ -19,10 +19,28 @@ use grain_agent_core::Usage;
 ///   `prompt_tokens_details.audio_tokens` — grain's `Usage` has no
 ///   matching fields;
 /// - any counter genai reports as `None` maps to 0.
+///
+/// **Total fallback (WP5, adapter-bug AB-2, seam vectors OV-4/OV-5)**: some
+/// providers omit `total_tokens` from streaming usage frames, and genai's
+/// OpenAI streamer passes the field through as `None` rather than computing
+/// it (verified against genai 0.6.5 `adapter/adapters/openai/streamer.rs`,
+/// which — unlike the Anthropic streamer's `message_stop` handler — never
+/// derives a total). Upstream pi-ai always computes
+/// `totalTokens = input + output + cacheRead + cacheWrite`
+/// (`packages/ai/src/api/openai-completions.ts` `parseChunkUsage`,
+/// `anthropic-messages.ts` usage accumulation). Mirror that here whenever
+/// genai reports no usable total; a provider-supplied total still wins.
+///
+/// The fallback is `input + output + cache_write` — NOT upstream's literal
+/// `input + output + cacheRead + cacheWrite` — because grain's `input` is
+/// documented as the *total* prompt tokens (cached + uncached, see
+/// [`grain_agent_core::Cost::cost_for`]), whereas upstream's `input`
+/// excludes the cached share. The two formulas produce the same absolute
+/// value under each side's own convention.
 pub fn map_usage(g: genai::chat::Usage) -> Usage {
     let input = g.prompt_tokens.unwrap_or(0).max(0) as u64;
     let output = g.completion_tokens.unwrap_or(0).max(0) as u64;
-    let total = g.total_tokens.unwrap_or(0).max(0) as u64;
+    let reported_total = g.total_tokens.unwrap_or(0).max(0) as u64;
 
     let (cache_read, cache_write) = g
         .prompt_tokens_details
@@ -35,12 +53,18 @@ pub fn map_usage(g: genai::chat::Usage) -> Usage {
         })
         .unwrap_or((0, 0));
 
+    let total_tokens = if reported_total > 0 {
+        reported_total
+    } else {
+        input + output + cache_write
+    };
+
     Usage {
         input,
         output,
         cache_read,
         cache_write,
-        total_tokens: total,
+        total_tokens,
         ..Usage::default()
     }
 }

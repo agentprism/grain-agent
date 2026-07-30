@@ -744,3 +744,178 @@ fn signature_on_signed_closed_block_preserved_distinctly() {
         panic!();
     }
 }
+
+// ---------------------------------------------------------------------------
+// WP5 — captured stop-reason resolution (adapter fix AB-1) and usage total
+// fallback (adapter fix AB-2). Seam-level coverage lives in
+// tests/seam_vectors.rs; these pin the state-machine mapping in isolation.
+// ---------------------------------------------------------------------------
+
+fn end_with_stop(reason: genai::chat::StopReason) -> ChatStreamEvent {
+    ChatStreamEvent::End(StreamEnd {
+        captured_stop_reason: Some(reason),
+        ..StreamEnd::default()
+    })
+}
+
+#[test]
+fn captured_completed_maps_to_stop() {
+    use genai::chat::StopReason as G;
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        chunk("hi"),
+        end_with_stop(G::Completed("stop".into())),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::Stop);
+        assert!(result.error_message.is_none());
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn captured_completed_with_tool_calls_overrides_to_tool_use() {
+    // Gemini reports STOP alongside functionCall parts; upstream
+    // google-generative-ai.ts forces toolUse when tool calls are present.
+    use genai::chat::StopReason as G;
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        tool_call("call_1", "echo", serde_json::json!({"value": "ping"})),
+        end_with_stop(G::Completed("STOP".into())),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::ToolUse);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn captured_max_tokens_maps_to_length() {
+    use genai::chat::StopReason as G;
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        chunk("truncat"),
+        end_with_stop(G::MaxTokens("max_tokens".into())),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::Length);
+        assert!(result.error_message.is_none());
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn captured_content_filter_yields_error_terminal_with_upstream_phrasing() {
+    // Vector OV-2 (anthropic-family phrasing checked here; the openai
+    // family is exercised end-to-end in seam_vectors.rs).
+    use genai::chat::StopReason as G;
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        chunk("partial answer"),
+        end_with_stop(G::ContentFilter("SAFETY".into())),
+    ]);
+    match events.last().unwrap() {
+        AssistantMessageEvent::Error { error, result } => {
+            assert_eq!(error, "Provider stopped with: SAFETY");
+            assert_eq!(result.stop_reason, StopReason::Error);
+            assert_eq!(result.error_message.as_deref(), Some("Provider stopped with: SAFETY"));
+            // Accumulated content is preserved on the error terminal
+            // (upstream's error event carries the partial message).
+            assert_eq!(result.content.len(), 1);
+        }
+        other => panic!("expected Error terminal, got {other:?}"),
+    }
+}
+
+#[test]
+fn captured_pause_turn_is_resubmittable_stop() {
+    // anthropic-messages.ts mapStopReason: pause_turn → stop.
+    use genai::chat::StopReason as G;
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        chunk("thinking about it"),
+        end_with_stop(G::Other("pause_turn".into())),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::Stop);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn captured_refusal_uses_upstream_default_message() {
+    // genai never parses stop_details (structural gap S-4), so only
+    // upstream's no-details default message is reachable.
+    use genai::chat::StopReason as G;
+    let (events, _) = run([ChatStreamEvent::Start, end_with_stop(G::Other("refusal".into()))]);
+    match events.last().unwrap() {
+        AssistantMessageEvent::Error { error, result } => {
+            assert_eq!(error, "The model refused to complete the request");
+            assert_eq!(result.stop_reason, StopReason::Error);
+        }
+        other => panic!("expected Error terminal, got {other:?}"),
+    }
+}
+
+#[test]
+fn missing_captured_stop_reason_keeps_inference() {
+    // Pre-WP5 behavior preserved: no captured stop reason → infer from
+    // content (tool calls → ToolUse, otherwise Stop).
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        tool_call("call_1", "echo", serde_json::json!({"value": "x"})),
+        end_normal(),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::ToolUse);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn usage_total_falls_back_to_components_when_wire_omits_it() {
+    // AB-2 (seam vectors OV-4/OV-5): genai's OpenAI streamer passes an
+    // absent total_tokens through as None; grain computes
+    // input + output + cache_write (grain's input is cache-inclusive).
+    let usage = genai::chat::Usage {
+        prompt_tokens: Some(1),
+        completion_tokens: Some(2),
+        total_tokens: None,
+        ..Default::default()
+    };
+    let end = ChatStreamEvent::End(StreamEnd {
+        captured_usage: Some(usage),
+        ..StreamEnd::default()
+    });
+    let (events, _) = run([ChatStreamEvent::Start, chunk("hi"), end]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.usage.total_tokens, 3);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn usage_provider_supplied_total_wins_over_fallback() {
+    let usage = genai::chat::Usage {
+        prompt_tokens: Some(10),
+        completion_tokens: Some(5),
+        total_tokens: Some(99),
+        ..Default::default()
+    };
+    let end = ChatStreamEvent::End(StreamEnd {
+        captured_usage: Some(usage),
+        ..StreamEnd::default()
+    });
+    let (events, _) = run([ChatStreamEvent::Start, chunk("hi"), end]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.usage.total_tokens, 99);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
