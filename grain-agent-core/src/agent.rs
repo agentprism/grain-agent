@@ -98,6 +98,11 @@ struct Inner {
     steering_queue: PendingMessageQueue,
     follow_up_queue: PendingMessageQueue,
 
+    /// Opaque session id forwarded in stream requests. Lives in `Inner` so
+    /// it is settable mid-life (TS `agent.sessionId = ...`, agent.ts:199-200
+    /// @ 34239180); the next stream request picks up the new value.
+    session_id: Option<String>,
+
     active_run: Option<ActiveRun>,
 }
 
@@ -240,7 +245,6 @@ pub struct Agent {
     before_tool_call: Option<BeforeToolCallFn>,
     after_tool_call: Option<AfterToolCallFn>,
     prepare_next_turn: Option<PrepareNextTurnFn>,
-    session_id: Option<String>,
     thinking_budgets: Option<ThinkingBudgets>,
     transport: Option<String>,
     max_retry_delay_ms: Option<u64>,
@@ -267,6 +271,7 @@ impl Agent {
             next_listener_id: 0,
             steering_queue: PendingMessageQueue::new(options.steering_mode),
             follow_up_queue: PendingMessageQueue::new(options.follow_up_mode),
+            session_id: options.session_id,
             active_run: None,
         };
         Agent {
@@ -282,7 +287,6 @@ impl Agent {
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
             prepare_next_turn: options.prepare_next_turn,
-            session_id: options.session_id,
             thinking_budgets: options.thinking_budgets,
             transport: options.transport,
             max_retry_delay_ms: options.max_retry_delay_ms,
@@ -324,6 +328,19 @@ impl Agent {
     /// Switch the model for subsequent turns.
     pub async fn set_model(&self, model: Model) {
         self.inner.lock().await.model = model;
+    }
+
+    /// Re-target the opaque session id mid-life: the next stream request
+    /// receives the new value (TS `agent.sessionId = ...` setter,
+    /// agent.ts:199-200, pinned by the second half of "forwards sessionId
+    /// to streamFunction options").
+    pub async fn set_session_id(&self, session_id: Option<String>) {
+        self.inner.lock().await.session_id = session_id;
+    }
+
+    /// Current opaque session id forwarded in stream requests.
+    pub async fn session_id(&self) -> Option<String> {
+        self.inner.lock().await.session_id.clone()
     }
 
     /// Change the thinking level for subsequent turns.
@@ -700,15 +717,15 @@ impl Agent {
     }
 
     async fn build_loop_config(&self, skip_initial_steering_poll: bool) -> AgentLoopConfig {
-        let (thinking_level, model) = {
+        let (thinking_level, model, session_id) = {
             let g = self.inner.lock().await;
-            (g.thinking_level, g.model.clone())
+            (g.thinking_level, g.model.clone(), g.session_id.clone())
         };
         // Mirrors TS createLoopConfig (agent.ts:434-469): sessionId,
         // onPayload, onResponse, thinkingBudgets, transport and
         // maxRetryDelayMs all flow into the per-request stream options.
         let stream_options = StreamOptions {
-            session_id: self.session_id.clone(),
+            session_id,
             transport: self.transport.clone(),
             max_retry_delay_ms: self.max_retry_delay_ms,
             on_payload: self.on_payload.clone(),

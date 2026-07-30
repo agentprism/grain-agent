@@ -832,11 +832,9 @@ async fn prepare_next_turn_receives_run_cancellation_token() {
 
 /// TS: "forwards sessionId to streamFunction options"
 ///
-/// PARTIAL PORT: the TS test also reassigns `agent.sessionId = "session-def"`
-/// mid-life and asserts the next prompt forwards the new id. The Rust `Agent`
-/// has no session-id setter (the field is fixed at construction), so that
-/// half is untranslatable — flagged as an unmapped API divergence in
-/// tests/PORTING.md.
+/// Full port including the mid-life setter half (agent.test.ts:725-730):
+/// `agent.sessionId = "session-def"` re-targets subsequent prompts and the
+/// next stream call receives the new id (patch-11 added the Rust setter).
 #[tokio::test]
 async fn forwards_session_id_to_stream_options() {
     let received_session_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
@@ -854,5 +852,18 @@ async fn forwards_session_id_to_stream_options() {
     assert_eq!(
         received_session_id.lock().unwrap().as_deref(),
         Some("session-abc")
+    );
+
+    // Test setter (agent.test.ts:725-730).
+    agent.set_session_id(Some("session-def".into())).await;
+    assert_eq!(agent.session_id().await.as_deref(), Some("session-def"));
+
+    agent
+        .prompt_text("hello again")
+        .await
+        .expect("prompt failed");
+    assert_eq!(
+        received_session_id.lock().unwrap().as_deref(),
+        Some("session-def")
     );
 }
