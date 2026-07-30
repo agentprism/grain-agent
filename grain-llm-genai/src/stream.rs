@@ -1,4 +1,4 @@
-//! [`grain_agent_core::LlmStream`] implementation backed by `genai 0.5`.
+//! [`grain_agent_core::LlmStream`] implementation backed by `genai 0.6`.
 //!
 //! The streaming logic lives here; the message ↔ event translation lives in
 //! [`crate::mapping`]; the client construction + provider routing lives in
@@ -102,8 +102,8 @@ impl GenaiStream {
 ///
 /// Currently honored:
 /// - `reasoning` → `ChatOptions::with_reasoning_effort` (ThinkingLevel maps
-///   onto genai's `ReasoningEffort` variants 1:1, except `XHigh` collapses
-///   to `High` since genai 0.5 has no higher band).
+///   onto genai's `ReasoningEffort` variants 1:1 by name; see
+///   [`thinking_level_to_effort`]).
 ///
 /// **Not yet honored** (the genai 0.5 API doesn't expose per-call slots
 /// for these, so wiring them up requires a fuller refactor of the client
@@ -121,15 +121,37 @@ fn chat_options_with_runtime(base: ChatOptions, options: &StreamOptions) -> Chat
     chat
 }
 
+/// Map grain's [`ThinkingLevel`] onto genai 0.6's [`ReasoningEffort`], 1:1
+/// by name:
+///
+/// | grain `ThinkingLevel` | genai `ReasoningEffort` |
+/// |-----------------------|-------------------------|
+/// | `Off`                 | `None`                  |
+/// | `Minimal`             | `Minimal`               |
+/// | `Low`                 | `Low`                   |
+/// | `Medium`              | `Medium`                |
+/// | `High`                | `High`                  |
+/// | `XHigh`               | `XHigh`                 |
+///
+/// genai additionally offers `ReasoningEffort::Max` and
+/// `ReasoningEffort::Budget(u32)`, which have no grain-side counterpart
+/// yet — they stay unmapped until a later WP adds the corresponding
+/// `ThinkingLevel` variants. (The historical `XHigh` → `High` collapse
+/// dated from genai 0.5, which had no band above `High`; genai 0.6
+/// supports `XHigh` natively, so the user's intent now passes through
+/// unchanged.)
+///
+/// Forward-compat note: the genai 0.7 line renames `ReasoningEffort::None`
+/// to `ReasoningEffort::Zero` (with `#[serde(alias = "None")]`), so on that
+/// bump the `Off` arm becomes `ReasoningEffort::Zero` — a mechanical change.
 fn thinking_level_to_effort(level: ThinkingLevel) -> Option<ReasoningEffort> {
     match level {
         ThinkingLevel::Off => Some(ReasoningEffort::None),
         ThinkingLevel::Minimal => Some(ReasoningEffort::Minimal),
         ThinkingLevel::Low => Some(ReasoningEffort::Low),
         ThinkingLevel::Medium => Some(ReasoningEffort::Medium),
-        // genai 0.5 caps at High; XHigh collapses up to it rather than
-        // silently dropping the user's higher-effort intent.
-        ThinkingLevel::High | ThinkingLevel::XHigh => Some(ReasoningEffort::High),
+        ThinkingLevel::High => Some(ReasoningEffort::High),
+        ThinkingLevel::XHigh => Some(ReasoningEffort::XHigh),
     }
 }
 
