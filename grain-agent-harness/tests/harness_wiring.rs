@@ -444,3 +444,185 @@ async fn abort_while_idle_still_emits() {
     assert!(result.cleared_follow_up.is_empty());
     assert_eq!(fired.load(Ordering::SeqCst), 1);
 }
+
+// ---------------------------------------------------------------------------
+// The next_turn bucket
+// ---------------------------------------------------------------------------
+
+/// `next_turn` is callable while idle — that is the whole point of the third
+/// bucket, and it is what `steer` / `follow_up` cannot do.
+#[tokio::test]
+async fn next_turn_is_callable_while_idle_and_leads_the_next_prompt() {
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let spy = Arc::new(PromptSpy {
+        seen: seen.clone(),
+        turns: AtomicUsize::new(0),
+        tool_turns: 0,
+    });
+    let harness = AgentHarness::new(AgentHarnessOptions::new(
+        session().await,
+        model(),
+        spy as StreamFn,
+    ))
+    .await;
+
+    // Nothing is running.
+    harness.next_turn(user("queued first")).await;
+    harness.next_turn(user("queued second")).await;
+    harness.prompt_text("the actual prompt").await.unwrap();
+    harness.wait_for_idle().await;
+
+    let texts: Vec<String> = harness
+        .agent()
+        .state()
+        .await
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Standard(grain_agent_core::Message::User(u)) => match &u.content[0] {
+                UserContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        texts,
+        vec![
+            "queued first".to_string(),
+            "queued second".to_string(),
+            "the actual prompt".to_string(),
+        ],
+        "queued messages must lead the prompt, in queue order"
+    );
+}
+
+/// The bucket drains fully and does not leak into a later prompt.
+#[tokio::test]
+async fn next_turn_queue_drains_once() {
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let spy = Arc::new(PromptSpy {
+        seen: seen.clone(),
+        turns: AtomicUsize::new(0),
+        tool_turns: 0,
+    });
+    let harness = AgentHarness::new(AgentHarnessOptions::new(
+        session().await,
+        model(),
+        spy as StreamFn,
+    ))
+    .await;
+
+    harness.next_turn(user("only once")).await;
+    harness.prompt_text("first").await.unwrap();
+    harness.wait_for_idle().await;
+    harness.prompt_text("second").await.unwrap();
+    harness.wait_for_idle().await;
+
+    let count = harness
+        .agent()
+        .state()
+        .await
+        .messages
+        .iter()
+        .filter(|m| match m {
+            AgentMessage::Standard(grain_agent_core::Message::User(u)) => {
+                matches!(&u.content[0], UserContent::Text(t) if t.text == "only once")
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(count, 1, "the queued message must appear exactly once");
+}
+
+/// `abort` clears steer and follow-up but leaves the next-turn bucket alone,
+/// matching upstream's `AbortEvent` payload (which reports only the first two).
+#[tokio::test]
+async fn next_turn_survives_abort() {
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let spy = Arc::new(PromptSpy {
+        seen: seen.clone(),
+        turns: AtomicUsize::new(0),
+        tool_turns: 0,
+    });
+    let harness = AgentHarness::new(AgentHarnessOptions::new(
+        session().await,
+        model(),
+        spy as StreamFn,
+    ))
+    .await;
+
+    harness.next_turn(user("survives")).await;
+    let result = harness.abort().await;
+    assert!(result.cleared_steer.is_empty());
+    assert!(result.cleared_follow_up.is_empty());
+
+    harness.prompt_text("after abort").await.unwrap();
+    harness.wait_for_idle().await;
+
+    let texts: Vec<String> = harness
+        .agent()
+        .state()
+        .await
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Standard(grain_agent_core::Message::User(u)) => match &u.content[0] {
+                UserContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["survives".to_string(), "after abort".to_string()]
+    );
+}
+
+/// `QueueUpdate` reports per-bucket depth, so a status line can distinguish
+/// "two steers pending" from "one thing queued for next time".
+#[tokio::test]
+async fn queue_update_reports_per_bucket_depth() {
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let spy = Arc::new(PromptSpy {
+        seen: seen.clone(),
+        turns: AtomicUsize::new(0),
+        tool_turns: 0,
+    });
+    let harness = AgentHarness::new(AgentHarnessOptions::new(
+        session().await,
+        model(),
+        spy as StreamFn,
+    ))
+    .await;
+
+    let last: Arc<StdMutex<Option<(usize, usize, usize)>>> = Arc::new(StdMutex::new(None));
+    let sink = last.clone();
+    harness
+        .subscribe(Arc::new(move |event, _signal| {
+            let sink = sink.clone();
+            Box::pin(async move {
+                if let AgentHarnessEvent::QueueUpdate {
+                    steer_count,
+                    follow_up_count,
+                    next_turn_count,
+                    ..
+                } = event
+                {
+                    *sink.lock().unwrap() = Some((steer_count, follow_up_count, next_turn_count));
+                }
+            })
+        }))
+        .await;
+
+    harness.next_turn(user("a")).await;
+    assert_eq!(*last.lock().unwrap(), Some((0, 0, 1)));
+    harness.next_turn(user("b")).await;
+    assert_eq!(*last.lock().unwrap(), Some((0, 0, 2)));
+    harness.steer(user("s")).await;
+    assert_eq!(*last.lock().unwrap(), Some((1, 0, 2)));
+    harness.follow_up(user("f")).await;
+    assert_eq!(*last.lock().unwrap(), Some((1, 1, 2)));
+}

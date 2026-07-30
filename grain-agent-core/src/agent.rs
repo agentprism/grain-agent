@@ -41,6 +41,9 @@ impl PendingMessageQueue {
     fn has_items(&self) -> bool {
         !self.messages.is_empty()
     }
+    fn len(&self) -> usize {
+        self.messages.len()
+    }
     fn drain(&mut self) -> Vec<AgentMessage> {
         if self.messages.is_empty() {
             return Vec::new();
@@ -412,6 +415,17 @@ impl Agent {
         let mut g = self.inner.lock().await;
         g.steering_queue.clear();
         g.follow_up_queue.clear();
+    }
+
+    /// Pending message counts as `(steering, follow_up)`.
+    ///
+    /// Lets a wrapper report queue depth without draining. Upstream's harness
+    /// keeps its own copies of the queues and reports their contents
+    /// (`agent-harness.ts:320-327` @ 34239180); grain's queues live here, so
+    /// the counts have to come from here too.
+    pub async fn queued_counts(&self) -> (usize, usize) {
+        let g = self.inner.lock().await;
+        (g.steering_queue.len(), g.follow_up_queue.len())
     }
 
     /// Returns `true` when either queue has at least one pending message.

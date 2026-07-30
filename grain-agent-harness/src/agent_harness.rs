@@ -66,7 +66,7 @@ use crate::compaction::{
 };
 use crate::messages::convert_to_llm as convert_to_llm_sync;
 use crate::session::{Session, SessionError};
-use crate::system_prompt::Skill;
+use crate::system_prompt::{Skill, format_skill_invocation};
 
 // ---------------------------------------------------------------------------
 // Options
@@ -309,12 +309,18 @@ pub enum AgentHarnessEvent {
     /// any harness-side post-processing" have a single subscribe
     /// point.
     Settled,
-    /// One of the harness queues changed (steer / follow_up /
-    /// next_turn). Phase 2 carries only a `has_queued` boolean —
-    /// `grain-agent-core::Agent` doesn't surface exact lengths.
-    /// Higher-fidelity counts can be added when needed.
+    /// One of the harness queues changed (steer / follow_up / next_turn).
+    ///
+    /// Upstream reports each bucket's messages
+    /// (`harness/types.ts:927-932` @ 34239180); grain reports depths, which
+    /// is what a status line actually renders, without cloning transcripts
+    /// on every queue mutation.
     QueueUpdate {
+        /// True when any bucket is non-empty.
         has_queued: bool,
+        steer_count: usize,
+        follow_up_count: usize,
+        next_turn_count: usize,
     },
     /// `set_model` ran successfully. Pi fires this after every
     /// runtime model swap so listeners (e.g. the TUI status bar)
@@ -464,6 +470,8 @@ pub enum HarnessError {
     EmptyTranscript,
     #[error("unknown prompt template: {0}")]
     UnknownTemplate(String),
+    #[error("unknown skill: {0}")]
+    UnknownSkill(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +523,10 @@ struct HarnessInner {
     /// Session writes deferred while [`Self::running`], drained in FIFO order
     /// once the run settles.
     pending_session_writes: Vec<PendingSessionWrite>,
+    /// The third queue bucket. Unlike steer and follow-up (which live on the
+    /// `Agent` and feed the *running* loop), this one is owned by the harness
+    /// and drains at the start of the next prompt.
+    next_turn_queue: Vec<AgentMessage>,
     /// Snapshot of every tool passed to `AgentHarnessOptions::tools`,
     /// kept unfiltered so `set_active_tools` can re-derive the
     /// active subset without losing the full catalog.
@@ -608,6 +620,7 @@ impl AgentHarness {
             next_listener_id: 0,
             running: false,
             pending_session_writes: Vec::new(),
+            next_turn_queue: Vec::new(),
             all_tools: tools,
             active_tool_names: active_set,
             stream_fn: stream_fn_for_compact,
@@ -750,15 +763,26 @@ impl AgentHarness {
     /// [`AgentHarnessEvent::BeforeAgentStart`] before dispatching
     /// to the agent loop.
     pub async fn prompt_text(&self, text: impl Into<String>) -> Result<(), HarnessError> {
-        self.emit_before_start().await;
-        self.mark_running().await;
-        self.agent.prompt_text(text).await.map_err(Into::into)
+        let message = AgentMessage::user(grain_agent_core::UserMessage {
+            content: vec![grain_agent_core::UserContent::text(text.into())],
+            timestamp: now_ms(),
+        });
+        self.prompt(vec![message]).await
     }
 
     /// Start a new prompt from a batch of messages. Emits
     /// [`AgentHarnessEvent::BeforeAgentStart`] before dispatching.
     pub async fn prompt(&self, messages: Vec<AgentMessage>) -> Result<(), HarnessError> {
         self.emit_before_start().await;
+        // Queued next-turn messages lead this prompt (upstream
+        // `messages = [...queuedMessages, messages[0]!]`, agent-harness.ts:596).
+        let mut queued = self.take_next_turn_queue().await;
+        let messages = if queued.is_empty() {
+            messages
+        } else {
+            queued.extend(messages);
+            queued
+        };
         self.mark_running().await;
         self.agent.prompt(messages).await.map_err(Into::into)
     }
@@ -785,15 +809,33 @@ impl AgentHarness {
         self.prompt_text(rendered).await
     }
 
-    /// Invoke a "skill" — Phase 4 minimal version synthesizes a
-    /// user prompt like `"Use the <name> skill with args: <json>"`
-    /// and submits it. Phase 5 will wire pi's typed-skill semantics
-    /// (validate against `Resources::skills`, structured invocation).
-    pub async fn skill(&self, name: &str, args: serde_json::Value) -> Result<(), HarnessError> {
-        let text = format!(
-            "Use the `{name}` skill with arguments: {}",
-            serde_json::to_string(&args).unwrap_or_else(|_| "{}".into())
-        );
+    /// Invoke a skill by name.
+    ///
+    /// Port of upstream `AgentHarness.skill`
+    /// (`agent-harness.ts:673-688` @ 34239180): look the name up in
+    /// [`Resources::skills`], fail with [`HarnessError::UnknownSkill`] if it
+    /// is not there, and submit [`format_skill_invocation`]'s block. The
+    /// previous behavior — synthesizing "Use the `x` skill" for *any* name —
+    /// meant a typo silently became a prompt asking the model to use a skill
+    /// that does not exist.
+    ///
+    /// `additional_instructions` is appended after the skill block, as
+    /// upstream does.
+    pub async fn skill(
+        &self,
+        name: &str,
+        additional_instructions: Option<&str>,
+    ) -> Result<(), HarnessError> {
+        let text = {
+            let g = self.inner.lock().await;
+            let skill = g
+                .resources
+                .skills
+                .iter()
+                .find(|candidate| candidate.name == name)
+                .ok_or_else(|| HarnessError::UnknownSkill(name.to_string()))?;
+            format_skill_invocation(skill, additional_instructions)
+        };
         self.prompt_text(text).await
     }
 
@@ -955,18 +997,43 @@ impl AgentHarness {
         self.emit_queue_update().await;
     }
 
-    /// Queue a "next turn" message. In pi this is a third bucket
-    /// distinct from follow-up; Phase 2 maps it to follow-up
-    /// pending a richer queue model.
+    /// Queue a message to lead the *next* prompt.
+    ///
+    /// The third bucket, ported from upstream's `nextTurnQueue`
+    /// (`agent-harness.ts:719-722`, drained at `:588-597` @ 34239180). It
+    /// differs from steer and follow-up in three ways that matter:
+    ///
+    /// - **Callable while idle.** Steering and follow-up only mean something
+    ///   relative to a run in flight; this is "say this next time you go".
+    /// - **Drains at the next prompt**, prepended *ahead* of that prompt's
+    ///   own message, rather than being consumed mid-run.
+    /// - **Always drains fully**, ignoring [`QueueMode`].
+    ///
+    /// It also survives [`Self::abort`], which clears only the other two.
     pub async fn next_turn(&self, message: AgentMessage) {
-        self.agent.follow_up(message).await;
+        self.inner.lock().await.next_turn_queue.push(message);
         self.emit_queue_update().await;
     }
 
+    /// Drain the next-turn bucket, returning its messages in queue order.
+    async fn take_next_turn_queue(&self) -> Vec<AgentMessage> {
+        let queued = std::mem::take(&mut self.inner.lock().await.next_turn_queue);
+        if !queued.is_empty() {
+            self.emit_queue_update().await;
+        }
+        queued
+    }
+
     async fn emit_queue_update(&self) {
-        let has_queued = self.agent.has_queued_messages().await;
-        self.emit(AgentHarnessEvent::QueueUpdate { has_queued })
-            .await;
+        let (steer_count, follow_up_count) = self.agent.queued_counts().await;
+        let next_turn_count = self.inner.lock().await.next_turn_queue.len();
+        self.emit(AgentHarnessEvent::QueueUpdate {
+            has_queued: steer_count + follow_up_count + next_turn_count > 0,
+            steer_count,
+            follow_up_count,
+            next_turn_count,
+        })
+        .await;
     }
 
     // ----- Phase 3 — session control -------------------------------------
@@ -1213,6 +1280,14 @@ async fn broadcast(
     for l in listeners {
         l(event.clone(), signal.clone()).await;
     }
+}
+
+/// Milliseconds since the Unix epoch, matching how core stamps messages.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Render the current system prompt.
@@ -1646,7 +1721,13 @@ mod tests {
         h.subscribe(Arc::new(move |event, _| {
             let c = c.clone();
             Box::pin(async move {
-                if matches!(event, AgentHarnessEvent::QueueUpdate { has_queued: true }) {
+                if matches!(
+                    event,
+                    AgentHarnessEvent::QueueUpdate {
+                        has_queued: true,
+                        ..
+                    }
+                ) {
                     c.fetch_add(1, Ordering::SeqCst);
                 }
             })
@@ -1861,28 +1942,61 @@ mod tests {
         assert_eq!(saw.load(Ordering::SeqCst), 1);
     }
 
+    fn triage_skill() -> Skill {
+        Skill {
+            name: "triage".into(),
+            description: "Triage an incident".into(),
+            file_path: "/skills/triage/SKILL.md".into(),
+            disable_model_invocation: false,
+            body: "Sort by severity.".into(),
+        }
+    }
+
     #[tokio::test]
-    async fn skill_synthesizes_a_prompt_mentioning_name_and_args() {
-        let h = AgentHarness::new(AgentHarnessOptions::new(
-            empty_session(),
-            dummy_model(),
-            stub_stream_fn(),
-        ))
-        .await;
-        h.skill("triage", serde_json::json!({ "priority": "high" }))
+    async fn skill_submits_the_upstream_invocation_block() {
+        let mut opts = AgentHarnessOptions::new(empty_session(), dummy_model(), stub_stream_fn());
+        opts.resources.skills = vec![triage_skill()];
+        let h = AgentHarness::new(opts).await;
+
+        h.skill("triage", Some("focus on paging alerts"))
             .await
             .unwrap();
         h.wait_for_idle().await;
+
         let msgs = h.agent().state().await.messages;
         let user = msgs.iter().find_map(|m| match m {
             AgentMessage::Standard(Message::User(u)) => Some(u),
             _ => None,
         });
         let UserContent::Text(t) = &user.unwrap().content[0] else {
-            panic!();
+            panic!("expected a text block");
         };
-        assert!(t.text.contains("triage"));
-        assert!(t.text.contains("priority"));
+        assert!(t.text.contains("<skill name=\"triage\""));
+        assert!(t.text.contains("location=\"/skills/triage/SKILL.md\""));
+        assert!(
+            t.text
+                .contains("References are relative to /skills/triage.")
+        );
+        assert!(t.text.contains("Sort by severity."));
+        assert!(t.text.ends_with("focus on paging alerts"));
+    }
+
+    /// A name that is not in `Resources::skills` is an error, not a prompt
+    /// politely asking the model to use a skill that does not exist.
+    #[tokio::test]
+    async fn unknown_skill_is_rejected() {
+        let mut opts = AgentHarnessOptions::new(empty_session(), dummy_model(), stub_stream_fn());
+        opts.resources.skills = vec![triage_skill()];
+        let h = AgentHarness::new(opts).await;
+
+        match h.skill("triaage", None).await {
+            Err(HarnessError::UnknownSkill(name)) => assert_eq!(name, "triaage"),
+            other => panic!("expected UnknownSkill, got {other:?}"),
+        }
+        assert!(
+            h.agent().state().await.messages.is_empty(),
+            "a rejected skill must not put anything in the transcript"
+        );
     }
 
     #[tokio::test]

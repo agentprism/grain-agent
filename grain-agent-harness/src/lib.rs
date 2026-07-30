@@ -85,7 +85,7 @@ pub use session::{
     SessionMetadata, SessionRepo, SessionStorage, SessionTreeEntry, SessionTreeEntryKind, uuidv7,
 };
 pub use session_jsonl::{JsonlSessionRepo, JsonlSessionStorage};
-pub use system_prompt::{Skill, format_skills_for_system_prompt};
+pub use system_prompt::{Skill, format_skill_invocation, format_skills_for_system_prompt};
 pub use truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH, TruncationOptions,
     TruncationResult, format_size, truncate_head, truncate_line, truncate_tail,
