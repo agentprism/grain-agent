@@ -249,7 +249,33 @@ impl AnthropicState {
                     content_index: idx,
                 });
             }
-            Some("thinking") | Some("redacted_thinking") => {
+            // A `redacted_thinking` block carries NEITHER `thinking` nor
+            // `signature` -- its whole payload is an opaque `data` string that
+            // must be replayed verbatim. Reading the normal fields would yield
+            // an empty, unsigned block, which the replay path then drops, so
+            // the block would vanish from history entirely. Upstream pi-ai
+            // stores `content_block.data` and marks the block redacted; grain
+            // has no dedicated field, so it rides in `provider_metadata` --
+            // whose documented purpose is exactly this (a provider-specific
+            // raw reasoning payload preserved for verbatim replay).
+            Some("redacted_thinking") => {
+                self.blocks
+                    .push(AssistantContent::Thinking(ThinkingContent {
+                        thinking: String::new(),
+                        signature: None,
+                        provider_metadata: Some(serde_json::json!({
+                            "type": "redacted_thinking",
+                            "data": str_at(block, "data").unwrap_or_default(),
+                        })),
+                    }));
+                let idx = self.blocks.len() - 1;
+                self.open.insert(wire_index, OpenBlock::Thinking(idx));
+                out.push(AssistantMessageEvent::ThinkingStart {
+                    partial: self.partial(),
+                    content_index: idx,
+                });
+            }
+            Some("thinking") => {
                 self.blocks
                     .push(AssistantContent::Thinking(ThinkingContent {
                         thinking: str_at(block, "thinking").unwrap_or_default().to_string(),
@@ -826,6 +852,44 @@ mod tests {
             s.response_model.as_deref(),
             Some("claude-haiku-4-5-20991231")
         );
+    }
+
+    /// W4: a `redacted_thinking` block carries only an opaque `data` payload.
+    /// Reading `thinking`/`signature` yields an empty, unsigned block, which
+    /// the replay path then drops — losing the block entirely.
+    #[test]
+    fn redacted_thinking_preserves_its_opaque_payload() {
+        let mut s = AnthropicState::new(&model());
+        let events = s.on_frame(
+            "content_block_start",
+            &json!({
+                "index": 0,
+                "content_block": {"type": "redacted_thinking", "data": "EroBCkYIB..."}
+            })
+            .to_string(),
+        );
+        assert_eq!(tags(&events), vec!["Start", "ThinkingStart"]);
+        s.on_frame("content_block_stop", &json!({"index":0}).to_string());
+        let done = s.finish();
+
+        let AssistantMessageEvent::Done { result } = done.last().unwrap() else {
+            panic!("expected Done");
+        };
+        match &result.content[0] {
+            AssistantContent::Thinking(t) => {
+                let meta = t
+                    .provider_metadata
+                    .as_ref()
+                    .expect("redacted payload must be preserved");
+                assert_eq!(meta["type"], json!("redacted_thinking"));
+                assert_eq!(
+                    meta["data"],
+                    json!("EroBCkYIB..."),
+                    "the opaque data is the entire content of the block"
+                );
+            }
+            other => panic!("expected a thinking block, got {other:?}"),
+        }
     }
 
     #[test]

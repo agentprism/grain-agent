@@ -21,6 +21,31 @@
 //!
 //! Promoting this to the default is deliberately a one-line change (flip the
 //! default in [`crate::GenaiStreamBuilder`]) plus a test run — no migration.
+//!
+//! # Known gaps, recorded rather than fixed
+//!
+//! - **W5 — extended-thinking request shape.** Always the legacy
+//!   `{type:"enabled", budget_tokens}` form; see
+//!   [`crate::anthropic::request`]. Whether adaptive-era models still accept
+//!   it is an assumption only live access can settle, and it is the single
+//!   largest unknown here.
+//! - **W7 — reasoning-suffix stripping.** The genai path strips provider
+//!   reasoning suffixes from model ids; this transport passes the bare model
+//!   name through. Latent today because no grain model id carries such a
+//!   suffix on the Anthropic route.
+//! - **W8 — no retries, no per-request timeout.** A dropped connection
+//!   surfaces as a terminal error rather than being retried. This is at
+//!   parity with the genai backend, which has no per-request retry hook at
+//!   this seam either, so it is a shared gap and not a regression.
+//! - **W9 — no prompt caching.** No `cache_control` is emitted, so Anthropic
+//!   prompt caching is unavailable on this path. Nothing in the workspace
+//!   requests it today (no crate sets `ChatOptions::cache_control`), but on a
+//!   long coding session this is a real cost difference, not only a feature
+//!   gap. Relatedly, the terminal error for a provider `error` frame uses
+//!   `error.message` and discards `error.type` — and this transport is the
+//!   one place `overloaded_error` is actually available, so a caller that
+//!   wanted to distinguish retryable overload from a hard failure cannot.
+//!   Surfacing the type belongs with the retry work in W8.
 
 use std::sync::Arc;
 
@@ -35,17 +60,70 @@ use crate::anthropic::request::{ANTHROPIC_VERSION, build_request};
 use crate::anthropic::state::AnthropicState;
 use crate::anthropic::wire::SseDecoder;
 
+/// The `anthropic-beta` value sent with an OAuth (subscription) token.
+///
+/// **Deliberately incomplete, and owned by the follow-on OAuth package.**
+/// `docs/oauth-claude-subscription-spec.md` §6 specifies the full Claude Code
+/// request shape a subscription token requires: this beta list extended with
+/// `claude-code-20250219`, plus `user-agent: claude-cli/<v>`, `x-app: cli`,
+/// `accept: application/json`,
+/// `anthropic-dangerous-direct-browser-access: true`, and a prepended Claude
+/// Code identity system block. None of that is implemented here — it cannot be
+/// verified offline, and that package owns it. What this transport provides is
+/// the seam it needs: Bearer auth with `x-api-key` suppressed, per-request
+/// credential resolution, and a single place where request headers are built.
+pub const OAUTH_BETA: &str = "oauth-2025-04-20";
+
 /// How the transport authenticates to Anthropic.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AnthropicAuth {
     /// Standard API key — sent as `x-api-key`.
     ApiKey(String),
-    /// OAuth access token (Claude Pro/Max) — sent as `authorization: Bearer`
-    /// with the OAuth beta header.
+    /// OAuth access token (Claude Pro/Max) — sent as `authorization: Bearer`,
+    /// with `x-api-key` **not** sent at all (sending both is an auth error;
+    /// `docs/oauth-claude-subscription-spec.md` §6).
     ///
     /// Wiring the OAuth *login* flow is owned elsewhere (debt item G7); this
     /// variant only carries an already-obtained token.
     OauthToken(String),
+    /// Resolved immediately before **every** request.
+    ///
+    /// Required for OAuth: Anthropic subscription access tokens expire in
+    /// roughly an hour, so a credential captured once at client-construction
+    /// time starts returning 401 partway through any long session, with no
+    /// recovery short of a restart. The genai backend avoids this by resolving
+    /// inside its per-request auth resolver; this variant is the equivalent
+    /// seam, and is what the builder installs.
+    PerRequest(Arc<dyn Fn() -> Option<AnthropicAuth> + Send + Sync>),
+}
+
+impl std::fmt::Debug for AnthropicAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnthropicAuth::ApiKey(_) => f.write_str("ApiKey(<redacted>)"),
+            AnthropicAuth::OauthToken(_) => f.write_str("OauthToken(<redacted>)"),
+            AnthropicAuth::PerRequest(_) => f.write_str("PerRequest(<closure>)"),
+        }
+    }
+}
+
+impl AnthropicAuth {
+    /// Produce the concrete credential to use for one request.
+    ///
+    /// Returns `None` when nothing could be resolved, which the caller turns
+    /// into a terminal error naming the problem rather than issuing an
+    /// unauthenticated request and surfacing an opaque provider 401.
+    fn resolve_for_request(&self) -> Option<AnthropicAuth> {
+        match self {
+            AnthropicAuth::PerRequest(resolve) => match resolve() {
+                // One level only: a resolver returning another resolver would
+                // otherwise loop. Treated as "unresolved" and reported.
+                Some(AnthropicAuth::PerRequest(_)) | None => None,
+                resolved => resolved,
+            },
+            concrete => Some(concrete.clone()),
+        }
+    }
 }
 
 /// Configuration for [`AnthropicStream`].
@@ -129,6 +207,16 @@ impl LlmStream for AnthropicStream {
             }
         };
 
+        // Resolve the credential per request, not once at construction: an
+        // OAuth access token captured at build time expires mid-session.
+        let Some(auth) = self.config.auth.resolve_for_request() else {
+            return Ok(one_shot_error(
+                model,
+                "anthropic transport: no Anthropic credential could be resolved                  (set ANTHROPIC_API_KEY, or configure an OAuth provider profile)"
+                    .to_string(),
+            ));
+        };
+
         let mut req = self
             .http
             .post(self.messages_url())
@@ -136,11 +224,14 @@ impl LlmStream for AnthropicStream {
             .header("accept", "text/event-stream")
             .header("anthropic-version", ANTHROPIC_VERSION);
 
-        req = match &self.config.auth {
+        req = match &auth {
             AnthropicAuth::ApiKey(key) => req.header("x-api-key", key.as_str()),
+            // Bearer, and `x-api-key` deliberately absent.
             AnthropicAuth::OauthToken(token) => req
                 .header("authorization", format!("Bearer {token}"))
-                .header("anthropic-beta", "oauth-2025-04-20"),
+                .header("anthropic-beta", OAUTH_BETA),
+            // `resolve_for_request` never yields this.
+            AnthropicAuth::PerRequest(_) => req,
         };
 
         let response = match req.json(&body).send().await {
@@ -181,8 +272,12 @@ impl LlmStream for AnthropicStream {
                     next = body_stream.next() => {
                         match next {
                             Some(Ok(bytes)) => {
-                                let chunk = String::from_utf8_lossy(&bytes).to_string();
-                                for frame in decoder.push(&chunk) {
+                                // Raw bytes: the decoder owns UTF-8 and CRLF
+                                // state across chunk boundaries. Decoding per
+                                // chunk here would corrupt any scalar (or
+                                // CRLF pair) split by the network -- see
+                                // `wire::SseDecoder`.
+                                for frame in decoder.push_bytes(&bytes) {
                                     for ev in state.on_frame(&frame.event, &frame.data) {
                                         yield ev;
                                     }
@@ -238,6 +333,57 @@ mod tests {
         let cfg = AnthropicTransportConfig::with_api_key("k").with_base_url("http://localhost:1234");
         let s = AnthropicStream::new(cfg);
         assert_eq!(s.messages_url(), "http://localhost:1234/messages");
+    }
+
+    #[test]
+    fn per_request_auth_is_resolved_on_every_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let auth = AnthropicAuth::PerRequest(Arc::new(move || {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            Some(AnthropicAuth::OauthToken(format!("token-{n}")))
+        }));
+
+        // Each resolution must re-run the closure and observe the fresh value
+        // -- this is what keeps an expiring OAuth token from wedging a session.
+        for expected in ["token-0", "token-1", "token-2"] {
+            match auth.resolve_for_request() {
+                Some(AnthropicAuth::OauthToken(t)) => assert_eq!(t, expected),
+                other => panic!("expected a fresh OAuth token, got {other:?}"),
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn unresolvable_credentials_are_reported_not_sent_unauthenticated() {
+        let auth = AnthropicAuth::PerRequest(Arc::new(|| None));
+        assert!(auth.resolve_for_request().is_none());
+
+        // A resolver that returns another resolver must not loop.
+        let nested = AnthropicAuth::PerRequest(Arc::new(|| {
+            Some(AnthropicAuth::PerRequest(Arc::new(|| None)))
+        }));
+        assert!(nested.resolve_for_request().is_none());
+    }
+
+    #[test]
+    fn concrete_credentials_resolve_to_themselves() {
+        match AnthropicAuth::ApiKey("k".into()).resolve_for_request() {
+            Some(AnthropicAuth::ApiKey(k)) => assert_eq!(k, "k"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_debug_never_leaks_the_credential() {
+        let rendered = format!(
+            "{:?} {:?}",
+            AnthropicAuth::ApiKey("sk-ant-super-secret".into()),
+            AnthropicAuth::OauthToken("sk-ant-oat-secret".into())
+        );
+        assert!(!rendered.contains("secret"), "credential leaked: {rendered}");
     }
 
     #[test]

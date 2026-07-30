@@ -158,15 +158,23 @@ pub fn resolve_max_tokens(model_name: &str) -> u32 {
 /// defaults match genai's legacy budget constants (`REASONING_LOW` 1024,
 /// `REASONING_MEDIUM` 8000, `REASONING_HIGH` 24000).
 ///
-/// **Known divergence from the genai backend, by design.** genai additionally
-/// emits the newer `output_config.effort` and `thinking: {type:"adaptive"}`
-/// shapes for the model families that support them, gated on hard-coded model
-/// name lists. This transport always emits the legacy
-/// `thinking: {type:"enabled", budget_tokens}` shape, which every
-/// extended-thinking Anthropic model accepts. Replicating genai's model-family
-/// tables would duplicate exactly the kind of list that silently drifts, so
-/// the simpler universally-accepted shape is used instead. This is recorded as
-/// a deferred item; it changes *how* thinking is requested, never *whether*.
+/// **Known divergence from the genai backend — and the largest unverified
+/// assumption in this transport.** genai additionally emits the newer
+/// `output_config.effort` and `thinking: {type:"adaptive"}` shapes for the
+/// model families that support them, gated on hard-coded model-name lists.
+/// This transport always emits the legacy
+/// `thinking: {type:"enabled", budget_tokens}` shape.
+///
+/// The reasoning for the simpler shape is that replicating genai's
+/// model-family tables duplicates exactly the kind of list that drifts
+/// silently. The *assumption* is that every extended-thinking Anthropic model
+/// still accepts the legacy shape, including the adaptive-thinking era ones.
+/// **That assumption is untested.** It is stated here as an assumption rather
+/// than a fact because only a live request against an adaptive-era model can
+/// settle it, and no fixture at the pin exercises thinking at all. If it is
+/// wrong, the failure is a request-time 400 on exactly those models — loud,
+/// not silent, but a hard failure for anyone who enables thinking on them.
+/// Tracked as deferred item W5; it is the item most in need of live access.
 fn thinking_budget(level: ThinkingLevel, options: &StreamOptions) -> Option<u64> {
     let budgets = options.thinking_budgets;
     let explicit = budgets.and_then(|b| match level {
@@ -282,6 +290,36 @@ fn build_messages(
     out
 }
 
+/// The opaque payload of a redacted-thinking block, if this is one.
+///
+/// Stored in `provider_metadata` by the stream state machine; see the
+/// `redacted_thinking` arm in [`crate::anthropic::state`].
+fn redacted_thinking_data(t: &grain_agent_core::ThinkingContent) -> Option<String> {
+    let meta = t.provider_metadata.as_ref()?;
+    if meta.get("type").and_then(Value::as_str)? != "redacted_thinking" {
+        return None;
+    }
+    meta.get("data")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Project user-side content blocks, dropping empty text.
+///
+/// Anthropic rejects a `text` block whose `text` is empty
+/// ("text content blocks must be non-empty"), which fails the **whole
+/// request**, not just the block. The assistant path has always guarded this;
+/// the user and tool-result paths did not — and empty tool output is entirely
+/// routine in a coding harness (a silent `write`, a command with no stdout),
+/// so this was the likeliest of the empty-block cases to fire in practice.
+fn user_content_blocks(content: &[UserContent]) -> Vec<Value> {
+    content
+        .iter()
+        .filter(|c| !matches!(c, UserContent::Text(t) if t.text.is_empty()))
+        .map(user_content_block)
+        .collect()
+}
+
 fn user_content_block(c: &UserContent) -> Value {
     match c {
         UserContent::Text(t) => json!({"type": "text", "text": t.text}),
@@ -299,7 +337,7 @@ fn user_content_block(c: &UserContent) -> Value {
 fn user_message(u: &UserMessage) -> Value {
     json!({
         "role": "user",
-        "content": u.content.iter().map(user_content_block).collect::<Vec<_>>(),
+        "content": user_content_blocks(&u.content),
     })
 }
 
@@ -318,9 +356,17 @@ fn assistant_message(
                 "type": "image",
                 "source": {"type": "base64", "media_type": i.mime_type, "data": i.data}
             })),
-            // Anthropic only accepts a thinking block back when it carries the
-            // provider's signature; an unsigned one is rejected, so it is
-            // dropped from the replay exactly as the genai path does.
+            // A redacted-thinking block replays verbatim as
+            // `{type:"redacted_thinking", data}` -- it has no signature and
+            // must not be judged by the signed-thinking rule below, or it
+            // would be dropped and the reasoning chain would break.
+            AssistantContent::Thinking(t) if redacted_thinking_data(t).is_some() => {
+                let data = redacted_thinking_data(t).unwrap_or_default();
+                blocks.push(json!({"type": "redacted_thinking", "data": data}));
+            }
+            // Anthropic only accepts an ordinary thinking block back when it
+            // carries the provider's signature; an unsigned one is rejected,
+            // so it is dropped from the replay exactly as the genai path does.
             AssistantContent::Thinking(t) => {
                 if let Some(sig) = &t.signature {
                     blocks.push(json!({
@@ -350,7 +396,7 @@ fn assistant_message(
 }
 
 fn tool_result_message(t: &ToolResultMessage) -> Value {
-    let content: Vec<Value> = t.content.iter().map(user_content_block).collect();
+    let content: Vec<Value> = user_content_blocks(&t.content);
     let mut block = Map::new();
     block.insert("type".into(), json!("tool_result"));
     block.insert("tool_use_id".into(), json!(t.tool_call_id));
@@ -581,6 +627,102 @@ mod tests {
             req["messages"].as_array().unwrap().len(),
             1,
             "only the user message survives"
+        );
+    }
+
+    /// W4: the redacted block must survive a full round trip — captured by
+    /// the state machine, replayed verbatim on the next request.
+    #[test]
+    fn redacted_thinking_replays_verbatim() {
+        use grain_agent_core::{StopReason, ThinkingContent, Usage};
+        let assistant = Message::Assistant(AssistantMessage {
+            content: vec![AssistantContent::Thinking(ThinkingContent {
+                thinking: String::new(),
+                signature: None,
+                provider_metadata: Some(json!({
+                    "type": "redacted_thinking",
+                    "data": "EroBCkYIB..."
+                })),
+            })],
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            model: "anthropic/claude-haiku-4-5".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            error_code: None,
+            timestamp: 0,
+        });
+
+        let req = build_request(
+            &model(),
+            &ctx_with(vec![assistant]),
+            &StreamOptions::default(),
+        )
+        .expect("supported");
+
+        assert_eq!(
+            req["messages"][0]["content"][0],
+            json!({"type": "redacted_thinking", "data": "EroBCkYIB..."}),
+            "a redacted block has no signature and must not be dropped by the \
+             signed-thinking rule"
+        );
+    }
+
+    /// W6: Anthropic rejects empty `text` blocks, failing the whole request.
+    /// Empty tool output is routine in a coding harness.
+    #[test]
+    fn empty_text_blocks_are_dropped_from_user_and_tool_result_messages() {
+        let empty_result = Message::ToolResult(ToolResultMessage {
+            tool_call_id: "call_1".into(),
+            tool_name: "bash".into(),
+            content: vec![UserContent::text("")],
+            details: Value::Null,
+            usage: None,
+            added_tool_names: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let req = build_request(
+            &model(),
+            &ctx_with(vec![empty_result]),
+            &StreamOptions::default(),
+        )
+        .expect("supported");
+        assert_eq!(
+            req["messages"][0]["content"][0]["content"],
+            json!([]),
+            "an empty tool result must not emit an empty text block"
+        );
+
+        let mixed = Message::User(UserMessage {
+            content: vec![
+                UserContent::text(""),
+                UserContent::text("real"),
+                UserContent::text(""),
+            ],
+            timestamp: 0,
+        });
+        let req = build_request(&model(), &ctx_with(vec![mixed]), &StreamOptions::default())
+            .expect("supported");
+        assert_eq!(
+            req["messages"][0]["content"],
+            json!([{"type": "text", "text": "real"}]),
+            "only the non-empty block survives"
+        );
+    }
+
+    #[test]
+    fn non_empty_user_content_is_untouched() {
+        let req = build_request(
+            &model(),
+            &ctx_with(vec![user("hello")]),
+            &StreamOptions::default(),
+        )
+        .expect("supported");
+        assert_eq!(
+            req["messages"][0]["content"],
+            json!([{"type": "text", "text": "hello"}])
         );
     }
 

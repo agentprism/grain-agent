@@ -93,7 +93,11 @@ impl GenaiStreamBuilder {
     /// usage correctly. genai 0.6.5 (and `0.7.0-beta.15`) double-count
     /// Anthropic usage — they add `message_delta.usage` onto
     /// `message_start.usage` where the wire semantics are per-field
-    /// *replacement* — which inflates billed prompt tokens by roughly 2x. That
+    /// *replacement* — which inflates billed prompt tokens by roughly 2x.
+    ///
+    /// Weigh that against the caveat below rather than reading it as a
+    /// blanket recommendation: this path trades a **loud, measurable** usage
+    /// error for a transport whose request shape has not met the live API. That
     /// defect cannot be corrected from genai's streaming event API (proven in
     /// `tests/genai_seam_limits.rs`), and the one route that would reach it —
     /// proxying the transport and re-parsing the wire — costs more than owning
@@ -364,20 +368,28 @@ impl GenaiStreamBuilder {
         // same way the genai auth resolver does it: explicit env override
         // first, then an OAuth profile for the `anthropic` adapter.
         let native = native_anthropic.then(|| {
-            let auth = env_resolver
-                .resolve("anthropic")
-                .map(AnthropicAuth::ApiKey)
-                .or_else(|| {
-                    oauth_map.get("anthropic").and_then(|(profile, config)| {
-                        get_valid_access_token_with_config_sync(config, profile)
-                            .ok()
-                            .flatten()
-                            .map(AnthropicAuth::OauthToken)
-                    })
-                });
+            // Resolve auth PER REQUEST, mirroring the genai auth-resolver
+            // closure above. Anthropic OAuth access tokens expire in roughly
+            // an hour; a credential captured once here would start 401'ing
+            // partway through any long session with no recovery, and
+            // `get_valid_access_token_with_config_sync` refreshes on demand
+            // only if it is actually called each time.
+            let auth_env = env_resolver.clone();
+            let auth_oauth = oauth_map.clone();
+            let resolver = move || -> Option<AnthropicAuth> {
+                if let Some(key) = auth_env.resolve("anthropic") {
+                    return Some(AnthropicAuth::ApiKey(key));
+                }
+                let (profile, config) = auth_oauth.get("anthropic")?;
+                get_valid_access_token_with_config_sync(config, profile)
+                    .ok()
+                    .flatten()
+                    .map(AnthropicAuth::OauthToken)
+            };
+
             let mut config = AnthropicTransportConfig {
                 base_url: AnthropicTransportConfig::DEFAULT_BASE_URL.to_string(),
-                auth: auth.unwrap_or_else(|| AnthropicAuth::ApiKey(String::new())),
+                auth: AnthropicAuth::PerRequest(Arc::new(resolver)),
             };
             if let Some(base) = native_anthropic_base_url {
                 config = config.with_base_url(base);
