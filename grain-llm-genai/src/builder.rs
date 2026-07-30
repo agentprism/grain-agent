@@ -14,6 +14,7 @@ use genai::resolver::{AuthData, Endpoint};
 use genai::{ModelIden, ServiceTarget};
 use grain_llm_models::Registry;
 
+use crate::anthropic::{AnthropicAuth, AnthropicStream, AnthropicTransportConfig};
 use crate::config::{EnvKeyResolver, OpenAiCompatEndpoint, OpenAiCompatPreset, ProviderRouter};
 use crate::mapping::outbound::baseline_chat_options;
 use crate::oauth::OauthConfig;
@@ -47,6 +48,15 @@ pub struct GenaiStreamBuilder {
     /// Populated by `with_provider_profiles` for auth entries of kind
     /// `anthropic_oauth` / `openai_oauth`. Used by the auth resolver closure
     /// to fetch fresh access tokens at request time.
+    /// Opt-in selection of the native Anthropic transport
+    /// ([`crate::anthropic`]) in place of genai for Anthropic models.
+    ///
+    /// Defaults to `false`: genai stays the default backend so that no
+    /// existing caller's primary provider changes underneath them. See
+    /// [`GenaiStreamBuilder::with_native_anthropic_transport`].
+    native_anthropic: bool,
+    /// Override for the native transport's base URL (tests, gateways).
+    native_anthropic_base_url: Option<String>,
     oauth_map: HashMap<String, (String, OauthConfig)>,
 }
 
@@ -65,8 +75,53 @@ impl GenaiStreamBuilder {
             openai_compat: Vec::new(),
             registry: None,
             bypass_proxy: None,
+            native_anthropic: false,
+            native_anthropic_base_url: None,
             oauth_map: HashMap::new(),
         }
+    }
+
+    /// Route Anthropic models through the **native Anthropic transport**
+    /// ([`crate::anthropic`]) instead of genai.
+    ///
+    /// Off by default, and deliberately explicit: genai remains the default
+    /// backend for every provider including Anthropic.
+    ///
+    /// # When to turn this on
+    ///
+    /// The native transport is the only path that reports Anthropic token
+    /// usage correctly. genai 0.6.5 (and `0.7.0-beta.15`) double-count
+    /// Anthropic usage — they add `message_delta.usage` onto
+    /// `message_start.usage` where the wire semantics are per-field
+    /// *replacement* — which inflates billed prompt tokens by roughly 2x. That
+    /// defect cannot be corrected above genai (proven in
+    /// `tests/genai_seam_limits.rs`), which is why this backend exists. It
+    /// additionally recovers Anthropic refusal explanations, true content-block
+    /// boundaries, and malformed-frame repair.
+    ///
+    /// # Why it is not the default
+    ///
+    /// Its request shape is verified only against recorded fixtures, never
+    /// against the live Anthropic API. Fixture parity proves the decode path
+    /// reproduces upstream pi-ai exactly; it proves nothing about whether the
+    /// live API accepts the request this transport builds. Until that live
+    /// confirmation happens, shipping it as the default would risk breaking
+    /// the harness's primary provider. Promoting it afterwards is a one-line
+    /// change here plus a test run.
+    ///
+    /// The transport also supports a deliberately narrow request surface and
+    /// rejects anything outside it *loudly* — see
+    /// [`crate::anthropic::request::UnsupportedFeature`].
+    pub fn with_native_anthropic_transport(mut self, enabled: bool) -> Self {
+        self.native_anthropic = enabled;
+        self
+    }
+
+    /// Override the native Anthropic transport's base URL (gateways, tests).
+    /// Ignored unless [`Self::with_native_anthropic_transport`] is on.
+    pub fn with_native_anthropic_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.native_anthropic_base_url = Some(base_url.into());
+        self
     }
 
     /// Override proxy-bypass behavior. See [`Self::bypass_proxy`] field
@@ -195,6 +250,8 @@ impl GenaiStreamBuilder {
             openai_compat,
             registry,
             bypass_proxy,
+            native_anthropic,
+            native_anthropic_base_url,
             oauth_map,
         } = self;
 
@@ -301,7 +358,33 @@ impl GenaiStreamBuilder {
         }
         let client = client_builder.build();
 
+        // Opt-in native Anthropic transport. Auth is resolved once here, the
+        // same way the genai auth resolver does it: explicit env override
+        // first, then an OAuth profile for the `anthropic` adapter.
+        let native = native_anthropic.then(|| {
+            let auth = env_resolver
+                .resolve("anthropic")
+                .map(AnthropicAuth::ApiKey)
+                .or_else(|| {
+                    oauth_map.get("anthropic").and_then(|(profile, config)| {
+                        get_valid_access_token_with_config_sync(config, profile)
+                            .ok()
+                            .flatten()
+                            .map(AnthropicAuth::OauthToken)
+                    })
+                });
+            let mut config = AnthropicTransportConfig {
+                base_url: AnthropicTransportConfig::DEFAULT_BASE_URL.to_string(),
+                auth: auth.unwrap_or_else(|| AnthropicAuth::ApiKey(String::new())),
+            };
+            if let Some(base) = native_anthropic_base_url {
+                config = config.with_base_url(base);
+            }
+            Arc::new(AnthropicStream::new(config))
+        });
+
         GenaiStream::with_client_options_and_router(client, chat_options, provider_router, registry)
+            .with_native_anthropic(native)
     }
 }
 

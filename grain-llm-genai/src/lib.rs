@@ -12,7 +12,13 @@
 //!   endpoint routing, optional [`grain_llm_models::Registry`] wiring.
 //! - [`config`] — small config types ([`EnvKeyResolver`],
 //!   [`OpenAiCompatEndpoint`], [`OpenAiCompatPreset`], [`ProviderRouter`]).
+//! - [`anthropic`] — an **opt-in** native Anthropic Messages transport, a
+//!   second `LlmStream` behind the same seam. It exists because several
+//!   structural gaps (notably the S-3 usage double-count) cannot be fixed
+//!   above genai. genai remains the default; see [`anthropic`] for the full
+//!   rationale and the fixture-verified-but-not-live-verified caveat.
 
+pub mod anthropic;
 pub mod builder;
 pub mod config;
 pub mod mapping;
@@ -20,6 +26,7 @@ pub mod oauth;
 pub mod provider;
 pub mod stream;
 
+pub use anthropic::{AnthropicAuth, AnthropicStream, AnthropicTransportConfig};
 pub use builder::GenaiStreamBuilder;
 pub use config::{EnvKeyResolver, OpenAiCompatEndpoint, OpenAiCompatPreset, ProviderRouter};
 pub use mapping::inbound::InboundState;

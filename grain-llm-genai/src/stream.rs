@@ -16,6 +16,7 @@ use grain_agent_core::{
 use grain_llm_models::Registry;
 use tokio_util::sync::CancellationToken;
 
+use crate::anthropic::AnthropicStream;
 use crate::builder::GenaiStreamBuilder;
 use crate::config::ProviderRouter;
 use crate::mapping::inbound::InboundState;
@@ -32,6 +33,10 @@ pub struct GenaiStream {
     provider_router: ProviderRouter,
     #[allow(dead_code)] // Reserved for harness hooks / future adapters.
     registry: Option<Arc<Registry>>,
+    /// Opt-in native Anthropic transport ([`crate::anthropic`]). `None` -- the
+    /// default -- routes Anthropic through genai like every other provider.
+    /// Set via [`crate::GenaiStreamBuilder::with_native_anthropic_transport`].
+    native_anthropic: Option<Arc<AnthropicStream>>,
 }
 
 impl Default for GenaiStream {
@@ -48,6 +53,7 @@ impl GenaiStream {
             chat_options: baseline_chat_options(),
             provider_router: ProviderRouter::default(),
             registry: None,
+            native_anthropic: None,
         }
     }
 
@@ -64,6 +70,7 @@ impl GenaiStream {
             chat_options,
             provider_router: ProviderRouter::default(),
             registry: None,
+            native_anthropic: None,
         }
     }
 
@@ -80,7 +87,27 @@ impl GenaiStream {
             chat_options,
             provider_router,
             registry,
+            native_anthropic: None,
         }
+    }
+
+    /// Attach (or clear) the opt-in native Anthropic transport. Used by
+    /// [`GenaiStreamBuilder::build`]; see
+    /// [`crate::GenaiStreamBuilder::with_native_anthropic_transport`].
+    pub fn with_native_anthropic(mut self, native: Option<Arc<AnthropicStream>>) -> Self {
+        self.native_anthropic = native;
+        self
+    }
+
+    /// Whether `model` should be served by the native Anthropic transport.
+    ///
+    /// Gated on both the opt-in being set *and* the model actually routing to
+    /// the anthropic namespace, so enabling it never affects other providers.
+    fn native_anthropic_for(&self, model: &Model) -> Option<&Arc<AnthropicStream>> {
+        let native = self.native_anthropic.as_ref()?;
+        self.translate_model_id(&model.id)
+            .starts_with("anthropic::")
+            .then_some(native)
     }
 
     /// Translate a grain model id (`"anthropic/claude-sonnet-4-5"`) into the
@@ -181,6 +208,12 @@ impl LlmStream for GenaiStream {
         options: &StreamOptions,
         cancel: CancellationToken,
     ) -> Result<AssistantStream, StreamError> {
+        // Opt-in: serve Anthropic from the native transport, which reports
+        // usage correctly (genai double-counts it -- see `crate::anthropic`).
+        if let Some(native) = self.native_anthropic_for(model) {
+            return native.stream(model, context, options, cancel).await;
+        }
+
         let chat_req = to_chat_request(context);
         let chat_options = chat_options_with_runtime(self.chat_options.clone(), options);
         let model_for_genai = self.translate_model_id(&model.id);
@@ -287,6 +320,54 @@ mod tests {
         let projected = chat_options_with_runtime(base, &StreamOptions::default());
         assert_eq!(projected.capture_usage, Some(true));
         assert_eq!(projected.capture_tool_calls, Some(true));
+    }
+
+    fn model_id(id: &str) -> Model {
+        Model {
+            id: id.into(),
+            name: id.into(),
+            api: "anthropic-messages".into(),
+            provider: "anthropic".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Constraint: genai stays the default backend. A builder that says
+    /// nothing about transports must not route Anthropic anywhere new.
+    #[test]
+    fn genai_is_the_default_backend_for_anthropic() {
+        let stream = GenaiStreamBuilder::new().build();
+        assert!(
+            stream.native_anthropic.is_none(),
+            "the native Anthropic transport must be opt-in, never implicit"
+        );
+        assert!(
+            stream
+                .native_anthropic_for(&model_id("anthropic/claude-haiku-4-5"))
+                .is_none()
+        );
+    }
+
+    /// Opting in routes Anthropic to the native transport — and nothing else.
+    #[test]
+    fn opt_in_routes_only_anthropic_models_to_the_native_transport() {
+        let stream = GenaiStreamBuilder::new()
+            .with_native_anthropic_transport(true)
+            .build();
+        assert!(stream.native_anthropic.is_some());
+
+        assert!(
+            stream
+                .native_anthropic_for(&model_id("anthropic/claude-haiku-4-5"))
+                .is_some(),
+            "anthropic models must use the native transport when opted in"
+        );
+        for other in ["openai/gpt-5", "google/gemini-2.5-pro", "deepseek/deepseek-chat"] {
+            assert!(
+                stream.native_anthropic_for(&model_id(other)).is_none(),
+                "{other} must stay on genai"
+            );
+        }
     }
 
     #[test]
