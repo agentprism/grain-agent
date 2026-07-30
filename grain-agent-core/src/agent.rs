@@ -63,6 +63,20 @@ impl PendingMessageQueue {
 // Inner agent state
 // ---------------------------------------------------------------------------
 
+/// Bookkeeping for the run in flight.
+///
+/// Port of the TS `ActiveRun` (`{ promise, resolve, abortController }`,
+/// agent.ts:159-163): `token` is the abort controller, and the watch channel
+/// is the run-settlement promise — `finish_run` sends `true` only after the
+/// loop returned and every awaited listener (including `agent_end`
+/// listeners) settled, exactly when the TS `finishRun()` resolves the
+/// promise (agent.ts:514-520).
+struct ActiveRun {
+    token: CancellationToken,
+    done_tx: tokio::sync::watch::Sender<bool>,
+    done_rx: tokio::sync::watch::Receiver<bool>,
+}
+
 struct Inner {
     system_prompt: String,
     model: Model,
@@ -84,7 +98,7 @@ struct Inner {
     steering_queue: PendingMessageQueue,
     follow_up_queue: PendingMessageQueue,
 
-    active_run: Option<CancellationToken>,
+    active_run: Option<ActiveRun>,
 }
 
 impl Inner {
@@ -365,8 +379,8 @@ impl Agent {
     /// an in-progress LLM stream to be cancelled via the shared
     /// [`CancellationToken`].
     pub async fn abort(&self) {
-        if let Some(token) = self.inner.lock().await.active_run.clone() {
-            token.cancel();
+        if let Some(run) = self.inner.lock().await.active_run.as_ref() {
+            run.token.cancel();
         }
     }
 
@@ -374,7 +388,35 @@ impl Agent {
     /// when the agent is idle. Can be used by external code to tie their
     /// own cleanup to the agent lifecycle.
     pub async fn signal(&self) -> Option<CancellationToken> {
-        self.inner.lock().await.active_run.clone()
+        self.inner
+            .lock()
+            .await
+            .active_run
+            .as_ref()
+            .map(|run| run.token.clone())
+    }
+
+    /// Resolve when the current run and all awaited event listeners have
+    /// finished.
+    ///
+    /// Port of the TS `waitForIdle()` (agent.ts:321-323): returns the current
+    /// run's settlement promise, which resolves only after `agent_end`
+    /// listeners settle and runtime state is cleared. Returns immediately
+    /// when no run is active. Like upstream, it is bound to the run active
+    /// at call time — a run started afterwards does not extend the wait.
+    pub async fn wait_for_idle(&self) {
+        let rx = self
+            .inner
+            .lock()
+            .await
+            .active_run
+            .as_ref()
+            .map(|run| run.done_rx.clone());
+        let Some(mut rx) = rx else {
+            return;
+        };
+        // A closed channel (sender dropped) also means the run settled.
+        let _ = rx.wait_for(|done| *done).await;
     }
 
     /// Clear transcript and runtime state.
@@ -536,7 +578,12 @@ impl Agent {
             return Err(AgentError::AlreadyRunning);
         }
         let token = CancellationToken::new();
-        g.active_run = Some(token.clone());
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+        g.active_run = Some(ActiveRun {
+            token: token.clone(),
+            done_tx,
+            done_rx,
+        });
         g.is_streaming = true;
         g.streaming_message = None;
         g.error_message = None;
@@ -572,7 +619,11 @@ impl Agent {
                     timestamp: current_time_ms(),
                 };
                 let listeners_clone: Vec<EventListener> = g.listeners.values().cloned().collect();
-                let token = g.active_run.clone().unwrap_or_default();
+                let token = g
+                    .active_run
+                    .as_ref()
+                    .map(|run| run.token.clone())
+                    .unwrap_or_default();
                 (failure, listeners_clone, token)
             };
 
@@ -599,18 +650,26 @@ impl Agent {
             }
         }
 
-        let mut g = inner.lock().await;
-        if let Some(result) = final_result {
-            g.system_prompt = result.context.system_prompt;
-            g.messages = result.context.messages;
-            g.tools = result.context.tools;
-            g.model = result.model;
-            g.thinking_level = result.thinking_level;
+        let finished_run = {
+            let mut g = inner.lock().await;
+            if let Some(result) = final_result {
+                g.system_prompt = result.context.system_prompt;
+                g.messages = result.context.messages;
+                g.tools = result.context.tools;
+                g.model = result.model;
+                g.thinking_level = result.thinking_level;
+            }
+            g.is_streaming = false;
+            g.streaming_message = None;
+            g.pending_tool_calls.clear();
+            g.active_run.take()
+        };
+        // TS finishRun (agent.ts:514-520): resolve the run's settlement
+        // promise last, after runtime-owned state is cleared — waiters
+        // observe the fully idle agent.
+        if let Some(run) = finished_run {
+            let _ = run.done_tx.send(true);
         }
-        g.is_streaming = false;
-        g.streaming_message = None;
-        g.pending_tool_calls.clear();
-        g.active_run = None;
     }
 
     async fn snapshot_context(&self) -> AgentContext {
