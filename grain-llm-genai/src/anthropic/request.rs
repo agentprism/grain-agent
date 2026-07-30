@@ -239,7 +239,7 @@ pub fn build_request(
 }
 
 /// Strip a grain `provider/model` namespace down to the provider-native id.
-fn bare_model_name(model_id: &str) -> String {
+pub(super) fn bare_model_name(model_id: &str) -> String {
     match model_id.split_once('/') {
         Some((_, name)) => name.to_string(),
         None => model_id.to_string(),

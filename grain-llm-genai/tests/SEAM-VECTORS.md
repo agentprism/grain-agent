@@ -109,15 +109,15 @@ Grain protocol: `grain-agent-core::AssistantMessageEvent`.
 
 | upstream field | grain field | status |
 |---|---|---|
-| `content[]` (text/thinking/toolCall) | `content: Vec<AssistantContent>` | mapped; `toolCall.thoughtSignature` has **no grain slot** (see S-7 / AB-R1 family) |
+| `content[]` (text/thinking/toolCall) | `content: Vec<AssistantContent>` | mapped; `toolCall.thoughtSignature` now HAS a grain slot (`ToolCall::thought_signature`, WP19) but no producer on either path — genai drops `reasoning_details` (S-7), and the Anthropic wire carries no signature on `tool_use` at all |
 | `stopReason` stop/length/toolUse/error/aborted | `StopReason` Stop/Length/ToolUse/Error/Aborted | mapped; upstream's mid-stream `"pending"` placeholder has no grain variant — grain partials carry the default `Stop` (cosmetic, excluded from comparison) |
 | `rawStopReason` | — none | **AB-R1** (info crosses genai; grain drops it) |
 | `errorMessage` | `error_message` | mapped |
 | `usage.input` (cache-**exclusive**) | `usage.input` (cache-**inclusive**, see `Cost::cost_for`) | convention differs; numerically equal whenever cache counters are 0 (all vectors here) |
 | `usage.output/cacheRead/cacheWrite/totalTokens` | `output/cache_read/cache_write/total_tokens` | mapped (total via AB-2 fallback when the wire omits it; see AB-2 divergence notes in §5) |
 | `usage.reasoning` | `usage.reasoning: Option<u64>` | mapped (**AB-R2 closed** after the WP4 rebase gave grain the field). Nuance: genai's `zero_as_none` deserialization turns a wire `reasoning_tokens: 0` into `None`, so upstream's `Some(0)` for openai-completions/google is not reproducible — wire zero and absent field are indistinguishable at this seam |
-| `responseId` | — none | **S-2** |
-| `responseModel` | — none | **S-6** |
+| `responseId` | `response_id` | **S-2 closed for the native transport** (WP27); still unreachable on the genai path, which never surfaces it |
+| `responseModel` | `response_model` | **S-6 closed for the native transport** (WP27); still unreachable on the genai path (genai never reads `chunk.model`) — see OV-3 |
 | `model`/`api`/`provider` | same names | grain echoes its own namespaced config (`anthropic/claude-…`); excluded from comparison |
 | `timestamp` | `timestamp` | excluded (wall clock) |
 
@@ -155,9 +155,12 @@ not smear every vector into STRUCTURAL):
 - mid-stream `partial.stopReason` `"pending"` placeholder (no grain
   variant; cosmetic);
 - `timestamp`, `model`/`api`/`provider` echoes;
-- `rawStopReason` (**AB-R1**), `usage.reasoning` (**AB-R2**),
-  `responseId` (**S-2**) — no grain slot to assert against; each is
-  inventoried below with the vectors upstream asserts it on.
+- `usage.reasoning` (**AB-R2**) — inventoried below with the vectors
+  upstream asserts it on. `rawStopReason` (**AB-R1**) and `responseId`
+  (**S-2**) no longer belong on this list for the NATIVE transport: both
+  now have grain slots (WP19) and are populated and asserted
+  (`tests/response_metadata.rs`). They remain unassertable on the **genai**
+  path, which is what the vectors in this file exercise.
 
 STRUCTURAL vectors assert the *upstream-translated* expectation and are
 intentionally **red** under `cargo test -- --ignored`; the red is the
@@ -175,9 +178,9 @@ explicit `structural gap` panic naming the unrepresentable field.
 | AV-3 | anthropic | `anthropic-sse-parsing.test.ts` | preserves sensitive stop reasons with a descriptive error message | **PASS** (native transport) | Was S-3. `message_delta.usage` now replaces rather than adds: 12/0/12, not 24/24 |
 | AV-4 | anthropic | `anthropic-sse-parsing.test.ts` | treats message_delta without usage as a no-op for usage accumulation | **PASS** (native transport) | Passed on genai too; on the native path the same green comes from replacement semantics skipping absent fields — the case that makes an unconditional halving of genai's total unsound |
 | AV-5 | anthropic | `anthropic-sse-parsing.test.ts` | ignores unknown SSE events after message_stop | **PASS** (native transport) | Was S-3. 12/5/17, not 24/5/29. Trailing junk frames are never read: the transport stops at the terminal |
-| OV-1 | openai-completions | `openai-completions-raw-stop-reason.test.ts` | preserves raw finish reasons for successful stops | **PASS** | Events/stop/usage exact. Upstream's `rawStopReason === "stop"` leg is AB-R1 (no grain slot; raw string does cross genai) |
+| OV-1 | openai-completions | `openai-completions-raw-stop-reason.test.ts` | preserves raw finish reasons for successful stops | **PASS** | Events/stop/usage exact. Upstream's `rawStopReason === "stop"` leg is AB-R1, still excluded — but **no longer blocked**: the slot exists (WP19) and the raw string DOES cross genai (preserved inside every `StopReason` variant). What is missing is only the assignment in `mapping::inbound::resolve_stop_reason`. Deliberately not done here: that is the DEFAULT path, so it is a live behavior change needing its own verification, unlike the opt-in transport WP27 wired |
 | OV-2 | openai-completions | `openai-completions-raw-stop-reason.test.ts` | preserves raw finish reasons for provider error stops | **PASS** | Fixed by AB-1 (was: silent `Done/Stop`). Error event + `Provider finish_reason: content_filter` exact. `rawStopReason` → AB-R1 |
-| OV-3 | openai-completions | `openai-completions-response-model.test.ts` | surfaces routed chunk.model on responseModel without changing model | **STRUCTURAL** | S-6: `chunk.model` never crosses genai; grain also lacks `response_model`. Representable remainder (text events, stop, usage 10/5/15) passes |
+| OV-3 | openai-completions | `openai-completions-response-model.test.ts` | surfaces routed chunk.model on responseModel without changing model | **STRUCTURAL** | S-6: `chunk.model` never crosses genai (grain's `response_model` slot now exists and the native transport fills it — this vector is genai-blocked only). Representable remainder (text events, stop, usage 10/5/15) passes |
 | OV-4 | openai-completions | `openai-completions-response-model.test.ts` | leaves responseModel undefined when chunks echo the requested id | **PASS** | Absence semantics vacuously exact; usage total 2 via AB-2 |
 | OV-5 | openai-completions | `openai-completions-response-model.test.ts` | ignores empty or missing chunk.model | **PASS** | Two text deltas aggregate; usage total 3 via AB-2 |
 | OV-6 | openai-completions (openrouter-flavored) | `openai-completions-reasoning-details.test.ts` | preserves reasoning_details that arrive before their matching tool call | **STRUCTURAL** | S-7: `delta.reasoning_details` never crosses genai; grain `ToolCall` has no signature slot. Representable remainder (toolcall events, args, toolUse stop) passes |
@@ -363,13 +366,16 @@ by `src/anthropic/` (opt-in; genai is still the default):
 | S-4 `stop_details` | **closed** — explanation → `error_message` [AV-2] |
 | S-5 malformed repair | **closed**, both halves — frames and tool arguments [AV-1] |
 | S-8 block boundaries | **closed** — driven by `content_block_start`/`stop`; an empty block now emits its `*_start`/`*_end` pair |
-| S-2 `responseId` | **blocked on core** — the transport *captures* it (`AnthropicState::response_id`); `AssistantMessage` has no slot |
-| S-6 `responseModel` | **blocked on core** — likewise captured (`AnthropicState::response_model`), no slot |
-| S-7 `reasoning_details` | **out of reach** — openai-completions only; needs a genai change *and* a core `ToolCall` signature field |
+| S-2 `responseId` | **closed** (WP27) — captured from `message_start.message.id` and carried on `AssistantMessage::response_id`, first-write-wins [`tests/response_metadata.rs`] |
+| S-6 `responseModel` | **closed** (WP27) — captured from `message_start.message.model` and carried on `AssistantMessage::response_model`, reported ONLY when it differs from the name actually sent on the wire (upstream's rule, `openai-completions.ts:442-444`) [`tests/response_metadata.rs`] |
+| S-7 `reasoning_details` | **out of reach** — openai-completions only, and needs a genai change. The core half is now closed (`ToolCall::thought_signature`, WP19); not applicable to this transport, since the Anthropic wire carries no signature on `tool_use` |
 
-The three unclosed rows are unchanged in kind: two are one-line wire-ups
-waiting on core fields nobody owns yet, and the third is a different provider
-family. Everything the Anthropic wire actually carries now reaches the loop.
+Only ONE row is now unclosed, and it is a different provider family
+(openai-completions), not an Anthropic-wire gap. S-2 and S-6 closed in WP27:
+WP19 supplied the core slots the earlier "blocked on core" verdict was waiting
+for, and the native transport — which parses the Anthropic stream itself and
+therefore actually holds the values — now carries them. Everything the
+Anthropic wire actually carries reaches the loop.
 
 - **S-1 — per-event usage.** Upstream partials carry running usage from
   `message_start` / per-chunk `usage` onward; genai only surfaces usage on
@@ -391,7 +397,10 @@ family. Everything the Anthropic wire actually carries now reaches the loop.
   on every message. genai's `InterStreamEnd.captured_response_id` field
   exists but all three streamers (anthropic, openai, gemini) hard-code it
   to `None` in 0.6.5; grain's `AssistantMessage` also has no field. genai
-  would need to populate `captured_response_id` (and grain grow a slot).
+  would need to populate `captured_response_id`. **The grain half is
+  closed** (`AssistantMessage::response_id`, WP19; populated by the native
+  transport in WP27) — what remains here is genai-only, and applies to the
+  genai path alone.
   **WP21 verdict — not reachable from `ChatStreamEvent`, and doubly
   blocked.** genai never populates the field (`streamer.rs:234` sets
   `captured_response_id: None` although `message_start.message.id` was
@@ -448,7 +457,8 @@ family. Everything the Anthropic wire actually carries now reaches the loop.
   `tests/genai_seam_limits.rs::s4_stop_details_never_crosses`, which
   serializes the whole terminal payload and asserts neither string occurs in
   it. grain *does* have the destination slot (`error_message`), so unlike
-  S-2/S-6/S-7 this one is blocked solely by genai. AV-2 additionally needs
+  S-7 this one is blocked solely by genai (as, since WP27, are S-2 and
+  S-6 — their core halves are closed). AV-2 additionally needs
   S-3, so it stays ignored regardless.
 - **S-5 — no malformed-JSON repair.** genai serde-parses every SSE frame
   and every accumulated tool-argument buffer; a malformed frame aborts the
@@ -467,10 +477,12 @@ family. Everything the Anthropic wire actually carries now reaches the loop.
 - **S-6 — `chunk.model` / responseModel not captured.** genai's openai
   streamer never reads `chunk.model`, so routed model ids (OpenRouter
   `auto` etc.) cannot be surfaced. genai would need e.g.
-  `captured_response_model` on `StreamEnd` (and grain a field). [OV-3]
+  `captured_response_model` on `StreamEnd`. [OV-3]
   **WP21 verdict — not reachable from `ChatStreamEvent`, and doubly
-  blocked** (genai never reads the field; grain has no `response_model`
-  slot, a core change outside WP21 and not in WP19's scope).
+  blocked.** **WP27 update: no longer doubly blocked.** The grain half is
+  closed (`AssistantMessage::response_model`, WP19; populated by the native
+  transport, which reads `message_start.message.model` directly). The
+  remaining blocker is genai-only, so OV-3 stays red on the genai path.
 - **S-7 — `delta.reasoning_details` not captured.** genai's openai
   streamer reads only `delta.content` / `delta.reasoning_content` /
   `delta.reasoning`; OpenRouter-style encrypted reasoning details (which

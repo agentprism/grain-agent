@@ -948,7 +948,7 @@ async fn ov2_openai_content_filter_finish_reason_is_error() {
 /// OV-3 — upstream test/openai-completions-response-model.test.ts:
 /// "surfaces routed chunk.model on responseModel without changing model".
 #[tokio::test]
-#[ignore = "structural: upstream expects responseModel=\"anthropic/claude-opus-4.8\" captured from chunk.model; genai 0.6.5's openai streamer never reads chunk.model and StreamEnd has no field for it (and grain's AssistantMessage has no response_model slot either). genai would need to capture chunk.model on StreamEnd (e.g. captured_response_model)"]
+#[ignore = "structural, and now genai-ONLY: upstream expects responseModel=\"anthropic/claude-opus-4.8\" captured from chunk.model. The grain half of this gap is CLOSED — AssistantMessage.response_model exists (WP19) and the native Anthropic transport populates it from message_start, proven end-to-end over a socket in tests/response_metadata.rs. What still blocks THIS vector is entirely genai 0.6.5: its openai streamer never reads chunk.model and StreamEnd has no field for it, so the value never crosses the seam on the genai path this vector exercises. genai would need to capture chunk.model on StreamEnd (e.g. captured_response_model)"]
 async fn ov3_openai_routed_response_model_surfaces() {
     let sse = openai_sse(&[
         json!({
@@ -1098,7 +1098,7 @@ async fn ov5_openai_ignores_empty_or_missing_chunk_model() {
 /// "preserves reasoning_details that arrive before their matching tool
 /// call".
 #[tokio::test]
-#[ignore = "structural: delta.reasoning_details never crosses genai — the openai streamer reads only delta.content / delta.reasoning_content / delta.reasoning (adapter/adapters/openai/streamer.rs), so the encrypted reasoning detail upstream attaches as toolCall.thoughtSignature is dropped; grain's ToolCall struct also has no thought-signature slot. genai would need to surface reasoning_details on its tool-call chunks (and grain-agent-core a ToolCall signature field) for the replay contract to survive this seam"]
+#[ignore = "structural, and now genai-ONLY: delta.reasoning_details never crosses genai — the openai streamer reads only delta.content / delta.reasoning_content / delta.reasoning (adapter/adapters/openai/streamer.rs), so the encrypted reasoning detail upstream attaches as toolCall.thoughtSignature is dropped. The grain half is CLOSED: ToolCall.thought_signature exists (WP19) and the cross-model replay rule is implemented in grain_agent_core::strip_cross_model_thought_signatures. genai would need to surface reasoning_details on its tool-call chunks for the replay contract to survive this seam. Note this vector is OpenAI/OpenRouter-specific and is NOT blocked by the native Anthropic transport: the Anthropic Messages wire carries no signature on tool_use at all (its signature lives on thinking blocks, which the transport already maps to ThinkingContent.signature), so there is nothing for that transport to attach"]
 async fn ov6_openai_reasoning_details_attach_to_tool_call() {
     let reasoning_detail = json!({
         "type": "reasoning.encrypted",
