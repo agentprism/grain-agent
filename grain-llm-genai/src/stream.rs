@@ -198,6 +198,14 @@ impl LlmStream for GenaiStream {
         let model_for_state = model.clone();
         let inner = stream_resp.stream;
 
+        // Terminal contract audit (WP3): every exit from the loop below
+        // yields exactly one terminal event carrying the assistant message —
+        // `Done` from the state machine on `ChatStreamEvent::End`, or an
+        // `Error` synthesized via `into_aborted` / `into_error_msg`, both of
+        // which preserve all content accumulated so far (mirroring upstream
+        // pi-ai, whose error event carries the partial AssistantMessage).
+        // The transport-failure path above returns a one-shot Error stream
+        // with an empty (nothing streamed yet) message for the same reason.
         let out = async_stream::stream! {
             let mut state = InboundState::new(&model_for_state);
             let mut inner = inner;

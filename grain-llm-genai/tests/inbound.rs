@@ -631,6 +631,37 @@ fn captured_usage_maps_cache_details() {
 }
 
 #[test]
+fn error_mid_tool_call_carries_partial_assembled_call() {
+    // Terminal contract: the Error terminal must carry the assistant
+    // message with everything accumulated so far — including an in-flight
+    // tool call whose arguments were still streaming (upstream pi-ai's
+    // error event carries the partial AssistantMessage the same way).
+    let mut state = InboundState::new(&model());
+    state.on_event(ChatStreamEvent::Start);
+    state.on_event(chunk("about to call"));
+    state.on_event(tool_call_cumulative("call-1", "echo", r#"{"v":"#));
+
+    let term = state.into_error_msg("connection reset");
+    if let AssistantMessageEvent::Error { error, result } = term {
+        assert_eq!(error, "connection reset");
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(result.error_message.as_deref(), Some("connection reset"));
+        assert_eq!(result.content.len(), 2);
+        match &result.content[1] {
+            AssistantContent::ToolCall(tc) => {
+                assert_eq!(tc.id, "call-1");
+                // Partial accumulation is preserved as-is (a string that
+                // the outbound corrupt-args guard recognizes).
+                assert_eq!(tc.arguments, serde_json::json!(r#"{"v":"#));
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
+    } else {
+        panic!("expected Error terminal");
+    }
+}
+
+#[test]
 fn duplicate_start_event_is_idempotent() {
     let (events, _) = run([ChatStreamEvent::Start, ChatStreamEvent::Start, end_normal()]);
     let starts = events
