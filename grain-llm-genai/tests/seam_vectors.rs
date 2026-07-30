@@ -421,6 +421,7 @@ fn tool_call_block(id: &str, name: &str, args: serde_json::Value) -> AssistantCo
         id: id.into(),
         name: name.into(),
         arguments: args,
+        thought_signature: None,
     })
 }
 

@@ -651,6 +651,8 @@ impl Agent {
                         StopReason::Error
                     },
                     error_message: Some(err.to_string()),
+                    // Locally synthesized, so no provider stop string exists.
+                    raw_stop_reason: None,
                     // AgentLoopError carries no structured code (its variants
                     // are continue-precondition failures).
                     error_code: None,

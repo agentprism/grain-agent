@@ -305,6 +305,7 @@ mod tests {
             error_message: None,
             error_code: None,
             timestamp: 0,
+            raw_stop_reason: None,
         })
     }
 
@@ -314,6 +315,7 @@ mod tests {
                 id: call_id.into(),
                 name: tool_name.into(),
                 arguments: serde_json::Value::Null,
+                thought_signature: None,
             })],
             api: "test".into(),
             provider: "test".into(),
@@ -323,6 +325,7 @@ mod tests {
             error_message: None,
             error_code: None,
             timestamp: 0,
+            raw_stop_reason: None,
         })
     }
 
@@ -350,6 +353,7 @@ mod tests {
             error_message: None,
             error_code: None,
             timestamp: 0,
+            raw_stop_reason: None,
         }
     }
 
@@ -364,6 +368,7 @@ mod tests {
             error_message: Some("overflow".into()),
             error_code: None,
             timestamp: 0,
+            raw_stop_reason: None,
         }
     }
 

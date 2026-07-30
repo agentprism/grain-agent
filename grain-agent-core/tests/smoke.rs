@@ -44,6 +44,7 @@ impl LlmStream for MockStream {
                         id: "call-1".into(),
                         name: "echo".into(),
                         arguments: serde_json::json!({ "value": "hi" }),
+                        thought_signature: None,
                     })],
                     api: model.api.clone(),
                     provider: model.provider.clone(),
@@ -53,6 +54,7 @@ impl LlmStream for MockStream {
                     error_message: None,
                     error_code: None,
                     timestamp: 0,
+                    raw_stop_reason: None,
                 };
                 vec![
                     AssistantMessageEvent::Start {
@@ -75,6 +77,7 @@ impl LlmStream for MockStream {
                     error_message: None,
                     error_code: None,
                     timestamp: 0,
+                    raw_stop_reason: None,
                 };
                 vec![
                     AssistantMessageEvent::Start {

@@ -31,13 +31,14 @@ pub use agent_loop::{
     run_agent_loop, run_agent_loop_continue,
 };
 pub use stream::{
-    AssistantStream, LlmStream, OnPayloadFn, OnResponseFn, ProviderResponse, StreamError, StreamFn,
-    StreamOptions,
+    AssistantStream, CacheRetention, LlmStream, OnPayloadFn, OnResponseFn, ProviderResponse,
+    StreamError, StreamFn, StreamOptions,
 };
 pub use types::{
     AgentContext, AgentEvent, AgentMessage, AgentState, AgentTool, AgentToolError, AgentToolResult,
     AssistantContent, AssistantMessage, AssistantMessageEvent, Cost, ErrorCode, ImageContent,
     LlmContext, Message, Model, QueueMode, StopReason, TextContent, ThinkingBudgets,
     ThinkingContent, ThinkingLevel, ToolCall, ToolDefinition, ToolExecutionMode, ToolResultMessage,
-    ToolUpdateCallback, Usage, UserContent, UserMessage,
+    ToolUpdateCallback, Usage, UserContent, UserMessage, is_same_model,
+    strip_cross_model_thought_signatures,
 };

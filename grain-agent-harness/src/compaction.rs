@@ -1264,6 +1264,7 @@ mod tests {
             error_message: None,
             error_code: None,
             timestamp: 0,
+            raw_stop_reason: None,
         }
     }
 
@@ -1292,6 +1293,7 @@ mod tests {
                 error_message: None,
                 error_code: None,
                 timestamp: 0,
+                raw_stop_reason: None,
             };
             Ok(Box::pin(stream::iter(vec![
                 AssistantMessageEvent::Start {
@@ -1677,6 +1679,7 @@ mod tests {
                     id: tool_call_id.into(),
                     name: tool_name.into(),
                     arguments: serde_json::json!({}),
+                    thought_signature: None,
                 }),
             ],
             api: "test".into(),
@@ -1687,6 +1690,7 @@ mod tests {
             error_message: None,
             error_code: None,
             timestamp: 0,
+            raw_stop_reason: None,
         })
     }
 

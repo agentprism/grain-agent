@@ -347,6 +347,11 @@ impl InboundState {
             id: tc.call_id.clone(),
             name: tc.fn_name,
             arguments: parse_tool_args(&raw),
+            // WP19 mechanical fill only — preserves today's behavior exactly.
+            // Populating this from `pending_thought_signatures` (instead of
+            // the empty-thinking-block workaround below) is adapter work
+            // owned by the concurrent grain-llm-genai package.
+            thought_signature: None,
         };
         self.blocks.push(AssistantContent::ToolCall(grain_tc));
         let idx = self.blocks.len() - 1;
@@ -622,6 +627,10 @@ fn empty_assistant(model: &Model) -> AssistantMessage {
         model: model.id.clone(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        // WP19 mechanical fill only. Mapping genai's terminal stop string
+        // into this slot is adapter work owned by the concurrent
+        // grain-llm-genai package.
+        raw_stop_reason: None,
         error_message: None,
         error_code: None,
         timestamp: now_ms(),

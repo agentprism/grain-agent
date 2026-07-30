@@ -36,6 +36,7 @@ fn assistant_text(text: &str) -> Message {
         error_message: None,
         error_code: None,
         timestamp: 0,
+        raw_stop_reason: None,
     })
 }
 
@@ -121,6 +122,7 @@ fn assistant_with_tool_calls_emits_tool_call_part() {
                 id: "call-1".into(),
                 name: "echo".into(),
                 arguments: serde_json::json!({ "value": "hi" }),
+                thought_signature: None,
             }),
         ],
         api: "openai".into(),
@@ -131,6 +133,7 @@ fn assistant_with_tool_calls_emits_tool_call_part() {
         error_message: None,
         error_code: None,
         timestamp: 0,
+        raw_stop_reason: None,
     });
     let chat = to_chat_request(&ctx(vec![msg], vec![], ""));
     let body = serde_json::to_value(&chat.messages[0].content).unwrap();
@@ -173,6 +176,7 @@ fn thinking_text_is_echoed_back_via_reasoning_content() {
         error_message: None,
         error_code: None,
         timestamp: 0,
+        raw_stop_reason: None,
     });
     let chat = to_chat_request(&ctx(vec![msg], vec![], ""));
     let body = serde_json::to_value(&chat.messages[0].content).unwrap();
@@ -198,11 +202,13 @@ fn thinking_signature_attaches_to_first_tool_call() {
                 id: "call-1".into(),
                 name: "echo".into(),
                 arguments: serde_json::json!({ "value": "hi" }),
+                thought_signature: None,
             }),
             AssistantContent::ToolCall(ToolCall {
                 id: "call-2".into(),
                 name: "echo".into(),
                 arguments: serde_json::json!({ "value": "ho" }),
+                thought_signature: None,
             }),
         ],
         api: "anthropic".into(),
@@ -213,6 +219,7 @@ fn thinking_signature_attaches_to_first_tool_call() {
         error_message: None,
         error_code: None,
         timestamp: 0,
+        raw_stop_reason: None,
     });
     let chat = to_chat_request(&ctx(vec![msg], vec![], ""));
     let body = serde_json::to_value(&chat.messages[0].content).unwrap();

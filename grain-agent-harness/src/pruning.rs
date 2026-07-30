@@ -224,6 +224,7 @@ mod tests {
                 id: (*id).into(),
                 name: (*name).into(),
                 arguments: serde_json::json!({}),
+                thought_signature: None,
             }));
         }
         AgentMessage::assistant(AssistantMessage {
@@ -236,6 +237,7 @@ mod tests {
             error_message: None,
             error_code: None,
             timestamp: 0,
+            raw_stop_reason: None,
         })
     }
 

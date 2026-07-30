@@ -1016,6 +1016,7 @@ mod tests {
                 error_message: None,
                 error_code: None,
                 timestamp: 0,
+                raw_stop_reason: None,
             };
             let evt = grain_agent_core::AssistantMessageEvent::Done { result: msg };
             Ok(Box::pin(stream::once(async move { evt })))

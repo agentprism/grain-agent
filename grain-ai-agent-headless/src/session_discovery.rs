@@ -411,6 +411,7 @@ mod tests {
             model: model.into(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            raw_stop_reason: None,
             error_message: None,
             error_code: None,
             timestamp: 0,
