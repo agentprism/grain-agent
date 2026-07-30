@@ -130,17 +130,54 @@ fn text_of(message: &AgentMessage) -> String {
     }
 }
 
+/// Message texts read **straight out of `entries.jsonl`**.
+///
+/// Durability assertions must go through the filesystem. Asserting against
+/// `agent.state().await.messages` cannot fail for the reason durability fails:
+/// the in-memory transcript contains the turn whether or not a single byte
+/// ever reached disk.
+async fn texts_on_disk(root: &std::path::Path, session_id: &str) -> Vec<String> {
+    let raw = tokio::fs::read(root.join(session_id).join("entries.jsonl"))
+        .await
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&raw);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in content {
+            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Round trip through a simulated process restart
 // ---------------------------------------------------------------------------
 
-/// Run a turn, drop every handle (the process dies), then reopen the session
-/// by id in a fresh repo and get an agent that still knows the conversation.
+/// Durability must hold across *repeated* restarts, not just the first.
+///
+/// Regression: `resume_agent` used to hand back a bare `Agent` with no session
+/// wiring, so a resumed worker read its history and then persisted nothing of
+/// its own. Restart #1 looked perfect and everything after it was lost,
+/// silently and without bound. Three processes deep is the shortest run that
+/// exposes it — and every assertion here reads `entries.jsonl`, because an
+/// in-memory assertion passes in both the fixed and the broken world.
 #[tokio::test]
-async fn session_round_trips_through_a_process_restart() {
+async fn session_survives_repeated_restarts_on_disk() {
     let dir = tempfile::tempdir().unwrap();
 
-    // ---- process 1 -------------------------------------------------------
+    // ---- process 1: harness-driven turn ---------------------------------
     {
         let repo = JsonlSessionRepo::new(dir.path()).unwrap();
         let session = repo.create(Some("worker-7".into())).await.unwrap();
@@ -156,14 +193,54 @@ async fn session_round_trips_through_a_process_restart() {
         // exactly as it would be when the process exits.
     }
 
-    // ---- process 2 -------------------------------------------------------
+    let after_one = texts_on_disk(dir.path(), "worker-7").await;
+    assert!(
+        after_one.iter().any(|t| t == "first question")
+            && after_one.iter().any(|t| t == "first answer"),
+        "turn one must be on disk, got {after_one:?}"
+    );
+
+    // ---- process 2: resumed agent takes a turn ---------------------------
+    {
+        let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+        let resumed = repo
+            .resume_agent("worker-7", agent_options(replier("second answer")))
+            .await
+            .expect("session must be resumable by id");
+        assert_eq!(
+            resumed.restored.message_count, 2,
+            "history must be recovered before the new turn"
+        );
+        resumed.agent.prompt_text("second question").await.unwrap();
+        resumed.agent.wait_for_idle().await;
+    }
+
+    let after_two = texts_on_disk(dir.path(), "worker-7").await;
+    assert!(
+        after_two.iter().any(|t| t == "second question"),
+        "a resumed agent's user turn must reach disk, got {after_two:?}"
+    );
+    assert!(
+        after_two.iter().any(|t| t == "second answer"),
+        "a resumed agent's assistant turn must reach disk, got {after_two:?}"
+    );
+    assert!(
+        after_two.iter().any(|t| t == "first answer"),
+        "turn one must not be clobbered, got {after_two:?}"
+    );
+
+    // ---- process 3: the turn taken after restart #1 is still there -------
     let repo = JsonlSessionRepo::new(dir.path()).unwrap();
-    let resumed = repo
-        .resume_agent("worker-7", agent_options(replier("second answer")))
+    let third = repo
+        .resume_agent("worker-7", agent_options(replier("third answer")))
         .await
-        .expect("session must be resumable by id");
-
-    let texts: Vec<String> = resumed
+        .unwrap();
+    assert_eq!(
+        third.restored.message_count, 4,
+        "the third process must see both turns; anything less means the \
+         resumed agent in process 2 wrote nothing"
+    );
+    let seen: Vec<String> = third
         .agent
         .state()
         .await
@@ -171,28 +248,41 @@ async fn session_round_trips_through_a_process_restart() {
         .iter()
         .map(text_of)
         .collect();
-    assert!(
-        texts.iter().any(|t| t.contains("first question")),
-        "user turn must survive the restart, got {texts:?}"
-    );
-    assert!(
-        texts.iter().any(|t| t.contains("first answer")),
-        "assistant turn must survive the restart, got {texts:?}"
-    );
-    assert_eq!(resumed.restored.message_count, texts.len());
+    assert!(seen.iter().any(|t| t.contains("second question")));
+    assert!(seen.iter().any(|t| t.contains("second answer")));
+}
 
-    // The rehydrated agent keeps appending to the same history.
-    resumed.agent.prompt_text("second question").await.unwrap();
-    let after: Vec<String> = resumed
-        .agent
-        .state()
-        .await
-        .messages
-        .iter()
-        .map(text_of)
-        .collect();
-    assert!(after.iter().any(|t| t.contains("first answer")));
-    assert!(after.iter().any(|t| t.contains("second answer")));
+/// The mirror writes exactly one copy of each message — a resumed agent must
+/// not double-append the history it was seeded with.
+#[tokio::test]
+async fn resumed_agent_does_not_duplicate_seeded_history() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+        let session = repo.create(Some("dup".into())).await.unwrap();
+        let harness =
+            AgentHarness::new(AgentHarnessOptions::new(session, model(), replier("a1"))).await;
+        harness.prompt_text("q1").await.unwrap();
+        harness.wait_for_idle().await;
+    }
+    {
+        let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+        let resumed = repo
+            .resume_agent("dup", agent_options(replier("a2")))
+            .await
+            .unwrap();
+        resumed.agent.prompt_text("q2").await.unwrap();
+        resumed.agent.wait_for_idle().await;
+    }
+
+    let texts = texts_on_disk(dir.path(), "dup").await;
+    for expected in ["q1", "a1", "q2", "a2"] {
+        assert_eq!(
+            texts.iter().filter(|t| *t == expected).count(),
+            1,
+            "{expected:?} must appear exactly once on disk, got {texts:?}"
+        );
+    }
 }
 
 /// Resuming a session id that was never written is a clean `NotFound`, not a
@@ -616,5 +706,298 @@ async fn fork_records_its_parent_session() {
             .await
             .parent_session(),
         None
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Identity: the directory is the session, not the id inside meta.json
+// ---------------------------------------------------------------------------
+
+/// Regression: restoring a session under a *different* directory name — the
+/// ordinary disaster-recovery path — must open the directory that was asked
+/// for, not the one `meta.json` happens to name.
+///
+/// Making `meta.json` authoritative for the whole record accidentally made its
+/// stale `id` authoritative too, and `SessionRepo::open` re-derives the
+/// directory from that id. The result was a handle bound to another session:
+/// reads returned the wrong history and, because the handle is writable,
+/// appends contaminated a different user's file.
+#[tokio::test]
+async fn a_copied_session_directory_opens_itself_not_its_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+
+    // The original: two entries.
+    {
+        let session = repo.create(Some("original".into())).await.unwrap();
+        session.append_message(user("original one")).await.unwrap();
+        session.append_message(user("original two")).await.unwrap();
+    }
+
+    // A restored/renamed copy carrying the original's meta.json, plus a third
+    // entry that exists only in the copy.
+    let src = dir.path().join("original");
+    let dst = dir.path().join("restored-copy");
+    tokio::fs::create_dir_all(&dst).await.unwrap();
+    for f in ["meta.json", "entries.jsonl", "state.json"] {
+        if src.join(f).exists() {
+            tokio::fs::copy(src.join(f), dst.join(f)).await.unwrap();
+        }
+    }
+    {
+        let copy = repo.open_id("restored-copy").await.unwrap();
+        copy.append_message(user("copy only")).await.unwrap();
+    }
+
+    // Opening the copy by id must yield the copy's three entries.
+    let copy = repo.open_id("restored-copy").await.unwrap();
+    assert_eq!(
+        copy.metadata().await.id,
+        "restored-copy",
+        "the directory name is the session id"
+    );
+    assert_eq!(copy.entries().await.len(), 3);
+
+    // Appending through that handle must land in the copy's file...
+    copy.append_message(user("written after restore"))
+        .await
+        .unwrap();
+    drop(copy);
+
+    let copy_texts = texts_on_disk(dir.path(), "restored-copy").await;
+    assert!(copy_texts.iter().any(|t| t == "written after restore"));
+
+    // ...and must not have touched the original's.
+    let original_texts = texts_on_disk(dir.path(), "original").await;
+    assert_eq!(
+        original_texts,
+        vec!["original one".to_string(), "original two".to_string()],
+        "the original session must be untouched, got {original_texts:?}"
+    );
+}
+
+/// The same guarantee through the resume path, which is how a worker is
+/// actually restored from a backup.
+#[tokio::test]
+async fn resume_binds_to_the_requested_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+    {
+        let session = repo.create(Some("worker-a".into())).await.unwrap();
+        session.append_message(user("a-history")).await.unwrap();
+    }
+    let src = dir.path().join("worker-a");
+    let dst = dir.path().join("worker-b");
+    tokio::fs::create_dir_all(&dst).await.unwrap();
+    for f in ["meta.json", "entries.jsonl", "state.json"] {
+        if src.join(f).exists() {
+            tokio::fs::copy(src.join(f), dst.join(f)).await.unwrap();
+        }
+    }
+
+    {
+        let resumed = repo
+            .resume_agent("worker-b", agent_options(replier("b-answer")))
+            .await
+            .unwrap();
+        assert_eq!(resumed.session.metadata().await.id, "worker-b");
+        resumed.agent.prompt_text("b-question").await.unwrap();
+        resumed.agent.wait_for_idle().await;
+    }
+
+    let b = texts_on_disk(dir.path(), "worker-b").await;
+    assert!(b.iter().any(|t| t == "b-question") && b.iter().any(|t| t == "b-answer"));
+    let a = texts_on_disk(dir.path(), "worker-a").await;
+    assert_eq!(
+        a,
+        vec!["a-history".to_string()],
+        "worker-a must not have received worker-b's turn, got {a:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Torn tails that split a multi-byte character
+// ---------------------------------------------------------------------------
+
+/// Regression: a tail torn mid-UTF-8-character must not make the session
+/// unopenable.
+///
+/// The repair reads bytes and truncates at the last newline *before* decoding.
+/// Decoding first would fail on the invalid tail and take every intact entry
+/// with it — turning a one-entry loss into total loss of the session, for any
+/// transcript containing an emoji, CJK text, a curly quote or an em-dash.
+#[tokio::test]
+async fn torn_multibyte_character_does_not_destroy_the_session() {
+    for payload in ["需要更多上下文", "🚀 shipping", "an em—dash", "a “quote”"] {
+        let dir = tempfile::tempdir().unwrap();
+        let entries_path = dir.path().join("utf8").join("entries.jsonl");
+        {
+            let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+            let session = repo.create(Some("utf8".into())).await.unwrap();
+            session.append_message(user("intact entry")).await.unwrap();
+            session.append_message(user(payload)).await.unwrap();
+        }
+
+        // Tear the final line inside its multi-byte payload: walk back to a
+        // byte that is a UTF-8 continuation byte (0b10xx_xxxx) and cut there,
+        // so the retained tail ends mid-character.
+        let raw = tokio::fs::read(&entries_path).await.unwrap();
+        let last_nl = raw.iter().rposition(|b| *b == b'\n').unwrap();
+        let prev_nl = raw[..last_nl].iter().rposition(|b| *b == b'\n').unwrap();
+        let cut = (prev_nl + 1..last_nl)
+            .rev()
+            .find(|i| raw[*i] & 0b1100_0000 == 0b1000_0000)
+            .expect("payload must contain a multi-byte character");
+        tokio::fs::write(&entries_path, &raw[..cut]).await.unwrap();
+        assert!(
+            std::str::from_utf8(&raw[..cut]).is_err(),
+            "the torn file must actually be invalid UTF-8 for {payload:?}"
+        );
+
+        // It must still open, keeping every complete entry.
+        let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+        let session = repo
+            .open_id("utf8")
+            .await
+            .unwrap_or_else(|e| panic!("torn {payload:?} made the session unopenable: {e:?}"));
+        assert_eq!(session.entries().await.len(), 1);
+
+        // And it must be writable afterwards, with the file left valid UTF-8.
+        session.append_message(user("after repair")).await.unwrap();
+        drop(session);
+        let repaired = tokio::fs::read(&entries_path).await.unwrap();
+        assert!(std::str::from_utf8(&repaired).is_ok());
+        let texts = texts_on_disk(dir.path(), "utf8").await;
+        assert_eq!(
+            texts,
+            vec!["intact entry".to_string(), "after repair".to_string()],
+            "payload {payload:?}"
+        );
+    }
+}
+
+/// Multi-byte content that is *not* torn must round-trip untouched.
+#[tokio::test]
+async fn intact_multibyte_content_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+        let session = repo.create(Some("u".into())).await.unwrap();
+        session
+            .append_message(user("🚀 需要 “x” — ok"))
+            .await
+            .unwrap();
+    }
+    let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+    let session = repo.open_id("u").await.unwrap();
+    assert_eq!(session.entries().await.len(), 1);
+    assert_eq!(
+        texts_on_disk(dir.path(), "u").await,
+        vec!["🚀 需要 “x” — ok".to_string()]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The batching gate, actually exercised
+// ---------------------------------------------------------------------------
+
+/// A stream that blocks until released, so a run is provably in flight while
+/// the test mutates settings.
+struct GatedReplier {
+    release: Arc<tokio::sync::Notify>,
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl LlmStream for GatedReplier {
+    async fn stream(
+        &self,
+        model: &Model,
+        _context: &LlmContext,
+        _options: &StreamOptions,
+        _cancel: CancellationToken,
+    ) -> Result<AssistantStream, StreamError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        let msg = AssistantMessage {
+            content: vec![AssistantContent::Text(TextContent {
+                text: "gated answer".into(),
+            })],
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            model: model.id.clone(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            raw_stop_reason: None,
+            response_model: None,
+            response_id: None,
+            error_message: None,
+            error_code: None,
+            timestamp: 0,
+        };
+        Ok(futures::stream::iter(vec![AssistantMessageEvent::Done { result: msg }]).boxed())
+    }
+}
+
+/// Regression: nothing in the suite previously reached `running == true`, so
+/// the batching branch was dead code as far as the tests were concerned.
+///
+/// With a run provably in flight, a settings change must be deferred — absent
+/// from `entries.jsonl` while the turn is mid-flight — and must land once the
+/// run settles, after the turn's own messages.
+#[tokio::test]
+async fn settings_changed_mid_run_are_deferred_then_flushed() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = JsonlSessionRepo::new(dir.path()).unwrap();
+    let session = repo.create(Some("gated".into())).await.unwrap();
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let stream: StreamFn = Arc::new(GatedReplier {
+        release: release.clone(),
+        started: started.clone(),
+    });
+
+    let harness =
+        Arc::new(AgentHarness::new(AgentHarnessOptions::new(session, model(), stream)).await);
+
+    let driver = {
+        let h = harness.clone();
+        tokio::spawn(async move { h.prompt_text("go").await })
+    };
+
+    // The provider call is in flight: the run is genuinely running.
+    started.notified().await;
+    harness.set_thinking_level(ThinkingLevel::High).await;
+
+    let mid = tokio::fs::read_to_string(dir.path().join("gated").join("entries.jsonl"))
+        .await
+        .unwrap_or_default();
+    assert!(
+        !mid.contains("thinking_level_change"),
+        "a mid-run settings change must be deferred, not written immediately: {mid}"
+    );
+
+    release.notify_one();
+    driver.await.unwrap().unwrap();
+    harness.wait_for_idle().await;
+
+    let after = tokio::fs::read_to_string(dir.path().join("gated").join("entries.jsonl"))
+        .await
+        .unwrap();
+    let kinds: Vec<&str> = after
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+        .map(|s| Box::leak(s.into_boxed_str()) as &str)
+        .collect();
+    let level_idx = kinds
+        .iter()
+        .position(|k| *k == "thinking_level_change")
+        .unwrap_or_else(|| panic!("deferred change must land once idle: {kinds:?}"));
+    let last_message_idx = kinds.iter().rposition(|k| *k == "message").unwrap();
+    assert!(
+        level_idx > last_message_idx,
+        "the flush must follow the turn's messages, not interleave: {kinds:?}"
     );
 }

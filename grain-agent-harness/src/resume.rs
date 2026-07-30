@@ -35,7 +35,9 @@
 //! registry. Upstream has the same split; it just always has a `ModelRuntime`
 //! on hand to do the lookup.
 
-use grain_agent_core::{Agent, AgentOptions, ThinkingLevel};
+use std::sync::Arc;
+
+use grain_agent_core::{Agent, AgentEvent, AgentOptions, ThinkingLevel};
 
 use crate::session::{Session, SessionContext, SessionError};
 
@@ -136,18 +138,48 @@ pub fn seed_options_from_context(
     }
 }
 
-/// Rebuild an [`Agent`] from an already-open [`Session`].
+/// Rebuild an [`Agent`] from an already-open [`Session`], wired so that
+/// everything it goes on to produce is persisted back.
 ///
 /// The supplied `options` provide everything the transcript cannot: the stream
 /// function, tool catalog, system prompt, hooks. Session-derived state is
 /// layered on top per [`seed_options_from_context`].
+///
+/// # The returned agent writes back
+///
+/// A resumed agent installs the same session-mirror listener
+/// [`crate::AgentHarness`] does: every finalized message is appended to the
+/// session as it completes. Without it a resumed agent would read history and
+/// then write none of its own — recovering correctly from the first restart
+/// and losing everything after it, silently, because the in-memory transcript
+/// still looks right. Durability that survives exactly one restart is worse
+/// than none, since nothing surfaces the loss.
+///
+/// Persistence failures are non-fatal and logged, matching the harness: a full
+/// disk should not abort a turn that is otherwise working.
 pub async fn resume_agent_from_session(
     session: &Session,
     mut options: AgentOptions,
 ) -> Result<ResumedAgent, SessionError> {
     let restored = seed_options_from_context(&mut options, session.build_context().await);
+    let agent = Agent::new(options);
+
+    let session_for_mirror = session.clone();
+    agent
+        .subscribe(Arc::new(move |event, _signal| {
+            let session = session_for_mirror.clone();
+            Box::pin(async move {
+                if let AgentEvent::MessageEnd { message } = event
+                    && let Err(e) = session.append_message(message).await
+                {
+                    eprintln!("[warn] resumed agent session append: {e}");
+                }
+            })
+        }))
+        .await;
+
     Ok(ResumedAgent {
-        agent: Agent::new(options),
+        agent,
         session: session.clone(),
         restored,
     })

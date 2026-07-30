@@ -30,18 +30,19 @@
 //! Known gaps against upstream (`packages/agent/src/harness/agent-harness.ts`
 //! @ 34239180) — see the repo's debt ledger for ownership:
 //!
-//! - `SystemPrompt::Dynamic` is resolved once at construction and never
-//!   re-rendered; upstream re-renders it every turn in `createTurnState`.
-//!   Today a `Dynamic` prompt collapses to the empty string.
-//! - `next_turn` is aliased onto the follow-up queue rather than being a
-//!   third bucket with its own prepend-at-next-prompt semantics.
 //! - The provider-hook triad (`before_provider_request`,
-//!   `before_provider_payload`, `after_provider_response`) is absent, and
-//!   `AgentHarnessOptions` exposes no `on_payload` / `on_response` /
-//!   `thinking_budgets` passthrough.
-//! - [`AgentHarness::skill`] synthesizes a prompt string instead of
-//!   validating the name against `Resources::skills` and rendering
-//!   upstream's `<skill>` invocation block.
+//!   `before_provider_payload`, `after_provider_response`) is absent. The
+//!   narrow form is wired — [`AgentHarnessOptions::on_payload`] /
+//!   [`AgentHarnessOptions::on_response`] /
+//!   [`AgentHarnessOptions::thinking_budgets`] reach the per-request
+//!   [`grain_agent_core::StreamOptions`] — but upstream's subscriber chain
+//!   with `applyStreamOptionsPatch` merge semantics is not ported.
+//! - `running` is set by [`AgentHarness::prompt`] only, so a settings change
+//!   made during [`AgentHarness::continue_`] or [`AgentHarness::compact`]
+//!   writes through mid-turn instead of batching to the turn boundary.
+//! - A failed settings write is logged, not surfaced: in-memory state is
+//!   already updated, so the agent can run one model while the session
+//!   records another. Upstream persists first and throws.
 //! - No harness-level `fork` over the ported [`crate::session::SessionRepo`]
 //!   fork. (Upstream has no `Agent.fork`; the fork lives at the session and
 //!   runtime layers.)
@@ -852,6 +853,10 @@ impl AgentHarness {
     /// `Agent::continue_` for the contract (the tail message must
     /// convert to a `user` or `toolResult` LLM message).
     pub async fn continue_(&self) -> Result<(), HarnessError> {
+        // Same batching gate as `prompt`: a settings change made while this
+        // run is in flight must land at the turn boundary, not spliced into
+        // the middle of the turn's entry chain.
+        self.mark_running().await;
         self.agent.continue_().await.map_err(Into::into)
     }
 
@@ -874,14 +879,22 @@ impl AgentHarness {
     /// Replace the active model. Forwards to `Agent::set_model` and
     /// emits [`AgentHarnessEvent::ModelSelect`].
     pub async fn set_model(&self, model: Model) {
+        // Persist first, assign second (upstream `agent-harness.ts:891-894`).
+        // The reverse order lets a failed write leave the agent running one
+        // model while the session records another, with nothing to signal it.
+        if self
+            .record_session_write(PendingSessionWrite::Model {
+                provider: model.provider.clone(),
+                model_id: model.id.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
         self.agent.set_model(model.clone()).await;
         self.inner.lock().await.model = model.clone();
         self.refresh_system_prompt().await;
-        self.record_session_write(PendingSessionWrite::Model {
-            provider: model.provider.clone(),
-            model_id: model.id.clone(),
-        })
-        .await;
         self.emit(AgentHarnessEvent::ModelSelect { model }).await;
     }
 
@@ -893,13 +906,19 @@ impl AgentHarness {
     /// Replace the thinking level. Forwards to `Agent::set_thinking_level`
     /// and emits [`AgentHarnessEvent::ThinkingLevelSelect`].
     pub async fn set_thinking_level(&self, level: ThinkingLevel) {
+        // Persist first, assign second — see `set_model`.
+        if self
+            .record_session_write(PendingSessionWrite::ThinkingLevel {
+                thinking_level: thinking_level_tag(level).to_string(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
         self.agent.set_thinking_level(level).await;
         self.inner.lock().await.thinking_level = level;
         self.refresh_system_prompt().await;
-        self.record_session_write(PendingSessionWrite::ThinkingLevel {
-            thinking_level: thinking_level_tag(level).to_string(),
-        })
-        .await;
         self.emit(AgentHarnessEvent::ThinkingLevelSelect { level })
             .await;
     }
@@ -911,15 +930,20 @@ impl AgentHarness {
     /// while a run is in flight it joins `pendingSessionWrites` and lands at
     /// the next turn boundary. Batching keeps mid-run state churn off the
     /// hot path and out of the middle of a turn's entry chain.
-    async fn record_session_write(&self, write: PendingSessionWrite) {
+    async fn record_session_write(&self, write: PendingSessionWrite) -> Result<(), SessionError> {
         {
             let mut g = self.inner.lock().await;
             if g.running {
                 g.pending_session_writes.push(write);
-                return;
+                return Ok(());
             }
         }
-        flush_one_session_write(&self.inner, &self.session, write).await;
+        // Idle: write through *now*, and report the outcome so the caller can
+        // decline to mutate in-memory state on failure. Deliberately does not
+        // touch the pending queue — re-queuing a write whose in-memory twin
+        // was never applied would reintroduce the divergence from the other
+        // side, applying it to the session later while memory never had it.
+        apply_session_write(&self.session, &write).await
     }
 
     /// Re-render a [`SystemPrompt::Dynamic`] prompt and push it onto the
@@ -972,12 +996,14 @@ impl AgentHarness {
             new_filtered = filter_tools(&g.all_tools, g.active_tool_names.as_ref());
             new_names = names.to_vec();
         }
-        self.agent.set_tools(new_filtered).await;
-        self.refresh_system_prompt().await;
+        // Persist first, assign second — see `set_model`. This one can report
+        // the failure, since it already returns `Result`.
         self.record_session_write(PendingSessionWrite::ActiveTools {
             active_tool_names: new_names.clone(),
         })
-        .await;
+        .await?;
+        self.agent.set_tools(new_filtered).await;
+        self.refresh_system_prompt().await;
         self.emit(AgentHarnessEvent::ActiveToolsSelect { names: new_names })
             .await;
         Ok(())
@@ -1090,6 +1116,21 @@ impl AgentHarness {
     /// `keep_recent` is clamped to `[1, total)`. Empty transcripts
     /// return [`HarnessError::EmptyTranscript`].
     pub async fn compact(&self, keep_recent: usize) -> Result<String, HarnessError> {
+        // The summarizer is a provider call, so this is a run for batching
+        // purposes: settings changed during it must not splice into the middle
+        // of the compaction. Nothing here goes through the agent loop, so no
+        // `AgentEnd` will arrive to clear the gate — this method owns both
+        // ends of it, including on the error paths.
+        self.mark_running().await;
+        let result = self.compact_inner(keep_recent).await;
+        {
+            self.inner.lock().await.running = false;
+        }
+        flush_pending_session_writes(&self.inner, &self.session).await;
+        result
+    }
+
+    async fn compact_inner(&self, keep_recent: usize) -> Result<String, HarnessError> {
         let state = self.agent.state().await;
         let messages = state.messages.clone();
         let total = messages.len();
@@ -1337,14 +1378,29 @@ fn thinking_level_tag(level: ThinkingLevel) -> &'static str {
     }
 }
 
-/// Apply a single session write immediately, re-queueing it on failure.
-async fn flush_one_session_write(
-    inner: &Arc<Mutex<HarnessInner>>,
+/// Apply one session write, logging and reporting any failure.
+async fn apply_session_write(
     session: &Session,
-    write: PendingSessionWrite,
-) {
-    inner.lock().await.pending_session_writes.push(write);
-    flush_pending_session_writes(inner, session).await;
+    write: &PendingSessionWrite,
+) -> Result<(), SessionError> {
+    let result = match write {
+        PendingSessionWrite::Model { provider, model_id } => session
+            .append_model_change(provider.clone(), model_id.clone())
+            .await
+            .map(|_| ()),
+        PendingSessionWrite::ThinkingLevel { thinking_level } => session
+            .append_thinking_level_change(thinking_level.clone())
+            .await
+            .map(|_| ()),
+        PendingSessionWrite::ActiveTools { active_tool_names } => session
+            .append_active_tools_change(active_tool_names.clone())
+            .await
+            .map(|_| ()),
+    };
+    if let Err(e) = &result {
+        eprintln!("[warn] harness session write: {e}");
+    }
+    result
 }
 
 /// Drain deferred session writes in FIFO order.
@@ -1366,26 +1422,10 @@ async fn flush_pending_session_writes(inner: &Arc<Mutex<HarnessInner>>, session:
             g.pending_session_writes.remove(0)
         };
 
-        let result = match &next {
-            PendingSessionWrite::Model { provider, model_id } => session
-                .append_model_change(provider.clone(), model_id.clone())
-                .await
-                .map(|_| ()),
-            PendingSessionWrite::ThinkingLevel { thinking_level } => session
-                .append_thinking_level_change(thinking_level.clone())
-                .await
-                .map(|_| ()),
-            PendingSessionWrite::ActiveTools { active_tool_names } => session
-                .append_active_tools_change(active_tool_names.clone())
-                .await
-                .map(|_| ()),
-        };
-
-        if let Err(e) = result {
+        if apply_session_write(session, &next).await.is_err() {
             // Non-fatal, like the message-mirror path: put the entry back at
             // the head so the next flush retries it, and stop draining so a
             // persistent failure doesn't spin.
-            eprintln!("[warn] harness pending session write: {e}");
             inner.lock().await.pending_session_writes.insert(0, next);
             return;
         }

@@ -23,10 +23,12 @@
 //!   `grain-ai-agent-headless`; this crate only renders already-loaded skills
 //!   into the system prompt via [`system_prompt`].
 //! - execution environment (`harness/env/*`) and shell-output capture.
-//! - the harness provider-hook triad (`before_provider_request`,
-//!   `before_provider_payload`, `after_provider_response`). The underlying
-//!   per-request callbacks exist on `grain_agent_core::StreamOptions`, but
-//!   `AgentHarnessOptions` does not yet expose them.
+//! - upstream's harness provider-hook *triad*
+//!   (`before_provider_request`, `before_provider_payload`,
+//!   `after_provider_response`) as a subscriber chain with patch-merge
+//!   semantics. The narrow single-callback form is wired:
+//!   `AgentHarnessOptions` forwards `on_payload` / `on_response` /
+//!   `thinking_budgets` to `grain_agent_core::StreamOptions`.
 
 pub mod agent_harness;
 pub mod compaction;
