@@ -273,6 +273,20 @@ mod tests {
     }
 
     #[test]
+    fn runtime_options_override_explicit_false_capture_flags() {
+        // A builder-supplied ChatOptions that explicitly disables the
+        // capture flags (Some(false), not merely unset) must still be
+        // overridden — the terminal-usage contract and the cumulative
+        // tool-chunk accumulator are not opt-outs.
+        let base = ChatOptions::default()
+            .with_capture_usage(false)
+            .with_capture_tool_calls(false);
+        let projected = chat_options_with_runtime(base, &StreamOptions::default());
+        assert_eq!(projected.capture_usage, Some(true));
+        assert_eq!(projected.capture_tool_calls, Some(true));
+    }
+
+    #[test]
     fn runtime_options_map_thinking_level() {
         let projected = chat_options_with_runtime(
             ChatOptions::default(),
