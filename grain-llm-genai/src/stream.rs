@@ -116,9 +116,11 @@ impl GenaiStream {
 ///   off, follow-up fragments arrive under a synthetic `call_{index}` id
 ///   and the inbound accumulator would treat them as new calls.
 ///
-/// **Not yet honored** (the genai 0.5 API doesn't expose per-call slots
-/// for these, so wiring them up requires a fuller refactor of the client
-/// builder; see the M-2 code-review entry):
+/// **Not yet honored** (verified against genai 0.6.5: `ChatOptions` has no
+/// per-call slots for these — auth goes through the client-build-time
+/// `AuthResolver`, and transport/retry config is fixed on the client — so
+/// wiring them up requires a fuller refactor of the client builder; see the
+/// M-2 code-review entry):
 /// - `api_key`: would need a dynamic auth resolver per-call.
 /// - `session_id` / `transport`: provider-specific transport knobs.
 /// - `max_retry_delay_ms`: WebConfig is set at client build time.
@@ -147,10 +149,11 @@ fn chat_options_with_runtime(base: ChatOptions, options: &StreamOptions) -> Chat
 /// genai additionally offers `ReasoningEffort::Max` and
 /// `ReasoningEffort::Budget(u32)`, which have no grain-side counterpart
 /// yet — they stay unmapped until a later WP adds the corresponding
-/// `ThinkingLevel` variants. (The historical `XHigh` → `High` collapse
-/// dated from genai 0.5, which had no band above `High`; genai 0.6
-/// supports `XHigh` natively, so the user's intent now passes through
-/// unchanged.)
+/// `ThinkingLevel` variants. (The historical `XHigh` → `High` collapse was
+/// stale adapter code: every genai release this adapter has pinned —
+/// 0.6.0-beta.20 onward — already had `ReasoningEffort::XHigh`, so the
+/// collapse silently downgraded the user's intent for no reason. It was
+/// removed in the 0.6.5 migration; `XHigh` now passes through unchanged.)
 ///
 /// Forward-compat note: the genai 0.7 line renames `ReasoningEffort::None`
 /// to `ReasoningEffort::Zero` (with `#[serde(alias = "None")]`), so on that
