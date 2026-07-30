@@ -32,6 +32,7 @@ use grain_agent_core::{
 };
 use serde_json::Value;
 
+use super::request::bare_model_name;
 use crate::mapping::json_repair::parse_json_with_repair;
 
 /// Per-field replacement accumulator for Anthropic usage.
@@ -119,10 +120,14 @@ pub struct AnthropicState {
     usage: UsageAccumulator,
     stop_reason: Option<String>,
     stop_explanation: Option<String>,
-    /// Captured from `message_start.message.id`. No grain slot today (S-2).
-    pub response_id: Option<String>,
-    /// Captured from `message_start.message.model`. No grain slot today (S-6).
-    pub response_model: Option<String>,
+    /// The model name this request actually put on the wire, i.e.
+    /// [`bare_model_name`] of the requested [`Model::id`].
+    ///
+    /// Kept so `message_start.message.model` can be compared against what we
+    /// *sent* rather than against the namespaced `Model::id`. See
+    /// [`Self::on_message_start`] for why that distinction decides whether
+    /// `response_model` is signal or noise.
+    requested_wire_model: String,
     finished: bool,
 }
 
@@ -134,22 +139,17 @@ impl AnthropicState {
                 api: model.api.clone(),
                 provider: model.provider.clone(),
                 model: model.id.clone(),
-                // WP19 mechanical fill only, matching the sibling genai path
-                // in `mapping::inbound::empty_assistant`. This transport
-                // *does* capture both values (see `Self::response_id` /
-                // `Self::response_model`, populated from `message_start`),
-                // and WP19 has since added the slots to carry them — but
-                // landing them here is a live behavior change on a transport
-                // that is opt-in and not yet live-verified, so it stays with
-                // the transport owner (WP24) rather than riding in on a
-                // build fix. Wiring these three closes G12/G13.
+                // Filled in from the wire as the stream progresses:
+                // `response_id` / `response_model` at `message_start`,
+                // `raw_stop_reason` at `message_delta`. They live on `base`
+                // rather than in side channels so that every downstream
+                // path — `partial()`, `finish()`, `into_error()` and
+                // `into_aborted()`, all of which clone `base` — carries them
+                // without each having to remember to.
                 response_id: None,
                 response_model: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
-                // Likewise: `Self::stop_reason` holds the provider's verbatim
-                // stop string and is exactly what this slot wants. Left None
-                // for the same reason as above.
                 raw_stop_reason: None,
                 error_message: None,
                 error_code: None,
@@ -162,8 +162,7 @@ impl AnthropicState {
             usage: UsageAccumulator::default(),
             stop_reason: None,
             stop_explanation: None,
-            response_id: None,
-            response_model: None,
+            requested_wire_model: bare_model_name(&model.id),
             finished: false,
         }
     }
@@ -230,8 +229,47 @@ impl AnthropicState {
 
     fn on_message_start(&mut self, value: &Value) -> Vec<AssistantMessageEvent> {
         if let Some(message) = value.get("message") {
-            self.response_id = str_at(message, "id").map(str::to_string);
-            self.response_model = str_at(message, "model").map(str::to_string);
+            // S-2. Upstream: `output.responseId = event.message.id`
+            // (pi-ai `anthropic-messages.ts:575` @ 34239180). Upstream
+            // assigns directly because Anthropic sends `message_start` once
+            // per response; we make that first-write-wins so a malformed or
+            // duplicated `message_start` cannot rewrite the id mid-stream.
+            if self.base.response_id.is_none()
+                && let Some(id) = str_at(message, "id")
+            {
+                self.base.response_id = Some(id.to_string());
+            }
+            // S-6. Upstream's rule, from the one place it implements this
+            // (pi-ai `openai-completions.ts:442-444` @ 34239180):
+            //
+            //     if (typeof chunk.model === "string" && chunk.model.length > 0
+            //         && chunk.model !== model.id) {
+            //         output.responseModel ||= chunk.model;
+            //     }
+            //
+            // i.e. a string, non-empty, and ONLY when it differs from what
+            // was requested — a served model that matches leaves the slot
+            // `None`. `||=` makes it first-write-wins.
+            //
+            // One deliberate deviation, forced by a difference upstream does
+            // not have: upstream compares against `model.id`, but this
+            // transport does not send `model.id` — `to_request` sends
+            // `bare_model_name(&model.id)`, stripping the `anthropic/`
+            // namespace. Comparing the echo against the *namespaced* id would
+            // therefore differ on literally every response, filling the slot
+            // with noise and destroying the very signal it exists to carry.
+            // Comparing against what we actually put on the wire preserves
+            // upstream's semantics — "did the provider serve something other
+            // than what I asked for?" — and still reports the real case,
+            // an alias resolving to a dated snapshot
+            // (`claude-haiku-4-5` -> `claude-haiku-4-5-20251001`).
+            if self.base.response_model.is_none()
+                && let Some(served) = str_at(message, "model")
+                && !served.is_empty()
+                && served != self.requested_wire_model
+            {
+                self.base.response_model = Some(served.to_string());
+            }
             if let Some(usage) = message.get("usage") {
                 self.usage.apply(usage);
             }
@@ -309,10 +347,34 @@ impl AnthropicState {
                     id: str_at(block, "id").unwrap_or_default().to_string(),
                     name: str_at(block, "name").unwrap_or_default().to_string(),
                     arguments: Value::Object(Default::default()),
-                    // Anthropic does not emit a thought signature on the tool
-                    // call itself (it carries one on `thinking` blocks, which
-                    // this transport already maps to `ThinkingContent`), so
-                    // there is genuinely nothing to supply here.
+                    // `None` is the CORRECT value here, not a fill. Evidence,
+                    // since this is the kind of claim that should not rest on
+                    // "it compiled":
+                    //
+                    // 1. The field is provider-scoped by definition — pi-ai
+                    //    annotates it "Google-specific: opaque signature for
+                    //    reusing thought context" (`types.ts:365` @ 34239180).
+                    // 2. Upstream's own Anthropic implementation never sets
+                    //    it: `thoughtSignature` does not appear anywhere in
+                    //    `anthropic-messages.ts`, and nothing there reads a
+                    //    signature off a `tool_use` block.
+                    // 3. The providers that DO set it are Google
+                    //    (`google-generative-ai.ts`, `google-vertex.ts`,
+                    //    `google-shared.ts`, from a native
+                    //    `part.thoughtSignature`) and OpenAI-completions —
+                    //    and that last one is not an Anthropic wire feature
+                    //    either: it is OpenRouter's `reasoning_details`,
+                    //    where an *encrypted* reasoning detail is matched to
+                    //    a tool call by id and serialized in
+                    //    (`openai-completions.ts:549-557`).
+                    // 4. On the Anthropic Messages wire a `tool_use` block
+                    //    carries `id`, `name` and `input` only. Anthropic's
+                    //    signature lives on `thinking` blocks, and this
+                    //    transport already maps that one — to
+                    //    `ThinkingContent.signature`, where it belongs.
+                    //
+                    // So there is no signature on this wire to carry, and
+                    // inventing one would be worse than omitting it.
                     thought_signature: None,
                 }));
                 let idx = self.blocks.len() - 1;
@@ -425,6 +487,19 @@ impl AnthropicState {
         if let Some(delta) = value.get("delta") {
             if let Some(reason) = str_at(delta, "stop_reason") {
                 self.stop_reason = Some(reason.to_string());
+                // Ledger 13. Upstream, inside the same `if
+                // (event.delta.stop_reason)` guard and immediately before
+                // mapping it: `output.rawStopReason = event.delta.stop_reason`
+                // (pi-ai `anthropic-messages.ts:709` @ 34239180).
+                //
+                // `stop_reason` below is the NORMALIZED union; this is what
+                // the provider actually said. Several distinct raw reasons
+                // collapse onto one `StopReason` — Anthropic's `"refusal"`
+                // and `"sensitive"` both normalize to a stop — so this is the
+                // only channel that preserves the distinction for diagnostics
+                // and policy. Written to `base`, so it survives onto whichever
+                // terminal follows, including an error or an abort.
+                self.base.raw_stop_reason = Some(reason.to_string());
             }
             // S-4: the refusal explanation the genai seam destroys.
             if let Some(details) = delta.get("stop_details")
@@ -856,10 +931,19 @@ mod tests {
         assert!(!s.is_finished(), "an unparseable frame must not end the turn");
     }
 
-    // -- S-2 / S-6: captured here, but no core slot -------------------------
+    // -- S-2 / S-6 / ledger 13: captured AND carried -------------------------
+
+    /// Pull the terminal message out of a finished event stream.
+    fn terminal(events: Vec<AssistantMessageEvent>) -> AssistantMessage {
+        match events.into_iter().next_back().expect("a terminal event") {
+            AssistantMessageEvent::Done { result } => result,
+            AssistantMessageEvent::Error { result, .. } => result,
+            other => panic!("expected a terminal event, got {other:?}"),
+        }
+    }
 
     #[test]
-    fn response_id_and_model_are_captured_even_though_grain_cannot_carry_them() {
+    fn response_id_and_served_model_reach_the_assistant_message() {
         let mut s = AnthropicState::new(&model());
         s.on_frame(
             "message_start",
@@ -867,11 +951,97 @@ mod tests {
                     "usage":{"input_tokens":1}}})
             .to_string(),
         );
-        assert_eq!(s.response_id.as_deref(), Some("msg_abc"));
+        let msg = terminal(s.finish());
+        assert_eq!(msg.response_id.as_deref(), Some("msg_abc"));
+        // The alias we sent was `claude-haiku-4-5`; the provider served a
+        // dated snapshot, so it DIFFERS and must be reported.
         assert_eq!(
-            s.response_model.as_deref(),
+            msg.response_model.as_deref(),
             Some("claude-haiku-4-5-20991231")
         );
+        // `model` itself is untouched — it stays the requested id.
+        assert_eq!(msg.model, "anthropic/claude-haiku-4-5");
+    }
+
+    /// Upstream's rule is "only when it differs". The namespace this
+    /// transport strips before sending must not be mistaken for a difference,
+    /// or every single response would report a served model.
+    #[test]
+    fn served_model_matching_what_we_sent_leaves_the_slot_empty() {
+        let mut s = AnthropicState::new(&model());
+        s.on_frame(
+            "message_start",
+            // `model()` is `anthropic/claude-haiku-4-5`, so the wire name we
+            // sent was the bare `claude-haiku-4-5` — this is a MATCH.
+            &json!({"message":{"id":"msg_1","model":"claude-haiku-4-5"}}).to_string(),
+        );
+        let msg = terminal(s.finish());
+        assert_eq!(
+            msg.response_model, None,
+            "a served model equal to the one requested is not a routing event \
+             and must not be reported"
+        );
+        assert_eq!(msg.response_id.as_deref(), Some("msg_1"));
+    }
+
+    #[test]
+    fn response_id_is_first_write_wins() {
+        let mut s = AnthropicState::new(&model());
+        s.on_frame("message_start", &json!({"message":{"id":"msg_first"}}).to_string());
+        s.on_frame("message_start", &json!({"message":{"id":"msg_second"}}).to_string());
+        assert_eq!(
+            terminal(s.finish()).response_id.as_deref(),
+            Some("msg_first"),
+            "a duplicated message_start must not rewrite the id mid-stream"
+        );
+    }
+
+    #[test]
+    fn empty_served_model_is_not_reported() {
+        let mut s = AnthropicState::new(&model());
+        s.on_frame(
+            "message_start",
+            &json!({"message":{"id":"m","model":""}}).to_string(),
+        );
+        assert_eq!(terminal(s.finish()).response_model, None);
+    }
+
+    /// The raw stop string is preserved verbatim next to the normalized one.
+    /// `stop_sequence` is a case that matters: `resolve_stop` collapses it,
+    /// `end_turn` and `pause_turn` onto a bare `StopReason::Stop` with no
+    /// error message, so the raw channel is the only surviving evidence of
+    /// which of the three actually happened.
+    #[test]
+    fn raw_stop_reason_survives_normalization() {
+        let mut s = AnthropicState::new(&model());
+        s.on_frame("message_start", &json!({"message":{"id":"m"}}).to_string());
+        s.on_frame(
+            "message_delta",
+            &json!({"delta":{"stop_reason":"stop_sequence"}}).to_string(),
+        );
+        let msg = terminal(s.finish());
+        assert_eq!(msg.raw_stop_reason.as_deref(), Some("stop_sequence"));
+        assert_eq!(
+            msg.stop_reason,
+            StopReason::Stop,
+            "precondition: the normalized value has lost the distinction"
+        );
+        assert_eq!(msg.error_message, None);
+    }
+
+    /// A provider stop string seen before a terminal ERROR must not be lost:
+    /// `into_error` clones the same `base`, so it carries too.
+    #[test]
+    fn raw_stop_reason_survives_a_terminal_error() {
+        let mut s = AnthropicState::new(&model());
+        s.on_frame("message_start", &json!({"message":{"id":"m"}}).to_string());
+        s.on_frame(
+            "message_delta",
+            &json!({"delta":{"stop_reason":"max_tokens"}}).to_string(),
+        );
+        let msg = terminal(s.into_error("connection reset"));
+        assert_eq!(msg.raw_stop_reason.as_deref(), Some("max_tokens"));
+        assert_eq!(msg.response_id.as_deref(), Some("m"));
     }
 
     /// W4: a `redacted_thinking` block carries only an opaque `data` payload.
