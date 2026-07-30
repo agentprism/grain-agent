@@ -57,6 +57,11 @@ impl PendingMessageQueue {
     fn clear(&mut self) {
         self.messages.clear();
     }
+    /// Empty the queue, returning everything it held — regardless of
+    /// [`QueueMode`], which governs draining into a turn, not discarding.
+    fn take_all(&mut self) -> Vec<AgentMessage> {
+        self.messages.drain(..).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +388,23 @@ impl Agent {
     /// Discard all pending follow-up messages.
     pub async fn clear_follow_up_queue(&self) {
         self.inner.lock().await.follow_up_queue.clear();
+    }
+
+    /// Clear the steering queue, returning what was discarded.
+    ///
+    /// Upstream snapshots the queue before clearing it so `abort()` can
+    /// report what it threw away (`const clearedSteer = [...this.steerQueue]`,
+    /// `packages/agent/src/harness/agent-harness.ts:1025-1028` @ 34239180);
+    /// callers can requeue the messages instead of losing them silently.
+    /// Unlike `drain`, this ignores [`QueueMode`] and always takes everything.
+    pub async fn take_steering_queue(&self) -> Vec<AgentMessage> {
+        self.inner.lock().await.steering_queue.take_all()
+    }
+
+    /// Clear the follow-up queue, returning what was discarded.
+    /// See [`Self::take_steering_queue`].
+    pub async fn take_follow_up_queue(&self) -> Vec<AgentMessage> {
+        self.inner.lock().await.follow_up_queue.take_all()
     }
 
     /// Discard both steering and follow-up queues.

@@ -2,7 +2,7 @@
 
 Session persistence. Represents a conversation as a **tree** of entries linked via `parent_id`, with a `leaf_id` cursor pointing at the tip of the active branch. Supports branching, forking, moving the cursor, and compaction.
 
-Corresponds to `packages/agent/src/harness/session/*` (excluding `jsonl-repo.ts` — on-disk JSONL persistence is not yet ported; see `grain_agent_harness::lib` doc).
+Corresponds to `packages/agent/src/harness/session/*` (including `jsonl-repo.ts` — on-disk JSONL persistence lives in `session_jsonl`).
 
 中文版：[zh/harness-session.md](./zh/harness-session.md).
 

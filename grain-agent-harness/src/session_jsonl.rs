@@ -31,6 +31,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+use grain_agent_core::AgentOptions;
+
+use crate::resume::{ResumedAgent, resume_agent_from_session};
 use crate::session::{
     ForkPosition, Session, SessionError, SessionMetadata, SessionRepo, SessionStorage,
     SessionTreeEntry, SessionTreeEntryKind, uuidv7,
@@ -104,7 +107,43 @@ impl JsonlSessionStorage {
             let raw = tokio::fs::read_to_string(&entries_path)
                 .await
                 .map_err(io_err(entries_path.display().to_string()))?;
-            for (lineno, line) in raw.lines().enumerate() {
+
+            // Repair a torn tail before anything else reads or appends.
+            //
+            // A crash partway through `append_to_jsonl` leaves a final line
+            // with no terminating newline. Skipping it at parse time is not
+            // enough: the next append would concatenate onto the fragment,
+            // fusing garbage and a valid entry into one unparseable line and
+            // silently losing *that* entry too. Truncating to the last
+            // newline boundary makes the file exactly "all complete
+            // entries", which is the contract the rest of this module and
+            // its callers rely on. Safe to do here because the exclusive
+            // lock above is already held.
+            let complete_len = if raw.is_empty() || raw.ends_with('\n') {
+                raw.len()
+            } else {
+                let complete_len = raw.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&entries_path)
+                    .await
+                    .map_err(io_err(entries_path.display().to_string()))?;
+                file.set_len(complete_len as u64)
+                    .await
+                    .map_err(io_err(entries_path.display().to_string()))?;
+                file.sync_all()
+                    .await
+                    .map_err(io_err(entries_path.display().to_string()))?;
+                eprintln!(
+                    "[warn] grain-agent-harness: discarded {} byte(s) of a \
+                     partially-written trailing entry in {}",
+                    raw.len() - complete_len,
+                    entries_path.display()
+                );
+                complete_len
+            };
+
+            for (lineno, line) in raw[..complete_len].lines().enumerate() {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -347,6 +386,32 @@ impl JsonlSessionRepo {
             return Err(SessionError::NotFound(format!("Session not found: {id}")));
         };
         self.open(&metadata).await
+    }
+
+    /// Load session `id` from disk and rebuild an [`Agent`] carrying its
+    /// history — the one call a worker needs to come back after a host
+    /// restart.
+    ///
+    /// ```no_run
+    /// # use grain_agent_harness::JsonlSessionRepo;
+    /// # use grain_agent_core::AgentOptions;
+    /// # async fn f(options: AgentOptions) -> Result<(), Box<dyn std::error::Error>> {
+    /// let repo = JsonlSessionRepo::new("/var/lib/agent/sessions")?;
+    /// let resumed = repo.resume_agent("worker-7", options).await?;
+    /// resumed.agent.prompt_text("carry on").await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Errors with [`SessionError::NotFound`] when no such session exists on
+    /// disk. See [`crate::resume`] for exactly what is and is not restored —
+    /// in particular the model, which the caller must resolve.
+    pub async fn resume_agent(
+        &self,
+        id: &str,
+        options: AgentOptions,
+    ) -> Result<ResumedAgent, SessionError> {
+        let session = self.open_id(id).await?;
+        resume_agent_from_session(&session, options).await
     }
 
     /// Open a session by id when it exists, otherwise create it.
