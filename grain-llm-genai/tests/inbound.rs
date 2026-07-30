@@ -400,6 +400,120 @@ fn tool_chunk_after_block_closed_updates_silently() {
 }
 
 #[test]
+fn orphan_signature_after_thinking_closed_attaches_to_last_thinking_block() {
+    // Gemini can deliver the signature on a later part, after the thinking
+    // block already closed (upstream google-shared.ts: "the signature
+    // appears on the last part for context replay").
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        reasoning("deep thought"),
+        chunk("answer"), // closes the thinking block
+        thought_sig("late-sig"),
+        end_normal(),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.content.len(), 2);
+        if let AssistantContent::Thinking(t) = &result.content[0] {
+            assert_eq!(t.signature.as_deref(), Some("late-sig"));
+        } else {
+            panic!("expected thinking block first");
+        }
+    } else {
+        panic!();
+    }
+}
+
+#[test]
+fn signature_before_reasoning_seeds_next_thinking_block() {
+    // genai's Gemini streamer queues ThoughtSignatureChunk *before* the
+    // ReasoningChunk of the same part, so the signature routinely arrives
+    // with no thinking block open yet. It must seed the block that opens
+    // next — never panic, never drop.
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        thought_sig("early-sig"),
+        reasoning("now thinking"),
+        end_normal(),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.content.len(), 1);
+        if let AssistantContent::Thinking(t) = &result.content[0] {
+            assert_eq!(t.thinking, "now thinking");
+            assert_eq!(t.signature.as_deref(), Some("early-sig"));
+        } else {
+            panic!("expected thinking block");
+        }
+    } else {
+        panic!();
+    }
+}
+
+#[test]
+fn orphan_signature_with_no_thinking_block_lands_in_signature_only_block() {
+    // Gemini thinking mode with thought summaries disabled: the turn has a
+    // signature but no reasoning text at all (the signature rides on the
+    // functionCall part). Upstream preserves such signatures for context
+    // replay; grain's slot for that is ThinkingContent::signature, so the
+    // final message carries a signature-only thinking block that the
+    // outbound mapper forwards as tool-call thought_signatures.
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        thought_sig("solo-sig"),
+        tool_call("call-1", "echo", serde_json::json!({ "v": 1 })),
+        end_normal(),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        let sig_blocks: Vec<_> = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                AssistantContent::Thinking(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sig_blocks.len(), 1);
+        assert_eq!(sig_blocks[0].thinking, "");
+        assert_eq!(sig_blocks[0].signature.as_deref(), Some("solo-sig"));
+        assert_eq!(
+            result.stop_reason,
+            StopReason::ToolUse,
+            "signature preservation must not disturb stop-reason inference"
+        );
+    } else {
+        panic!();
+    }
+}
+
+#[test]
+fn tool_chunk_carrying_thought_signatures_attaches_them() {
+    // Defensive: a ToolCallChunk whose ToolCall carries thought_signatures
+    // directly (genai's non-streaming Gemini shape) routes them through the
+    // same attachment logic as ThoughtSignatureChunk.
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        reasoning("thinking first"),
+        ChatStreamEvent::ToolCallChunk(ToolChunk {
+            tool_call: GenaiToolCall {
+                call_id: "call-1".into(),
+                fn_name: "echo".into(),
+                fn_arguments: serde_json::json!({ "v": 1 }),
+                thought_signatures: Some(vec!["inline-sig".into()]),
+            },
+        }),
+        end_normal(),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        if let AssistantContent::Thinking(t) = &result.content[0] {
+            assert_eq!(t.signature.as_deref(), Some("inline-sig"));
+        } else {
+            panic!("expected thinking block first");
+        }
+    } else {
+        panic!();
+    }
+}
+
+#[test]
 fn captured_usage_populates_final_message() {
     let usage = genai::chat::Usage {
         prompt_tokens: Some(100),
@@ -459,6 +573,28 @@ fn into_error_msg_preserves_accumulated_content() {
         assert_eq!(result.content.len(), 2);
     } else {
         panic!();
+    }
+}
+
+#[test]
+fn aborted_mid_stream_flushes_pending_signature() {
+    // A pending orphan signature must survive an abort — the Error
+    // terminal's message is what gets persisted for replay.
+    let mut state = InboundState::new(&model());
+    state.on_event(ChatStreamEvent::Start);
+    state.on_event(thought_sig("pending-sig"));
+
+    let term = state.into_aborted();
+    if let AssistantMessageEvent::Error { result, .. } = term {
+        assert_eq!(result.stop_reason, StopReason::Aborted);
+        assert_eq!(result.content.len(), 1);
+        if let AssistantContent::Thinking(t) = &result.content[0] {
+            assert_eq!(t.signature.as_deref(), Some("pending-sig"));
+        } else {
+            panic!("expected signature-only thinking block");
+        }
+    } else {
+        panic!("expected Error terminal");
     }
 }
 

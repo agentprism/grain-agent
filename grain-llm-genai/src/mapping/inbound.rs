@@ -55,6 +55,17 @@ pub struct InboundState {
     /// tool_call_ids. The stored `raw` string is what lets us compute the
     /// suffix delta between consecutive chunks.
     tool_calls: HashMap<String, ToolCallProgress>,
+    /// A thought signature that arrived before any thinking block existed
+    /// (Gemini emits `ThoughtSignatureChunk` *before* the `ReasoningChunk`
+    /// that would open the block — genai 0.6.5
+    /// `adapter/adapters/gemini/streamer.rs` queues Thought → Reasoning →
+    /// Text → ToolCall). Seeded into the next thinking block that opens;
+    /// flushed as a signature-only thinking block at terminal if no
+    /// thinking block ever appears (e.g. Gemini thinking mode with thought
+    /// summaries disabled, where the signature rides on a functionCall
+    /// part — upstream `packages/ai/src/api/google-shared.ts` preserves
+    /// such signatures for context replay rather than dropping them).
+    pending_thought_signature: Option<String>,
 }
 
 /// Cumulative-argument progress for one streamed tool call.
@@ -83,6 +94,7 @@ impl InboundState {
             open: None,
             started: false,
             tool_calls: HashMap::new(),
+            pending_thought_signature: None,
         }
     }
 
@@ -166,7 +178,10 @@ impl InboundState {
             self.blocks
                 .push(AssistantContent::Thinking(ThinkingContent {
                     thinking: String::new(),
-                    signature: None,
+                    // Adopt a signature that arrived ahead of the block:
+                    // Gemini sends the ThoughtSignatureChunk before the
+                    // first ReasoningChunk of the part it certifies.
+                    signature: self.pending_thought_signature.take(),
                     provider_metadata: None,
                 }));
             let idx = self.blocks.len() - 1;
@@ -189,31 +204,92 @@ impl InboundState {
         out
     }
 
+    /// Anthropic-style signed thinking: silently update the thinking
+    /// signature (grain's natural slot, `ThinkingContent::signature`). No
+    /// separate grain event — subscribers see the updated signature on the
+    /// next partial. Mirrors upstream `pi-ai`:
+    /// - `packages/ai/src/api/anthropic-messages.ts` (`signature_delta`)
+    ///   appends to the open thinking block's signature;
+    /// - `packages/ai/src/api/google-shared.ts` documents that a Gemini
+    ///   signature can arrive on any part — including *after* the thinking
+    ///   content it certifies — and must be preserved for context replay,
+    ///   so an orphan signature attaches to the most recent thinking block,
+    ///   or is held pending until one opens (see
+    ///   [`Self::pending_thought_signature`]). No ordering panics.
     fn on_thought_signature(&mut self, content: String) -> Vec<AssistantMessageEvent> {
-        // Anthropic-style signed thinking: silently update the open thinking
-        // block's `signature` (grain's natural slot,
-        // `ThinkingContent::signature`). No separate grain event —
-        // subscribers see the updated signature on the next partial.
+        self.attach_thought_signature(content);
+        Vec::new()
+    }
+
+    fn attach_thought_signature(&mut self, content: String) {
+        // 1. Open thinking block: append (anthropic signature_delta shape).
         if let Some(OpenBlock::Thinking { index }) = self.open
             && let AssistantContent::Thinking(t) = &mut self.blocks[index]
         {
-            match &mut t.signature {
-                Some(existing) => existing.push_str(&content),
-                None => t.signature = Some(content),
-            }
+            append_signature(t, &content);
+            return;
         }
-        // TODO(WP3: thought-signature mapping): a signature chunk arriving
-        // with no thinking block open (e.g. a provider that emits the
-        // signature after the block closed, or before any reasoning text)
-        // is currently consumed without being attached anywhere. WP3
-        // decides where such orphan signatures land; until then this is a
-        // deliberate no-panic no-op rather than a silent `unreachable!`.
-        Vec::new()
+        // 2. A thinking block exists but is closed: the signature certifies
+        //    that reasoning (Gemini "signature on the last part" case) —
+        //    attach to the most recent thinking block.
+        if let Some(AssistantContent::Thinking(t)) = self
+            .blocks
+            .iter_mut()
+            .rev()
+            .find(|b| matches!(b, AssistantContent::Thinking(_)))
+        {
+            append_signature(t, &content);
+            return;
+        }
+        // 3. No thinking block yet: hold it. Seeded into the next thinking
+        //    block that opens, or flushed as a signature-only thinking block
+        //    at terminal (see `flush_pending_signature`).
+        match &mut self.pending_thought_signature {
+            Some(p) => p.push_str(&content),
+            None => self.pending_thought_signature = Some(content),
+        }
+    }
+
+    /// If a thought signature is still pending at terminal, preserve it:
+    /// attach to the last thinking block if one appeared, otherwise append a
+    /// signature-only thinking block so outbound replay
+    /// (`mapping::outbound`, which forwards `ThinkingContent::signature`
+    /// values as `thought_signatures` on the first outgoing tool call) can
+    /// round-trip it — dropping it would break Gemini/Anthropic multi-turn
+    /// signed-thinking flows.
+    fn flush_pending_signature(&mut self) {
+        let Some(sig) = self.pending_thought_signature.take() else {
+            return;
+        };
+        if let Some(AssistantContent::Thinking(t)) = self
+            .blocks
+            .iter_mut()
+            .rev()
+            .find(|b| matches!(b, AssistantContent::Thinking(_)))
+        {
+            append_signature(t, &sig);
+            return;
+        }
+        self.blocks
+            .push(AssistantContent::Thinking(ThinkingContent {
+                thinking: String::new(),
+                signature: Some(sig),
+                provider_metadata: None,
+            }));
     }
 
     fn on_tool_call(&mut self, tc: GenaiToolCall) -> Vec<AssistantMessageEvent> {
         let mut out = Vec::new();
         self.ensure_started(&mut out);
+
+        // Rare inbound path: a chunk-level ToolCall carrying thought
+        // signatures directly (genai's non-streaming Gemini shape). Route
+        // them through the same attachment logic as ThoughtSignatureChunk.
+        if let Some(sigs) = tc.thought_signatures.clone() {
+            for sig in sigs {
+                self.attach_thought_signature(sig);
+            }
+        }
 
         let raw = raw_tool_args(&tc.fn_arguments);
 
@@ -299,6 +375,7 @@ impl InboundState {
         if self.open.is_some() {
             self.close_open(&mut out);
         }
+        self.flush_pending_signature();
 
         let mut result = self.base.clone();
         result.content = std::mem::take(&mut self.blocks);
@@ -313,7 +390,13 @@ impl InboundState {
     }
 
     /// Consume self and emit a terminal aborted error event.
+    ///
+    /// `StreamFn` contract (mirroring upstream `pi-ai`'s error event, which
+    /// carries the partial `AssistantMessage` — see the catch handler in
+    /// `packages/ai/src/api/anthropic-messages.ts`): the terminal event
+    /// preserves all content accumulated so far.
     pub fn into_aborted(mut self) -> AssistantMessageEvent {
+        self.flush_pending_signature();
         let mut result = self.base.clone();
         result.content = std::mem::take(&mut self.blocks);
         result.stop_reason = StopReason::Aborted;
@@ -326,7 +409,11 @@ impl InboundState {
     }
 
     /// Consume self and emit a terminal error event with the given message.
+    ///
+    /// Like [`Self::into_aborted`], the terminal carries the partial
+    /// assistant message with all accumulated content (upstream parity).
     pub fn into_error_msg(mut self, msg: impl Into<String>) -> AssistantMessageEvent {
+        self.flush_pending_signature();
         let msg = msg.into();
         let mut result = self.base.clone();
         result.content = std::mem::take(&mut self.blocks);
@@ -355,6 +442,13 @@ impl InboundState {
                 content_index: index,
             }),
         }
+    }
+}
+
+fn append_signature(t: &mut ThinkingContent, content: &str) {
+    match &mut t.signature {
+        Some(existing) => existing.push_str(content),
+        None => t.signature = Some(content.to_string()),
     }
 }
 
