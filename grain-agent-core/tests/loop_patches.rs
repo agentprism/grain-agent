@@ -41,7 +41,11 @@ async fn malformed_tool_args_fail_validation_without_executing() {
         if n == 0 {
             // `value` must be a string; an object is not coercible.
             done_stream(create_assistant_message(
-                vec![tool_call("tool-1", "echo", json!({ "value": { "nested": true } }))],
+                vec![tool_call(
+                    "tool-1",
+                    "echo",
+                    json!({ "value": { "nested": true } }),
+                )],
                 StopReason::ToolUse,
             ))
         } else {

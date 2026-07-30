@@ -376,7 +376,10 @@ async fn handles_tool_calls_and_results() {
     );
     // TS: expect(observedToolUsage).toEqual(toolUsage) — the hook saw the
     // execute-returned usage (agent-loop.test.ts:365).
-    assert_eq!(observed_tool_usage.lock().unwrap().clone(), Some(tool_usage));
+    assert_eq!(
+        observed_tool_usage.lock().unwrap().clone(),
+        Some(tool_usage)
+    );
     // TS: the persisted toolResult message carries the patched usage
     // (agent-loop.test.ts:366-368).
     let tool_result = messages.iter().find_map(|m| match m {

@@ -32,9 +32,7 @@ pub struct ProviderResponse {
 /// Return `None` to keep the payload unchanged (the upstream `onPayload`
 /// "return undefined" contract, pi-ai `types.ts:143-147`).
 pub type OnPayloadFn = Arc<
-    dyn Fn(serde_json::Value, Model) -> BoxFuture<'static, Option<serde_json::Value>>
-        + Send
-        + Sync,
+    dyn Fn(serde_json::Value, Model) -> BoxFuture<'static, Option<serde_json::Value>> + Send + Sync,
 >;
 
 /// Callback invoked after an HTTP response is received and before its body

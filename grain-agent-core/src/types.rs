@@ -280,9 +280,7 @@ where
     let value = serde_json::Value::deserialize(deserializer)?;
     match value {
         serde_json::Value::String(text) => Ok(vec![UserContent::Text(TextContent { text })]),
-        serde_json::Value::Array(_) => {
-            serde_json::from_value(value).map_err(D::Error::custom)
-        }
+        serde_json::Value::Array(_) => serde_json::from_value(value).map_err(D::Error::custom),
         serde_json::Value::Null => Ok(Vec::new()),
         other => Err(D::Error::custom(format!(
             "invalid user message content: expected string, array, or null, got {other}"

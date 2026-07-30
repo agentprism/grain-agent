@@ -175,9 +175,8 @@ fn apply_schema_object_coercion(value: &mut Map<String, Value>, schema: &Value) 
     if let Some(additional) = schema.get("additionalProperties")
         && additional.is_object()
     {
-        let defined: std::collections::HashSet<&String> = properties
-            .map(|p| p.keys().collect())
-            .unwrap_or_default();
+        let defined: std::collections::HashSet<&String> =
+            properties.map(|p| p.keys().collect()).unwrap_or_default();
         let keys: Vec<String> = value
             .keys()
             .filter(|k| !defined.contains(k))
@@ -331,6 +330,22 @@ pub fn validate_tool_arguments(
             // check when the coerced value validates, else fall back to the
             // original arguments as-is (mirrored exactly, including the
             // skipped re-validation of the fallback).
+            //
+            // KNOWN DIVERGENCE (array-rooted schemas only): upstream's
+            // branch condition is `typeof args === "object"`, and in JS
+            // `typeof [] === "object"`, so an array root takes the merge
+            // branch above — the coercion is merged into `args` by
+            // reference and an invalid result reaches the final Check and
+            // throws. Here `Value::is_object()` is `false` for arrays, so
+            // an array root whose coercion changed but is still invalid
+            // takes this early return and passes the ORIGINAL args through
+            // unvalidated instead of erroring. This path is unreachable via
+            // LLM tool calls: `toolCall.arguments` is object-rooted in both
+            // implementations (`Record<string, any>` upstream, and every
+            // provider serializes tool arguments as a JSON object). Do not
+            // "fix" this by adding `is_array()` to the merge branch without
+            // also porting upstream's delete-keys/Object.assign in-place
+            // merge semantics and a covering vector.
             return Ok(if validator.is_valid(&coerced) {
                 coerced
             } else {

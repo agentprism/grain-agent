@@ -31,8 +31,8 @@ pub use agent_loop::{
     run_agent_loop, run_agent_loop_continue,
 };
 pub use stream::{
-    AssistantStream, LlmStream, OnPayloadFn, OnResponseFn, ProviderResponse, StreamError,
-    StreamFn, StreamOptions,
+    AssistantStream, LlmStream, OnPayloadFn, OnResponseFn, ProviderResponse, StreamError, StreamFn,
+    StreamOptions,
 };
 pub use types::{
     AgentContext, AgentEvent, AgentMessage, AgentState, AgentTool, AgentToolError, AgentToolResult,

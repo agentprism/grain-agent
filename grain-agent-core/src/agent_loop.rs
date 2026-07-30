@@ -71,8 +71,7 @@ pub type BeforeToolCallFn = Arc<
     dyn Fn(
             BeforeToolCallContext,
             CancellationToken,
-        )
-            -> BoxFuture<'static, Result<Option<BeforeToolCallResult>, AgentToolError>>
+        ) -> BoxFuture<'static, Result<Option<BeforeToolCallResult>, AgentToolError>>
         + Send
         + Sync,
 >;
@@ -110,8 +109,7 @@ pub type AfterToolCallFn = Arc<
     dyn Fn(
             AfterToolCallContext,
             CancellationToken,
-        )
-            -> BoxFuture<'static, Result<Option<AfterToolCallResult>, AgentToolError>>
+        ) -> BoxFuture<'static, Result<Option<AfterToolCallResult>, AgentToolError>>
         + Send
         + Sync,
 >;
