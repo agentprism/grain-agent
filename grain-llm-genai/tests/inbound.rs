@@ -682,3 +682,65 @@ fn chunk_before_explicit_start_synthesizes_start() {
         vec!["Start", "TextStart", "TextDelta", "TextEnd", "Done"]
     );
 }
+
+#[test]
+fn two_orphan_signatures_preserve_distinct_slots() {
+    // Gemini turn with signatures on both a text part and a functionCall
+    // part, thought summaries disabled: two distinct signatures arrive
+    // with no thinking block ever opening. Upstream forbids merging
+    // signatures across parts (google-shared.ts:29-31) — each must land
+    // in its own slot, in arrival order, never concatenated.
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        thought_sig("sig-a"),
+        chunk("visible text"),
+        thought_sig("sig-b"),
+        tool_call("call-1", "echo", serde_json::json!({ "v": 1 })),
+        end_normal(),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        let sigs: Vec<_> = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                AssistantContent::Thinking(t) => t.signature.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sigs, vec!["sig-a", "sig-b"], "one slot per signature");
+    } else {
+        panic!();
+    }
+}
+
+#[test]
+fn signature_on_signed_closed_block_preserved_distinctly() {
+    // A second signature landing after the last thinking block was already
+    // signed is a DISTINCT signature (another part's), not a fragment of
+    // the first — both must survive unmerged.
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        reasoning("deep thought"),
+        thought_sig("sig-a"), // attaches to the open thinking block
+        chunk("answer"),      // closes the thinking block
+        thought_sig("sig-b"), // last thinking block already signed
+        end_normal(),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        let sigs: Vec<_> = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                AssistantContent::Thinking(t) => t.signature.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sigs,
+            vec!["sig-a", "sig-b"],
+            "no concatenation onto the signed block"
+        );
+    } else {
+        panic!();
+    }
+}
