@@ -76,7 +76,17 @@ pub enum StopReason       { Stop, ToolUse, Length, Error, Aborted, Refused }
 pub enum ThinkingLevel    { Off, Minimal, Low, Medium, High, XHigh }     // Default = Off
 pub enum ToolExecutionMode { Sequential, Parallel }                       // Default = Parallel
 pub enum QueueMode        { All, OneAtATime }                             // Default = OneAtATime
+pub enum ErrorCode        { BudgetExhausted, AgentLimitExceeded, Other(String) }
 ```
+
+`ErrorCode` is the structured companion to `AssistantMessage::error_message`: a grain-side
+extension (like `StopReason::Refused` — no upstream counterpart) carried in
+`AssistantMessage::error_code: Option<ErrorCode>`. Producers (provider adapters, engine-bridging
+streams) attach it at the point of failure; the loop preserves it verbatim onto the final
+assistant message, so embedders classify failures by `match` instead of substring-matching
+`error_message` text. Wire form is a plain string (`"budget_exhausted"`,
+`"agent_limit_exceeded"`, or the `Other` string), omitted when `None` — serialized messages
+stay round-trippable against upstream transcript shapes.
 
 ## Tools
 

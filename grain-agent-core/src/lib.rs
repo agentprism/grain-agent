@@ -36,8 +36,8 @@ pub use stream::{
 };
 pub use types::{
     AgentContext, AgentEvent, AgentMessage, AgentState, AgentTool, AgentToolError, AgentToolResult,
-    AssistantContent, AssistantMessage, AssistantMessageEvent, Cost, ImageContent, LlmContext,
-    Message, Model, QueueMode, StopReason, TextContent, ThinkingBudgets, ThinkingContent,
-    ThinkingLevel, ToolCall, ToolDefinition, ToolExecutionMode, ToolResultMessage,
+    AssistantContent, AssistantMessage, AssistantMessageEvent, Cost, ErrorCode, ImageContent,
+    LlmContext, Message, Model, QueueMode, StopReason, TextContent, ThinkingBudgets,
+    ThinkingContent, ThinkingLevel, ToolCall, ToolDefinition, ToolExecutionMode, ToolResultMessage,
     ToolUpdateCallback, Usage, UserContent, UserMessage,
 };

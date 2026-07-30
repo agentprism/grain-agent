@@ -51,6 +51,7 @@ fn abort_responsive_stream() -> Arc<FnStream> {
             content: vec![text("Aborted")],
             stop_reason: StopReason::Aborted,
             error_message: None,
+            error_code: None,
             ..create_assistant_message(vec![], StopReason::Aborted)
         };
         async_stream::stream! {

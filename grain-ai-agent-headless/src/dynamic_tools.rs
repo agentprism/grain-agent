@@ -403,6 +403,7 @@ mod tests {
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
             error_message: None,
+            error_code: None,
             timestamp: 0,
         })];
         let decision = select_dynamic_tool_names(&tools, &prior, "continue");

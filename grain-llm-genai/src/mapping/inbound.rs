@@ -623,6 +623,7 @@ fn empty_assistant(model: &Model) -> AssistantMessage {
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
         error_message: None,
+        error_code: None,
         timestamp: now_ms(),
     }
 }

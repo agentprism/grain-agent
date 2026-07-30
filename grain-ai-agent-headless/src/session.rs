@@ -208,6 +208,7 @@ mod tests {
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
+            error_code: None,
             timestamp: 0,
         })
     }

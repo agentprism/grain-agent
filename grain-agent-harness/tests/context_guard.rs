@@ -28,6 +28,7 @@ fn assistant_text(text: &str) -> AgentMessage {
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
         error_message: None,
+        error_code: None,
         timestamp: 0,
     })
 }
@@ -112,6 +113,7 @@ fn estimator_assistant_thinking_counts_text_plus_signature() {
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
         error_message: None,
+        error_code: None,
         timestamp: 0,
     });
     assert_eq!(est.estimate_message(&m), 2);
@@ -132,6 +134,7 @@ fn estimator_tool_call_counts_name_plus_arguments() {
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
         error_message: None,
+        error_code: None,
         timestamp: 0,
     });
     assert_eq!(est.estimate_message(&m), 4);

@@ -34,6 +34,7 @@ fn assistant_text(text: &str) -> Message {
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
         error_message: None,
+        error_code: None,
         timestamp: 0,
     })
 }
@@ -128,6 +129,7 @@ fn assistant_with_tool_calls_emits_tool_call_part() {
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
         error_message: None,
+        error_code: None,
         timestamp: 0,
     });
     let chat = to_chat_request(&ctx(vec![msg], vec![], ""));
@@ -169,6 +171,7 @@ fn thinking_text_is_echoed_back_via_reasoning_content() {
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
         error_message: None,
+        error_code: None,
         timestamp: 0,
     });
     let chat = to_chat_request(&ctx(vec![msg], vec![], ""));
@@ -208,6 +211,7 @@ fn thinking_signature_attaches_to_first_tool_call() {
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
         error_message: None,
+        error_code: None,
         timestamp: 0,
     });
     let chat = to_chat_request(&ctx(vec![msg], vec![], ""));

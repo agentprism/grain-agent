@@ -584,6 +584,7 @@ mod tests {
             usage: Default::default(),
             stop_reason: StopReason::ToolUse,
             error_message: None,
+            error_code: None,
             timestamp: 0,
         }
     }

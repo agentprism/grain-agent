@@ -5917,6 +5917,7 @@ mod tests {
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
+            error_code: None,
             timestamp: 0,
         };
 
@@ -6889,6 +6890,7 @@ mod tests {
             usage: Default::default(),
             stop_reason: grain_agent_core::StopReason::Stop,
             error_message: None,
+            error_code: None,
             timestamp: 0,
         });
 
@@ -6936,6 +6938,7 @@ mod tests {
             usage: Default::default(),
             stop_reason: grain_agent_core::StopReason::Stop,
             error_message: None,
+            error_code: None,
             timestamp: 0,
         });
         let user2 = AgentMessage::user(grain_agent_core::UserMessage {
@@ -7254,6 +7257,7 @@ mod tests {
             usage: Default::default(),
             stop_reason: grain_agent_core::StopReason::Stop,
             error_message: None,
+            error_code: None,
             timestamp: 0,
         };
         s.on_event(TuiEvent::Agent(Box::new(AgentEvent::MessageUpdate {

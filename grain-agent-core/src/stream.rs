@@ -84,12 +84,37 @@ pub enum StreamError {
     Other(String),
     #[error("aborted")]
     Aborted,
+    /// A failure carrying a structured [`ErrorCode`] alongside its message.
+    /// The loop's degrade-gracefully path preserves the code onto the
+    /// synthesized error assistant message (`error_code`), so embedders can
+    /// classify the failure without parsing `error_message` text.
+    #[error("{message}")]
+    Coded {
+        code: crate::types::ErrorCode,
+        message: String,
+    },
 }
 
 impl StreamError {
     /// Convenience constructor wrapping a message into [`StreamError::Other`].
     pub fn msg(s: impl Into<String>) -> Self {
         StreamError::Other(s.into())
+    }
+
+    /// Convenience constructor for [`StreamError::Coded`].
+    pub fn coded(code: crate::types::ErrorCode, message: impl Into<String>) -> Self {
+        StreamError::Coded {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// The structured code, when this error carries one.
+    pub fn code(&self) -> Option<&crate::types::ErrorCode> {
+        match self {
+            StreamError::Coded { code, .. } => Some(code),
+            _ => None,
+        }
     }
 }
 

@@ -651,6 +651,9 @@ impl Agent {
                         StopReason::Error
                     },
                     error_message: Some(err.to_string()),
+                    // AgentLoopError carries no structured code (its variants
+                    // are continue-precondition failures).
+                    error_code: None,
                     timestamp: current_time_ms(),
                 };
                 let listeners_clone: Vec<EventListener> = g.listeners.values().cloned().collect();
