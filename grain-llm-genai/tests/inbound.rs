@@ -63,7 +63,14 @@ fn end_normal() -> ChatStreamEvent {
 fn run(
     events: impl IntoIterator<Item = ChatStreamEvent>,
 ) -> (Vec<AssistantMessageEvent>, InboundState) {
-    let mut state = InboundState::new(&model());
+    run_with_model(&model(), events)
+}
+
+fn run_with_model(
+    model: &Model,
+    events: impl IntoIterator<Item = ChatStreamEvent>,
+) -> (Vec<AssistantMessageEvent>, InboundState) {
+    let mut state = InboundState::new(model);
     let mut all = Vec::new();
     for ev in events {
         all.extend(state.on_event(ev));
@@ -742,5 +749,293 @@ fn signature_on_signed_closed_block_preserved_distinctly() {
         );
     } else {
         panic!();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WP5 — captured stop-reason resolution (adapter fix AB-1) and usage total
+// fallback (adapter fix AB-2). Seam-level coverage lives in
+// tests/seam_vectors.rs; these pin the state-machine mapping in isolation.
+// ---------------------------------------------------------------------------
+
+fn end_with_stop(reason: genai::chat::StopReason) -> ChatStreamEvent {
+    ChatStreamEvent::End(StreamEnd {
+        captured_stop_reason: Some(reason),
+        ..StreamEnd::default()
+    })
+}
+
+#[test]
+fn captured_completed_maps_to_stop() {
+    use genai::chat::StopReason as G;
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        chunk("hi"),
+        end_with_stop(G::Completed("stop".into())),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::Stop);
+        assert!(result.error_message.is_none());
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+fn google_model() -> Model {
+    Model {
+        id: "google/gemini-2.5-flash".into(),
+        name: "Gemini 2.5 Flash".into(),
+        api: "google-generative-ai".into(),
+        provider: "google".into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn gemini_completed_with_tool_calls_overrides_to_tool_use() {
+    // Upstream scopes the tool-call override to the google modules ONLY
+    // (google-generative-ai.ts:231-235, google-vertex.ts:231-235): Gemini
+    // reports STOP alongside functionCall parts, so toolUse is forced.
+    use genai::chat::StopReason as G;
+    let (events, _) = run_with_model(
+        &google_model(),
+        [
+            ChatStreamEvent::Start,
+            tool_call("call_1", "echo", serde_json::json!({"value": "ping"})),
+            end_with_stop(G::Completed("STOP".into())),
+        ],
+    );
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::ToolUse);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn gemini_wire_name_api_also_gets_the_override() {
+    // grain production populates Model::api from ApiKind::Gemini's wire
+    // name "gemini" (grain-llm-models descriptor), not upstream's
+    // "google-generative-ai" — both must scope into the override.
+    use genai::chat::StopReason as G;
+    let mut m = google_model();
+    m.api = "gemini".into();
+    let (events, _) = run_with_model(
+        &m,
+        [
+            ChatStreamEvent::Start,
+            tool_call("call_1", "echo", serde_json::json!({"value": "ping"})),
+            end_with_stop(G::Completed("STOP".into())),
+        ],
+    );
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::ToolUse);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn anthropic_end_turn_with_tool_calls_stays_stop() {
+    // anthropic-messages.ts mapStopReason: end_turn → stop, verbatim —
+    // upstream does NOT apply the google tool-call override outside the
+    // google modules, and neither do we (fidelity over generalization).
+    use genai::chat::StopReason as G;
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        tool_call("toolu_1", "echo", serde_json::json!({"value": "ping"})),
+        end_with_stop(G::Completed("end_turn".into())),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::Stop);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn captured_max_tokens_maps_to_length() {
+    use genai::chat::StopReason as G;
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        chunk("truncat"),
+        end_with_stop(G::MaxTokens("max_tokens".into())),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::Length);
+        assert!(result.error_message.is_none());
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn captured_content_filter_yields_error_terminal_with_upstream_phrasing() {
+    // Vector OV-2 (anthropic-family phrasing checked here; the openai
+    // family is exercised end-to-end in seam_vectors.rs).
+    use genai::chat::StopReason as G;
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        chunk("partial answer"),
+        end_with_stop(G::ContentFilter("SAFETY".into())),
+    ]);
+    match events.last().unwrap() {
+        AssistantMessageEvent::Error { error, result } => {
+            assert_eq!(error, "Provider stopped with: SAFETY");
+            assert_eq!(result.stop_reason, StopReason::Error);
+            assert_eq!(
+                result.error_message.as_deref(),
+                Some("Provider stopped with: SAFETY")
+            );
+            // Accumulated content is preserved on the error terminal
+            // (upstream's error event carries the partial message).
+            assert_eq!(result.content.len(), 1);
+        }
+        other => panic!("expected Error terminal, got {other:?}"),
+    }
+}
+
+#[test]
+fn captured_pause_turn_is_resubmittable_stop() {
+    // anthropic-messages.ts mapStopReason: pause_turn → stop,
+    // unconditionally — even with tool-call content streamed, upstream's
+    // table does not consult content. Pinned with a tool call present.
+    use genai::chat::StopReason as G;
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        tool_call("toolu_1", "echo", serde_json::json!({"value": "ping"})),
+        end_with_stop(G::Other("pause_turn".into())),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::Stop);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn captured_refusal_uses_upstream_default_message() {
+    // genai never parses stop_details (structural gap S-4), so only
+    // upstream's no-details default message is reachable.
+    use genai::chat::StopReason as G;
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        end_with_stop(G::Other("refusal".into())),
+    ]);
+    match events.last().unwrap() {
+        AssistantMessageEvent::Error { error, result } => {
+            assert_eq!(error, "The model refused to complete the request");
+            assert_eq!(result.stop_reason, StopReason::Error);
+        }
+        other => panic!("expected Error terminal, got {other:?}"),
+    }
+}
+
+#[test]
+fn missing_captured_stop_reason_keeps_inference() {
+    // Pre-WP5 behavior preserved: no captured stop reason → infer from
+    // content (tool calls → ToolUse, otherwise Stop).
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        tool_call("call_1", "echo", serde_json::json!({"value": "x"})),
+        end_normal(),
+    ]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.stop_reason, StopReason::ToolUse);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn usage_total_falls_back_to_components_when_wire_omits_it() {
+    // AB-2 (seam vectors OV-4/OV-5): genai's OpenAI streamer passes an
+    // absent total_tokens through as None; grain computes
+    // input + output + cache_write (grain's input is cache-inclusive).
+    let usage = genai::chat::Usage {
+        prompt_tokens: Some(1),
+        completion_tokens: Some(2),
+        total_tokens: None,
+        ..Default::default()
+    };
+    let end = ChatStreamEvent::End(StreamEnd {
+        captured_usage: Some(usage),
+        ..StreamEnd::default()
+    });
+    let (events, _) = run([ChatStreamEvent::Start, chunk("hi"), end]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.usage.total_tokens, 3);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn usage_provider_supplied_total_wins_over_fallback() {
+    let usage = genai::chat::Usage {
+        prompt_tokens: Some(10),
+        completion_tokens: Some(5),
+        total_tokens: Some(99),
+        ..Default::default()
+    };
+    let end = ChatStreamEvent::End(StreamEnd {
+        captured_usage: Some(usage),
+        ..StreamEnd::default()
+    });
+    let (events, _) = run([ChatStreamEvent::Start, chunk("hi"), end]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.usage.total_tokens, 99);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn usage_reasoning_tokens_map_into_grain_reasoning_field() {
+    // WP5 AB-R2, closed after the WP4 rebase gave grain's Usage a
+    // `reasoning` field: genai's completion_tokens_details.reasoning_tokens
+    // maps through as Option. genai's zero_as_none deserialization means a
+    // wire `reasoning_tokens: 0` arrives here as None — indistinguishable
+    // from an absent breakdown (documented in map_usage).
+    let usage = genai::chat::Usage {
+        prompt_tokens: Some(10),
+        completion_tokens: Some(50),
+        total_tokens: Some(60),
+        completion_tokens_details: Some(genai::chat::CompletionTokensDetails {
+            reasoning_tokens: Some(40),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let end = ChatStreamEvent::End(StreamEnd {
+        captured_usage: Some(usage),
+        ..StreamEnd::default()
+    });
+    let (events, _) = run([ChatStreamEvent::Start, chunk("hi"), end]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.usage.reasoning, Some(40));
+        assert_eq!(result.usage.output, 50, "reasoning is a subset of output");
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn usage_without_reasoning_breakdown_leaves_reasoning_none() {
+    let usage = genai::chat::Usage {
+        prompt_tokens: Some(10),
+        completion_tokens: Some(5),
+        total_tokens: Some(15),
+        ..Default::default()
+    };
+    let end = ChatStreamEvent::End(StreamEnd {
+        captured_usage: Some(usage),
+        ..StreamEnd::default()
+    });
+    let (events, _) = run([ChatStreamEvent::Start, chunk("hi"), end]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.usage.reasoning, None);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
     }
 }

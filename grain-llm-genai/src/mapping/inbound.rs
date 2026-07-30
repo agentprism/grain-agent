@@ -391,10 +391,30 @@ impl InboundState {
         if let Some(u) = end.captured_usage {
             result.usage = map_usage(u);
         }
-        result.stop_reason = infer_stop_reason(&result.content);
         result.timestamp = now_ms();
 
-        out.push(AssistantMessageEvent::Done { result });
+        // WP5 (adapter-bug AB-1, seam vectors OV-1/OV-2/GV-1/GV-2/AV-3):
+        // genai 0.6.5 delivers the provider's finish reason on
+        // `StreamEnd::captured_stop_reason` — with the raw provider string
+        // preserved inside each variant — and this adapter used to ignore
+        // it entirely, silently reporting `Stop` for content-filtered /
+        // refused / truncated turns. Resolve it the way upstream pi-ai
+        // does; error-class reasons terminate with an `Error` event (the
+        // upstream streams throw and emit `{type:"error"}`), carrying all
+        // accumulated content and usage.
+        let resolution = resolve_stop_reason(
+            end.captured_stop_reason.as_ref(),
+            &result.content,
+            &self.base.api,
+        );
+        result.stop_reason = resolution.stop_reason;
+        match resolution.error_message {
+            Some(msg) => {
+                result.error_message = Some(msg.clone());
+                out.push(AssistantMessageEvent::Error { error: msg, result });
+            }
+            None => out.push(AssistantMessageEvent::Done { result }),
+        }
         out
     }
 
@@ -469,6 +489,128 @@ fn infer_stop_reason(content: &[AssistantContent]) -> StopReason {
         StopReason::ToolUse
     } else {
         StopReason::Stop
+    }
+}
+
+/// Outcome of terminal stop-reason resolution: the grain stop reason plus,
+/// for error-class provider reasons, the error message that turns the
+/// terminal event into [`AssistantMessageEvent::Error`].
+struct StopResolution {
+    stop_reason: StopReason,
+    error_message: Option<String>,
+}
+
+impl StopResolution {
+    fn ok(stop_reason: StopReason) -> Self {
+        StopResolution {
+            stop_reason,
+            error_message: None,
+        }
+    }
+
+    fn error(message: String) -> Self {
+        StopResolution {
+            stop_reason: StopReason::Error,
+            error_message: Some(message),
+        }
+    }
+}
+
+/// Map genai's captured [`genai::chat::StopReason`] onto grain semantics,
+/// mirroring upstream pi-ai's per-provider `mapStopReason` tables
+/// (`packages/ai/src/api/anthropic-messages.ts`, `openai-completions.ts`,
+/// `google-shared.ts` at pin 34239180):
+///
+/// | genai variant           | grain outcome                                        |
+/// |-------------------------|------------------------------------------------------|
+/// | `Completed(_)`          | `Stop`; google APIs only: → `ToolUse` when tool calls streamed |
+/// | `StopSequence(_)`       | `Stop` (upstream: "should never happen", maps stop; same google-only override) |
+/// | `MaxTokens(_)`          | `Length`                                             |
+/// | `ToolCall(_)`           | `ToolUse`                                            |
+/// | `ContentFilter(raw)`    | `Error` + provider-stop message                      |
+/// | `Other("pause_turn")`   | `Stop`, unconditionally (anthropic: resubmittable pause) |
+/// | `Other("refusal")`      | `Error` + anthropic's no-details refusal message     |
+/// | `Other(raw)`            | `Error` + provider-stop message                      |
+/// | `None` (not captured)   | infer from content (pre-WP5 behavior)                |
+///
+/// The `Stop` → `ToolUse` content override is scoped to the google API
+/// family exactly as upstream scopes it: both google modules apply it
+/// after mapping the finish reason (`google-generative-ai.ts:231-235`,
+/// `google-vertex.ts:231-235` — Gemini reports `STOP` even when the chunk
+/// carried functionCall parts), while `anthropic-messages.ts` and
+/// `openai-completions.ts` trust the provider's reason verbatim —
+/// `end_turn` / `stop` / `stop_sequence` map to `stop` even if tool-call
+/// content streamed. We mirror upstream per provider rather than
+/// generalizing the override, since the adapter knows the API family from
+/// the model descriptor.
+///
+/// Error-message phrasing follows the upstream API family owning the
+/// vector: `openai-*` APIs phrase as `Provider finish_reason: <raw>`
+/// (`openai-completions.ts` `mapStopReason`), everything else as
+/// `Provider stopped with: <raw>` (`anthropic-messages.ts`,
+/// `google-generative-ai.ts`). The raw provider string is available here
+/// because genai preserves it inside every `StopReason` variant; grain's
+/// `AssistantMessage` has no `raw_stop_reason` slot to carry it further —
+/// that residual gap is reported as WP5 AB-R1, not silently dropped.
+fn resolve_stop_reason(
+    captured: Option<&genai::chat::StopReason>,
+    content: &[AssistantContent],
+    api: &str,
+) -> StopResolution {
+    use genai::chat::StopReason as GenaiStop;
+
+    let Some(captured) = captured else {
+        return StopResolution::ok(infer_stop_reason(content));
+    };
+
+    match captured {
+        GenaiStop::Completed(_) | GenaiStop::StopSequence(_) => {
+            // Gemini reports `STOP` alongside functionCall parts; upstream
+            // forces toolUse whenever tool calls are present — but ONLY in
+            // the two google modules. Anthropic/OpenAI map their completed
+            // reasons to `stop` verbatim, tool-call content or not.
+            if is_google_api(api) {
+                StopResolution::ok(infer_stop_reason(content))
+            } else {
+                StopResolution::ok(StopReason::Stop)
+            }
+        }
+        GenaiStop::MaxTokens(_) => StopResolution::ok(StopReason::Length),
+        GenaiStop::ToolCall(_) => StopResolution::ok(StopReason::ToolUse),
+        GenaiStop::ContentFilter(raw) => StopResolution::error(provider_stop_message(api, raw)),
+        GenaiStop::Other(raw) => match raw.as_str() {
+            // anthropic-messages.ts: pause_turn → "stop is good enough,
+            // resubmit". Hard-mapped to Stop, no content inference —
+            // upstream's table is unconditional.
+            "pause_turn" => StopResolution::ok(StopReason::Stop),
+            // anthropic-messages.ts: refusal → stopDetails.explanation ||
+            // default message. genai never parses `stop_details`
+            // (structural gap S-4), so only the default is reachable.
+            "refusal" => {
+                StopResolution::error("The model refused to complete the request".to_string())
+            }
+            _ => StopResolution::error(provider_stop_message(api, raw)),
+        },
+    }
+}
+
+/// The google/Gemini API family — the only modules where upstream applies
+/// the tool-call `ToolUse` override after finish-reason mapping
+/// (`google-generative-ai.ts`, `google-vertex.ts`). Matches both upstream's
+/// api ids (`google-generative-ai`, `google-vertex`, `google`) and grain's
+/// production wire name (`grain_llm_models::ApiKind::Gemini` →
+/// `Model::api == "gemini"`).
+fn is_google_api(api: &str) -> bool {
+    api.starts_with("google") || api == "gemini"
+}
+
+/// Upstream-parity phrasing for error-class provider stop reasons. See
+/// [`resolve_stop_reason`] for the per-API-family sources.
+fn provider_stop_message(api: &str, raw: &str) -> String {
+    if api.starts_with("openai") {
+        format!("Provider finish_reason: {raw}")
+    } else {
+        format!("Provider stopped with: {raw}")
     }
 }
 
