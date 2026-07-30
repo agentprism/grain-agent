@@ -51,9 +51,11 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use grain_agent_core::{
-    AfterToolCallFn, Agent, AgentError, AgentEvent, AgentMessage, AgentOptions, AgentTool,
-    AssistantMessage, AssistantMessageEvent, BeforeToolCallFn, ConvertToLlmFn, GetApiKeyFn, Model,
-    PrepareNextTurnFn, QueueMode, StreamFn, ThinkingLevel, ToolExecutionMode, TransformContextFn,
+    AfterToolCallFn, Agent, AgentError, AgentEvent, AgentLoopTurnUpdate, AgentMessage,
+    AgentOptions, AgentTool, AssistantMessage, AssistantMessageEvent, BeforeToolCallFn,
+    ConvertToLlmFn, GetApiKeyFn, Model, OnPayloadFn, OnResponseFn, PrepareNextTurnContext,
+    PrepareNextTurnFn, QueueMode, StreamFn, ThinkingBudgets, ThinkingLevel, ToolExecutionMode,
+    TransformContextFn,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -95,6 +97,23 @@ pub struct AgentHarnessOptions {
     pub session_id: Option<String>,
     pub transport: Option<String>,
     pub max_retry_delay_ms: Option<u64>,
+    /// Inspect or replace the provider payload before it is sent. Forwarded
+    /// verbatim to [`AgentOptions::on_payload`].
+    ///
+    /// This is the narrow form of upstream's `before_provider_payload` hook
+    /// (`agent-harness.ts:303-318` @ 34239180): one callback rather than a
+    /// chain of subscribers. Whether the shipped provider adapter honors it
+    /// is an adapter question — `grain-llm-genai` currently does not.
+    pub on_payload: Option<OnPayloadFn>,
+    /// Called once an HTTP response is received, before its body is consumed.
+    /// Forwarded to [`AgentOptions::on_response`]. Narrow form of upstream's
+    /// `after_provider_response` event (`agent-harness.ts:414-420`).
+    pub on_response: Option<OnResponseFn>,
+    /// Per-level thinking token budgets, forwarded to
+    /// [`AgentOptions::thinking_budgets`]. Upstream exposes this on `Agent`
+    /// but not on its harness; grain surfaces it here so a harness-only
+    /// embedder is not forced down to the bare `Agent`.
+    pub thinking_budgets: Option<ThinkingBudgets>,
     /// Optional Agent hook: gate a tool call before it executes
     /// (storm suppression, schema repair, …). Passed through verbatim
     /// to [`AgentOptions::before_tool_call`].
@@ -136,6 +155,9 @@ impl AgentHarnessOptions {
             session_id: None,
             transport: None,
             max_retry_delay_ms: None,
+            on_payload: None,
+            on_response: None,
+            thinking_budgets: None,
             before_tool_call: None,
             after_tool_call: None,
             prepare_next_turn: None,
@@ -506,6 +528,16 @@ struct HarnessInner {
     /// Live skills + prompt templates. Replaced atomically via
     /// `set_resources`; `prompt_from_template` looks up here.
     resources: Resources,
+    /// How the system prompt is produced. Kept (not just its rendered
+    /// output) so a [`SystemPrompt::Dynamic`] closure can be re-run each
+    /// turn, as upstream's `createTurnState` does.
+    system_prompt: SystemPrompt,
+    /// Mirror of the agent's current model / thinking level, maintained by
+    /// the setters. The dynamic-prompt closure needs both, and reading them
+    /// from here avoids a circular dependency on the `Agent` the closure is
+    /// installed into.
+    model: Model,
+    thinking_level: ThinkingLevel,
 }
 
 /// What an [`AgentHarness::abort`] discarded.
@@ -548,6 +580,9 @@ impl AgentHarness {
             session_id,
             transport,
             max_retry_delay_ms,
+            on_payload,
+            on_response,
+            thinking_budgets,
             before_tool_call,
             after_tool_call,
             prepare_next_turn,
@@ -556,14 +591,6 @@ impl AgentHarness {
 
         // Seed the agent with the session's current branch context.
         let seeded_messages = session.build_context().await.messages;
-        let resolved_system_prompt = match &system_prompt {
-            SystemPrompt::Static(s) => s.clone(),
-            // Phase 1: Dynamic prompts collapse to empty until Phase 2
-            // wires set_model / set_thinking_level which would
-            // trigger a re-render. Callers needing dynamic prompts
-            // today should use Static.
-            SystemPrompt::Dynamic(_) => String::new(),
-        };
 
         // Normalize active-tool selection and derive the initial
         // filtered subset that goes into the Agent.
@@ -572,6 +599,26 @@ impl AgentHarness {
         let filtered_tools = filter_tools(&tools, active_set.as_ref());
 
         let stream_fn_for_compact = stream_fn.clone();
+
+        // `inner` is built before the Agent so the dynamic-prompt closure can
+        // read live model / thinking / tools / resources without needing a
+        // handle on the Agent it is installed into.
+        let inner = Arc::new(Mutex::new(HarnessInner {
+            listeners: BTreeMap::new(),
+            next_listener_id: 0,
+            running: false,
+            pending_session_writes: Vec::new(),
+            all_tools: tools,
+            active_tool_names: active_set,
+            stream_fn: stream_fn_for_compact,
+            resources,
+            system_prompt,
+            model: model.clone(),
+            thinking_level,
+        }));
+
+        let resolved_system_prompt = render_system_prompt(&inner).await;
+
         let mut agent_opts = AgentOptions::new(model, stream_fn);
         agent_opts.system_prompt = resolved_system_prompt;
         agent_opts.thinking_level = thinking_level;
@@ -592,6 +639,9 @@ impl AgentHarness {
         agent_opts.session_id = session_id;
         agent_opts.transport = transport;
         agent_opts.max_retry_delay_ms = max_retry_delay_ms;
+        agent_opts.on_payload = on_payload;
+        agent_opts.on_response = on_response;
+        agent_opts.thinking_budgets = thinking_budgets;
         agent_opts.tool_execution = tool_execution;
         // Provider-agnostic hooks (Phase 3.0): pass through verbatim
         // to the underlying Agent. Lets callers wire storm
@@ -600,20 +650,43 @@ impl AgentHarness {
         // AgentHarness's other features.
         agent_opts.before_tool_call = before_tool_call;
         agent_opts.after_tool_call = after_tool_call;
-        agent_opts.prepare_next_turn = prepare_next_turn;
+        // Re-render the system prompt between turns. Upstream rebuilds the
+        // whole turn state in `prepareNextTurn` and hands the loop a fresh
+        // context (`agent-harness.ts:485-494` @ 34239180); grain overlays the
+        // freshly rendered prompt onto whatever context the turn is carrying,
+        // after any caller-supplied hook has had its say.
+        let inner_for_prompt = inner.clone();
+        agent_opts.prepare_next_turn =
+            Some(Arc::new(move |ctx: PrepareNextTurnContext, cancel| {
+                let inner = inner_for_prompt.clone();
+                let caller = prepare_next_turn.clone();
+                Box::pin(async move {
+                    let mut update = match &caller {
+                        Some(hook) => hook(ctx.clone(), cancel).await.unwrap_or_default(),
+                        None => AgentLoopTurnUpdate::default(),
+                    };
+                    // A caller hook that swapped model / thinking level must be
+                    // visible to the prompt closure that runs next.
+                    {
+                        let mut g = inner.lock().await;
+                        if let Some(m) = &update.model {
+                            g.model = m.clone();
+                        }
+                        if let Some(t) = update.thinking_level {
+                            g.thinking_level = t;
+                        }
+                    }
+                    let rendered = render_system_prompt(&inner).await;
+                    let mut context = update.context.unwrap_or_else(|| (*ctx.context).clone());
+                    if context.system_prompt != rendered {
+                        context.system_prompt = rendered;
+                    }
+                    update.context = Some(context);
+                    Some(update)
+                })
+            }));
 
         let agent = Arc::new(Agent::new(agent_opts));
-
-        let inner = Arc::new(Mutex::new(HarnessInner {
-            listeners: BTreeMap::new(),
-            next_listener_id: 0,
-            running: false,
-            pending_session_writes: Vec::new(),
-            all_tools: tools,
-            active_tool_names: active_set,
-            stream_fn: stream_fn_for_compact,
-            resources,
-        }));
 
         // Install internal session-mirror listener: every finalized
         // message lands back in the session. Mirrors what
@@ -760,6 +833,8 @@ impl AgentHarness {
     /// emits [`AgentHarnessEvent::ModelSelect`].
     pub async fn set_model(&self, model: Model) {
         self.agent.set_model(model.clone()).await;
+        self.inner.lock().await.model = model.clone();
+        self.refresh_system_prompt().await;
         self.record_session_write(PendingSessionWrite::Model {
             provider: model.provider.clone(),
             model_id: model.id.clone(),
@@ -777,6 +852,8 @@ impl AgentHarness {
     /// and emits [`AgentHarnessEvent::ThinkingLevelSelect`].
     pub async fn set_thinking_level(&self, level: ThinkingLevel) {
         self.agent.set_thinking_level(level).await;
+        self.inner.lock().await.thinking_level = level;
+        self.refresh_system_prompt().await;
         self.record_session_write(PendingSessionWrite::ThinkingLevel {
             thinking_level: thinking_level_tag(level).to_string(),
         })
@@ -801,6 +878,25 @@ impl AgentHarness {
             }
         }
         flush_one_session_write(&self.inner, &self.session, write).await;
+    }
+
+    /// Re-render a [`SystemPrompt::Dynamic`] prompt and push it onto the
+    /// agent immediately.
+    ///
+    /// Reconfiguration is the other half of upstream's re-render trigger: a
+    /// `Dynamic` prompt that mentions the model or the active tool set must
+    /// not keep describing the previous ones. A `Static` prompt is untouched,
+    /// so this never clobbers a caller's `set_system_prompt`.
+    async fn refresh_system_prompt(&self) {
+        let is_dynamic = matches!(
+            self.inner.lock().await.system_prompt,
+            SystemPrompt::Dynamic(_)
+        );
+        if !is_dynamic {
+            return;
+        }
+        let rendered = render_system_prompt(&self.inner).await;
+        self.agent.set_system_prompt(rendered).await;
     }
 
     /// Mark a run as started so subsequent state changes batch rather than
@@ -835,6 +931,7 @@ impl AgentHarness {
             new_names = names.to_vec();
         }
         self.agent.set_tools(new_filtered).await;
+        self.refresh_system_prompt().await;
         self.record_session_write(PendingSessionWrite::ActiveTools {
             active_tool_names: new_names.clone(),
         })
@@ -1116,6 +1213,36 @@ async fn broadcast(
     for l in listeners {
         l(event.clone(), signal.clone()).await;
     }
+}
+
+/// Render the current system prompt.
+///
+/// [`SystemPrompt::Static`] returns its string; [`SystemPrompt::Dynamic`]
+/// re-runs the closure against live model / thinking level / active tools /
+/// resources — upstream's `createTurnState` behavior
+/// (`agent-harness.ts:354-387` @ 34239180).
+///
+/// The closure borrows out of the guard, but the future it returns is
+/// `'static`, so the lock is released before awaiting: a prompt closure that
+/// itself calls back into the harness cannot deadlock.
+async fn render_system_prompt(inner: &Arc<Mutex<HarnessInner>>) -> String {
+    let fut = {
+        let g = inner.lock().await;
+        match &g.system_prompt {
+            SystemPrompt::Static(s) => return s.clone(),
+            SystemPrompt::Dynamic(render) => {
+                let active = filter_tools(&g.all_tools, g.active_tool_names.as_ref());
+                let ctx = SystemPromptCtx {
+                    model: &g.model,
+                    thinking_level: g.thinking_level,
+                    active_tools: &active,
+                    resources: &g.resources,
+                };
+                render(&ctx)
+            }
+        }
+    };
+    fut.await
 }
 
 /// Serialize a [`ThinkingLevel`] to the session's wire tag.
