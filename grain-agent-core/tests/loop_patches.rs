@@ -139,7 +139,7 @@ async fn coerced_tool_args_are_passed_to_hooks_and_execute() {
         let hook_args = hook_capture.clone();
         Box::pin(async move {
             *hook_args.lock().unwrap() = Some(ctx.args.clone());
-            None
+            Ok(None)
         })
     }));
 
@@ -176,6 +176,158 @@ async fn coerced_tool_args_are_passed_to_hooks_and_execute() {
     let expected = json!({ "count": 42, "flag": true, "note": "7" });
     assert_eq!(*executed_args.lock().unwrap(), vec![expected.clone()]);
     assert_eq!(hook_args.lock().unwrap().clone(), Some(expected));
+}
+
+// ---------------------------------------------------------------------------
+// patch-2: fallible before/afterToolCall hooks
+// (upstream: prepareToolCall try/catch agent-loop.ts:616-663;
+//  finalizeExecutedToolCall try/catch agent-loop.ts:720-747)
+// ---------------------------------------------------------------------------
+
+/// A `beforeToolCall` error is contained as an `isError` tool result for
+/// that call: the tool never executes and the loop continues.
+#[tokio::test]
+async fn before_tool_call_error_is_contained_as_error_result() {
+    let executed: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let context = AgentContext {
+        system_prompt: "".into(),
+        messages: vec![],
+        tools: vec![echo_tool(executed.clone())],
+    };
+
+    let mut config = AgentLoopConfig::new(create_model(), identity_converter());
+    config.before_tool_call = Some(Arc::new(|_ctx, _cancel| {
+        Box::pin(async move { Err(AgentToolError::msg("before hook exploded")) })
+    }));
+
+    let stream = FnStream::new(|n, _model, _ctx, _opts, _cancel| {
+        if n == 0 {
+            done_stream(create_assistant_message(
+                vec![tool_call("tool-1", "echo", json!({ "value": "hello" }))],
+                StopReason::ToolUse,
+            ))
+        } else {
+            done_stream(create_assistant_message(
+                vec![text("done")],
+                StopReason::Stop,
+            ))
+        }
+    });
+
+    let (sink, events) = recording_sink();
+    run_agent_loop(
+        vec![create_user_message("echo something")],
+        context,
+        config,
+        sink,
+        CancellationToken::new(),
+        stream.clone(),
+    )
+    .await
+    .expect("loop must not abort on a hook error");
+
+    // The tool never executed.
+    assert!(executed.lock().unwrap().is_empty());
+
+    let events = events.lock().unwrap();
+    let tool_end = events
+        .iter()
+        .find(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+        .expect("expected tool_execution_end");
+    if let AgentEvent::ToolExecutionEnd {
+        is_error, result, ..
+    } = tool_end
+    {
+        assert!(*is_error);
+        assert_eq!(
+            content_text(&result.content).as_deref(),
+            Some("before hook exploded")
+        );
+    }
+
+    // The loop continued past the contained failure.
+    assert_eq!(stream.calls(), 2);
+}
+
+/// An `afterToolCall` error replaces the executed result with an error tool
+/// result (isError=true) instead of panicking or aborting the run.
+#[tokio::test]
+async fn after_tool_call_error_replaces_result_with_error() {
+    let executed: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let context = AgentContext {
+        system_prompt: "".into(),
+        messages: vec![],
+        tools: vec![echo_tool(executed.clone())],
+    };
+
+    let mut config = AgentLoopConfig::new(create_model(), identity_converter());
+    config.after_tool_call = Some(Arc::new(|_ctx, _cancel| {
+        Box::pin(async move { Err(AgentToolError::msg("after hook exploded")) })
+    }));
+
+    let stream = FnStream::new(|n, _model, _ctx, _opts, _cancel| {
+        if n == 0 {
+            done_stream(create_assistant_message(
+                vec![tool_call("tool-1", "echo", json!({ "value": "hello" }))],
+                StopReason::ToolUse,
+            ))
+        } else {
+            done_stream(create_assistant_message(
+                vec![text("done")],
+                StopReason::Stop,
+            ))
+        }
+    });
+
+    let (sink, events) = recording_sink();
+    let messages = run_agent_loop(
+        vec![create_user_message("echo something")],
+        context,
+        config,
+        sink,
+        CancellationToken::new(),
+        stream.clone(),
+    )
+    .await
+    .expect("loop must not abort on a hook error");
+
+    // The tool DID execute; the hook error replaced its result.
+    assert_eq!(*executed.lock().unwrap(), vec!["hello".to_string()]);
+
+    let events = events.lock().unwrap();
+    let tool_end = events
+        .iter()
+        .find(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+        .expect("expected tool_execution_end");
+    if let AgentEvent::ToolExecutionEnd {
+        is_error, result, ..
+    } = tool_end
+    {
+        assert!(*is_error);
+        // createErrorToolResult replaces content and details wholesale
+        // (agent-loop.ts:744, 756-761).
+        assert_eq!(
+            content_text(&result.content).as_deref(),
+            Some("after hook exploded")
+        );
+        assert_eq!(result.details, json!({}));
+    }
+
+    // The error result is persisted as the toolResult message.
+    let tool_result = messages.iter().find_map(|m| match m {
+        grain_agent_core::AgentMessage::Standard(grain_agent_core::Message::ToolResult(tr)) => {
+            Some(tr.clone())
+        }
+        _ => None,
+    });
+    let tool_result = tool_result.expect("expected a toolResult message");
+    assert!(tool_result.is_error);
+    assert_eq!(
+        content_text(&tool_result.content).as_deref(),
+        Some("after hook exploded")
+    );
+
+    assert_eq!(stream.calls(), 2);
 }
 
 /// A tool-declared `prepare_arguments` runs before validation, and its output

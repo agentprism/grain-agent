@@ -143,13 +143,13 @@ pub fn before_tool_call_hook(registry: Arc<HookRegistry>) -> Option<BeforeToolCa
                         .clone()
                         .unwrap_or_else(|| format!("blocked by hook '{}'", rule.name));
                     registry.trace(rule, reason.clone());
-                    return Some(BeforeToolCallResult {
+                    return Ok(Some(BeforeToolCallResult {
                         block: true,
                         reason: Some(reason),
-                    });
+                    }));
                 }
             }
-            None
+            Ok(None)
         })
     }))
 }
@@ -226,9 +226,9 @@ pub fn after_tool_call_hook(registry: Arc<HookRegistry>) -> Option<AfterToolCall
                 || out.is_error.is_some()
                 || out.terminate.is_some()
             {
-                Some(out)
+                Ok(Some(out))
             } else {
-                None
+                Ok(None)
             }
         })
     }))
@@ -466,10 +466,12 @@ pub fn chain_before_hooks(
             let a = a.clone();
             let b = b.clone();
             Box::pin(async move {
-                if let Some(result) = a(ctx.clone(), cancel.clone()).await
+                // A hook error short-circuits the chain; the loop contains it
+                // as an isError tool result (patch-2 semantics).
+                if let Some(result) = a(ctx.clone(), cancel.clone()).await?
                     && result.block
                 {
-                    return Some(result);
+                    return Ok(Some(result));
                 }
                 b(ctx, cancel).await
             })
@@ -488,7 +490,9 @@ pub fn chain_after_hooks(
             let a = a.clone();
             let b = b.clone();
             Box::pin(async move {
-                let first = a(ctx.clone(), cancel.clone()).await;
+                // A hook error short-circuits the chain; the loop contains it
+                // as an isError tool result (patch-2 semantics).
+                let first = a(ctx.clone(), cancel.clone()).await?;
                 let mut next_ctx = ctx;
                 if let Some(result) = &first {
                     if let Some(content) = &result.content {
@@ -504,8 +508,8 @@ pub fn chain_after_hooks(
                         next_ctx.is_error = is_error;
                     }
                 }
-                let second = b(next_ctx, cancel).await;
-                merge_after_results(first, second)
+                let second = b(next_ctx, cancel).await?;
+                Ok(merge_after_results(first, second))
             })
         })),
     }
@@ -605,6 +609,7 @@ mod tests {
             CancellationToken::new(),
         )
         .await
+        .expect("hook must not error")
         .unwrap();
         assert!(got.block);
         assert_eq!(got.reason.as_deref(), Some("dangerous"));
@@ -642,6 +647,7 @@ mod tests {
             CancellationToken::new(),
         )
         .await
+        .expect("hook must not error")
         .unwrap();
         let text = tool_result_text(&got.content.unwrap());
         assert!(text.starts_with("abcd"));

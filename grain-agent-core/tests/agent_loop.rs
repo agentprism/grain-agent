@@ -253,7 +253,7 @@ async fn handles_tool_calls_and_results() {
         let observed = observed_capture.clone();
         Box::pin(async move {
             *observed.lock().unwrap() = content_text(&ctx.result.content);
-            None
+            Ok(None)
         })
     }));
 
@@ -426,7 +426,7 @@ async fn executes_mutated_before_tool_call_args_without_revalidation() {
             let mut args = ctx.args.clone();
             args["value"] = json!(123);
             let _ = args;
-            None
+            Ok(None)
         })
     }));
 
@@ -1397,10 +1397,10 @@ async fn after_tool_call_can_mark_batch_terminating() {
     let mut config = AgentLoopConfig::new(create_model(), identity_converter());
     config.after_tool_call = Some(Arc::new(|_ctx, _cancel| {
         Box::pin(async move {
-            Some(grain_agent_core::AfterToolCallResult {
+            Ok(Some(grain_agent_core::AfterToolCallResult {
                 terminate: Some(true),
                 ..Default::default()
-            })
+            }))
         })
     }));
 

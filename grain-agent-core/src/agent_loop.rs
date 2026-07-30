@@ -52,11 +52,17 @@ pub struct BeforeToolCallResult {
     pub reason: Option<String>,
 }
 
+/// Pre-tool-execution hook.
+///
+/// Fallible, mirroring the upstream contract: a hook error is contained as
+/// an `isError` tool result for that call (prepareToolCall's try/catch,
+/// agent-loop.ts:616-663) — it never aborts the loop.
 pub type BeforeToolCallFn = Arc<
     dyn Fn(
             BeforeToolCallContext,
             CancellationToken,
-        ) -> BoxFuture<'static, Option<BeforeToolCallResult>>
+        )
+            -> BoxFuture<'static, Result<Option<BeforeToolCallResult>, AgentToolError>>
         + Send
         + Sync,
 >;
@@ -79,11 +85,17 @@ pub struct AfterToolCallResult {
     pub terminate: Option<bool>,
 }
 
+/// Post-tool-execution hook.
+///
+/// Fallible, mirroring the upstream contract: a hook error replaces the
+/// executed result with an `isError` tool result (finalizeExecutedToolCall's
+/// try/catch, agent-loop.ts:720-747) — it never aborts the loop.
 pub type AfterToolCallFn = Arc<
     dyn Fn(
             AfterToolCallContext,
             CancellationToken,
-        ) -> BoxFuture<'static, Option<AfterToolCallResult>>
+        )
+            -> BoxFuture<'static, Result<Option<AfterToolCallResult>, AgentToolError>>
         + Send
         + Sync,
 >;
@@ -998,7 +1010,15 @@ async fn prepare_tool_call(
             args: validated_args.clone(),
             context: ctx_snapshot,
         };
-        let outcome = hook(before_ctx, cancel.clone()).await;
+        // agent-loop.ts:657-663 — a throwing beforeToolCall is contained as
+        // an immediate error tool result (the in-try abort check never runs
+        // on the throw path).
+        let outcome = match hook(before_ctx, cancel.clone()).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                return Preparation::Immediate(AgentToolResult::error(e.to_string()), true);
+            }
+        };
         if cancel.is_cancelled() {
             return Preparation::Immediate(AgentToolResult::error("Operation aborted"), true);
         }
@@ -1126,19 +1146,27 @@ async fn finalize_executed_owned(
             is_error,
             context,
         };
-        let outcome = hook(after_ctx, cancel.clone()).await;
-        if let Some(after) = outcome {
-            if let Some(content) = after.content {
-                result.content = content;
+        match hook(after_ctx, cancel.clone()).await {
+            Ok(Some(after)) => {
+                if let Some(content) = after.content {
+                    result.content = content;
+                }
+                if let Some(details) = after.details {
+                    result.details = details;
+                }
+                if let Some(t) = after.terminate {
+                    result.terminate = Some(t);
+                }
+                if let Some(err_flag) = after.is_error {
+                    is_error = err_flag;
+                }
             }
-            if let Some(details) = after.details {
-                result.details = details;
-            }
-            if let Some(t) = after.terminate {
-                result.terminate = Some(t);
-            }
-            if let Some(err_flag) = after.is_error {
-                is_error = err_flag;
+            Ok(None) => {}
+            Err(e) => {
+                // agent-loop.ts:743-746 — a throwing afterToolCall replaces
+                // the executed result with an error tool result.
+                result = AgentToolResult::error(e.to_string());
+                is_error = true;
             }
         }
     }

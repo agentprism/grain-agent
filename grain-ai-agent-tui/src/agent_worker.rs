@@ -2011,10 +2011,10 @@ fn rhai_before_tool_call_hook(
                                 "(hook '{label}' denied {}: {reason})",
                                 payload["tool"].as_str().unwrap_or("tool")
                             )));
-                            return Some(BeforeToolCallResult {
+                            return Ok(Some(BeforeToolCallResult {
                                 block: true,
                                 reason: Some(reason),
-                            });
+                            }));
                         }
                     }
                     Ok(Err(e)) => {
@@ -2029,7 +2029,7 @@ fn rhai_before_tool_call_hook(
                     }
                 }
             }
-            None
+            Ok(None)
         })
     }))
 }
@@ -2099,9 +2099,9 @@ fn rhai_after_tool_call_hook(
                 || out.is_error.is_some()
                 || out.terminate.is_some()
             {
-                Some(out)
+                Ok(Some(out))
             } else {
-                None
+                Ok(None)
             }
         })
     }))
