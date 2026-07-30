@@ -40,6 +40,22 @@ fn tool_call(id: &str, name: &str, args: serde_json::Value) -> ChatStreamEvent {
     })
 }
 
+/// A cumulative-arguments chunk as the OpenAI / Anthropic genai adapters
+/// deliver it: `fn_arguments` is a `Value::String` holding the latest
+/// accumulated (possibly partial) JSON.
+fn tool_call_cumulative(id: &str, name: &str, accumulated: &str) -> ChatStreamEvent {
+    tool_call(id, name, serde_json::json!(accumulated))
+}
+
+fn delta_of(e: &AssistantMessageEvent) -> Option<&str> {
+    match e {
+        AssistantMessageEvent::TextDelta { delta, .. }
+        | AssistantMessageEvent::ThinkingDelta { delta, .. }
+        | AssistantMessageEvent::ToolcallDelta { delta, .. } => Some(delta),
+        _ => None,
+    }
+}
+
 fn end_normal() -> ChatStreamEvent {
     ChatStreamEvent::End(StreamEnd::default())
 }
@@ -179,7 +195,11 @@ fn thought_signature_absorbs_silently_into_thinking_block() {
 }
 
 #[test]
-fn tool_call_closes_open_text_and_emits_pair() {
+fn tool_call_closes_open_text_and_emits_start_delta_end() {
+    // Gemini-style complete call in one chunk: Start, the full argument
+    // JSON as one delta, then End when the stream terminates (mirrors
+    // upstream pi-ai google-generative-ai.ts: start → delta(full JSON) →
+    // end).
     let (events, _) = run([
         ChatStreamEvent::Start,
         chunk("calling tool now"),
@@ -195,18 +215,185 @@ fn tool_call_closes_open_text_and_emits_pair() {
             "TextDelta",
             "TextEnd",
             "ToolcallStart",
+            "ToolcallDelta",
             "ToolcallEnd",
             "Done"
         ]
     );
+    let deltas: Vec<_> = events.iter().filter_map(delta_of).collect();
+    assert_eq!(deltas, vec!["calling tool now", r#"{"v":1}"#]);
     if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
         assert_eq!(result.content.len(), 2);
-        assert!(matches!(result.content[1], AssistantContent::ToolCall(_)));
+        match &result.content[1] {
+            AssistantContent::ToolCall(tc) => {
+                assert_eq!(tc.id, "call-1");
+                assert_eq!(tc.arguments, serde_json::json!({ "v": 1 }));
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
         assert_eq!(
             result.stop_reason,
             StopReason::ToolUse,
             "inferred from tool call presence"
         );
+    } else {
+        panic!();
+    }
+}
+
+#[test]
+fn cumulative_tool_chunks_emit_suffix_deltas() {
+    // OpenAI / Anthropic style: chunks for the same call_id repeat with
+    // cumulatively growing argument strings. Expect Start on first
+    // appearance, one delta per growth step carrying exactly the new
+    // suffix, and End with the final assembled call.
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        tool_call_cumulative("call-1", "get_weather", ""),
+        tool_call_cumulative("call-1", "get_weather", r#"{"city":"#),
+        tool_call_cumulative("call-1", "get_weather", r#"{"city":"Paris"}"#),
+        end_normal(),
+    ]);
+    let tags: Vec<_> = events.iter().map(tag).collect();
+    assert_eq!(
+        tags,
+        vec![
+            "Start",
+            "ToolcallStart",
+            "ToolcallDelta",
+            "ToolcallDelta",
+            "ToolcallEnd",
+            "Done"
+        ]
+    );
+    let deltas: Vec<_> = events.iter().filter_map(delta_of).collect();
+    assert_eq!(deltas, vec![r#"{"city":"#, r#""Paris"}"#]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            AssistantContent::ToolCall(tc) => {
+                assert_eq!(tc.id, "call-1");
+                assert_eq!(tc.name, "get_weather");
+                assert_eq!(tc.arguments, serde_json::json!({ "city": "Paris" }));
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
+        assert_eq!(result.stop_reason, StopReason::ToolUse);
+    } else {
+        panic!();
+    }
+}
+
+#[test]
+fn duplicate_identical_tool_chunks_are_deduped() {
+    // The same complete chunk repeated (observed on providers that re-send
+    // the assembled call on the finish chunk) must not produce duplicate
+    // blocks or duplicate events.
+    let args = serde_json::json!({ "v": 1 });
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        tool_call("call-1", "echo", args.clone()),
+        tool_call("call-1", "echo", args.clone()),
+        end_normal(),
+    ]);
+    let tags: Vec<_> = events.iter().map(tag).collect();
+    assert_eq!(
+        tags,
+        vec![
+            "Start",
+            "ToolcallStart",
+            "ToolcallDelta",
+            "ToolcallEnd",
+            "Done"
+        ]
+    );
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.content.len(), 1, "one block per unique call_id");
+    } else {
+        panic!();
+    }
+}
+
+#[test]
+fn parallel_tool_calls_close_previous_block() {
+    // A second call_id appearing closes the first call's block (End) before
+    // opening its own, so Start/End pairs never interleave.
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        tool_call_cumulative("call-a", "alpha", r#"{"a":1}"#),
+        tool_call_cumulative("call-b", "beta", r#"{"b":2}"#),
+        end_normal(),
+    ]);
+    let tags: Vec<_> = events.iter().map(tag).collect();
+    assert_eq!(
+        tags,
+        vec![
+            "Start",
+            "ToolcallStart",
+            "ToolcallDelta",
+            "ToolcallEnd",
+            "ToolcallStart",
+            "ToolcallDelta",
+            "ToolcallEnd",
+            "Done"
+        ]
+    );
+    // Block indices: End(a) at 0, Start(b) at 1.
+    let indices: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AssistantMessageEvent::ToolcallStart { content_index, .. }
+            | AssistantMessageEvent::ToolcallEnd { content_index, .. } => Some(*content_index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(indices, vec![0, 0, 1, 1]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.content.len(), 2);
+    } else {
+        panic!();
+    }
+}
+
+#[test]
+fn tool_chunk_after_block_closed_updates_silently() {
+    // If arguments for an already-closed call keep growing (End was emitted
+    // when another block opened), the block refreshes without further
+    // events — subscribers saw well-formed Start/End; the loop executes
+    // from the final message.
+    let (events, _) = run([
+        ChatStreamEvent::Start,
+        tool_call_cumulative("call-1", "echo", r#"{"v":1"#),
+        chunk("interleaved text"),
+        tool_call_cumulative("call-1", "echo", r#"{"v":12}"#),
+        end_normal(),
+    ]);
+    let tags: Vec<_> = events.iter().map(tag).collect();
+    assert_eq!(
+        tags,
+        vec![
+            "Start",
+            "ToolcallStart",
+            "ToolcallDelta",
+            "ToolcallEnd",
+            "TextStart",
+            "TextDelta",
+            "TextEnd",
+            "Done"
+        ],
+        "no Toolcall events after the block closed"
+    );
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        match &result.content[0] {
+            AssistantContent::ToolCall(tc) => {
+                assert_eq!(
+                    tc.arguments,
+                    serde_json::json!({ "v": 12 }),
+                    "final message carries the fully-accumulated args"
+                );
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
     } else {
         panic!();
     }
