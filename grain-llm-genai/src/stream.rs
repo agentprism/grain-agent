@@ -120,10 +120,18 @@ impl GenaiStream {
 /// per-call slots for these — auth goes through the client-build-time
 /// `AuthResolver`, and transport/retry config is fixed on the client — so
 /// wiring them up requires a fuller refactor of the client builder; see the
-/// M-2 code-review entry):
+/// M-2 code-review entry). `grain_agent_core::StreamOptions` carries all of
+/// the following per call; this adapter consumes only `reasoning`:
 /// - `api_key`: would need a dynamic auth resolver per-call.
 /// - `session_id` / `transport`: provider-specific transport knobs.
-/// - `max_retry_delay_ms`: WebConfig is set at client build time.
+/// - `max_retries` / `max_retry_delay_ms` / `timeout_ms` /
+///   `websocket_connect_timeout_ms`: WebConfig is set at client build time.
+/// - `temperature` / `max_tokens` / `cache_retention` / `headers` /
+///   `metadata` / `env` / `extra`.
+/// - `on_payload` / `on_response`: no genai interception point.
+///
+/// Note `headers` uses upstream's null-suppression semantics — a `None`
+/// value removes a provider default header rather than being a no-op.
 fn chat_options_with_runtime(base: ChatOptions, options: &StreamOptions) -> ChatOptions {
     let mut chat = base.with_capture_usage(true).with_capture_tool_calls(true);
     if let Some(level) = options.reasoning

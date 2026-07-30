@@ -67,7 +67,10 @@ Errors:
 - `AgentError::NoMessagesToContinue` — `continue_` called on empty transcript.
 - `AgentError::CannotContinueFromAssistant` — `continue_` while last is an assistant AND both queues are empty. If queues are non-empty, their content is drained and used as the new prompt.
 
-`prompt` / `prompt_text` **skip the initial steering poll** (so queued steering messages don't get prepended to the just-sent prompt); subsequent turns pull normally.
+`continue_` resuming **from the steering queue** skips the initial steering poll — the messages it
+resumes with were just drained, so re-polling would double-inject them. `prompt` / `prompt_text`
+do **not** skip it: a steering message queued before a prompt is prepended to that prompt's first
+turn. Matches upstream (`agent.ts:346` vs `:363` @ 34239180).
 
 ## State, subscriptions, abort
 

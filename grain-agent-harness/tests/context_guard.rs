@@ -25,11 +25,14 @@ fn assistant_text(text: &str) -> AgentMessage {
         api: "test".into(),
         provider: "test".into(),
         model: "test".into(),
+        response_id: None,
+        response_model: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
         error_message: None,
         error_code: None,
         timestamp: 0,
+        raw_stop_reason: None,
     })
 }
 
@@ -110,11 +113,14 @@ fn estimator_assistant_thinking_counts_text_plus_signature() {
         api: "x".into(),
         provider: "x".into(),
         model: "x".into(),
+        response_id: None,
+        response_model: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
         error_message: None,
         error_code: None,
         timestamp: 0,
+        raw_stop_reason: None,
     });
     assert_eq!(est.estimate_message(&m), 2);
 }
@@ -127,15 +133,19 @@ fn estimator_tool_call_counts_name_plus_arguments() {
             id: "c1".into(),
             name: "echo".into(),                         // 4 chars / 4 = 1
             arguments: serde_json::json!({ "v": "ab" }), // {"v":"ab"} = 10 chars / 4 = 3
+            thought_signature: None,
         })],
         api: "x".into(),
         provider: "x".into(),
         model: "x".into(),
+        response_id: None,
+        response_model: None,
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
         error_message: None,
         error_code: None,
         timestamp: 0,
+        raw_stop_reason: None,
     });
     assert_eq!(est.estimate_message(&m), 4);
 }

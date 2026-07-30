@@ -4,20 +4,31 @@
 //! plumbing needed to ship a real agent process:
 //!
 //! - [`session`] — typed session tree (entries, branches, leaf cursor) and an
-//!   `InMemorySessionRepo`. JSONL persistence is intended to live alongside it
-//!   under the same trait.
+//!   `InMemorySessionRepo`.
+//! - [`session_jsonl`] — on-disk JSONL persistence behind the same traits, and
+//!   the durability path a worker uses to survive a host restart.
+//! - [`resume`] — rehydrate an `Agent` from a persisted session.
+//! - [`agent_harness`] — the top-level `AgentHarness` orchestrator.
+//! - [`compaction`], [`context_guard`], [`pruning`], [`retry_overflow`],
+//!   [`escalation`], [`prefix_pin`], [`repair`] — context-window and
+//!   failure-handling policy layers.
 //! - [`messages`] — custom-message helpers (`branch_summary`, `compaction_summary`,
 //!   `custom_message`) and the harness-aware `convert_to_llm`.
 //! - [`system_prompt`] — assembles skill descriptors into the XML block injected
 //!   into the system prompt.
 //! - [`truncate`] — head/tail truncation utilities for tool output.
 //!
-//! What is NOT here yet (deliberately scoped out of this slice; see TS source):
-//! - context compaction (`harness/compaction/*`)
-//! - skills loading from disk (`harness/skills.ts`)
-//! - execution environment (`harness/env/*`) and shell-output capture
-//! - top-level `AgentHarness` constructor
-//! - JSONL session storage
+//! What is NOT in this crate (see TS source for the reference behavior):
+//! - skills **loading from disk** (`harness/skills.ts`) — the loader lives in
+//!   `grain-ai-agent-headless`; this crate only renders already-loaded skills
+//!   into the system prompt via [`system_prompt`].
+//! - execution environment (`harness/env/*`) and shell-output capture.
+//! - upstream's harness provider-hook *triad*
+//!   (`before_provider_request`, `before_provider_payload`,
+//!   `after_provider_response`) as a subscriber chain with patch-merge
+//!   semantics. The narrow single-callback form is wired:
+//!   `AgentHarnessOptions` forwards `on_payload` / `on_response` /
+//!   `thinking_budgets` to `grain_agent_core::StreamOptions`.
 
 pub mod agent_harness;
 pub mod compaction;
@@ -27,6 +38,7 @@ pub mod messages;
 pub mod prefix_pin;
 pub mod pruning;
 pub mod repair;
+pub mod resume;
 pub mod retry_overflow;
 pub mod session;
 pub mod session_jsonl;
@@ -34,9 +46,9 @@ pub mod system_prompt;
 pub mod truncate;
 
 pub use agent_harness::{
-    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, DynamicSystemPromptFn, HarnessError,
-    HarnessEventListener, HarnessUnsubscribe, PromptTemplate, Resources, SystemPrompt,
-    SystemPromptCtx,
+    AbortResult, AgentHarness, AgentHarnessEvent, AgentHarnessOptions, DynamicSystemPromptFn,
+    HarnessError, HarnessEventListener, HarnessUnsubscribe, PromptTemplate, Resources,
+    SystemPrompt, SystemPromptCtx,
 };
 
 pub use compaction::{
@@ -63,15 +75,20 @@ pub use messages::{
 pub use prefix_pin::{PinnedSystemPrompt, append_only_guard};
 pub use pruning::{PruneConfig, PruneOutcome, prune_tool_outputs};
 pub use repair::{StormConfig, storm_hook};
+pub use resume::{
+    RestoredState, ResumedAgent, resume_agent_from_session, seed_options_from_context,
+    thinking_level_from_tag,
+};
 pub use retry_overflow::{
     OverflowDetector, RetryNotify, RetryOnOverflowConfig, RetryOnOverflowStream,
 };
 pub use session::{
-    InMemorySessionRepo, InMemorySessionStorage, Session, SessionContext, SessionError,
-    SessionMetadata, SessionRepo, SessionStorage, SessionTreeEntry, SessionTreeEntryKind, uuidv7,
+    ForkPosition, InMemorySessionRepo, InMemorySessionStorage, Session, SessionContext,
+    SessionError, SessionMetadata, SessionRepo, SessionStorage, SessionTreeEntry,
+    SessionTreeEntryKind, uuidv7,
 };
 pub use session_jsonl::{JsonlSessionRepo, JsonlSessionStorage};
-pub use system_prompt::{Skill, format_skills_for_system_prompt};
+pub use system_prompt::{Skill, format_skill_invocation, format_skills_for_system_prompt};
 pub use truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH, TruncationOptions,
     TruncationResult, format_size, truncate_head, truncate_line, truncate_tail,

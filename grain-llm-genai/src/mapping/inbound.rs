@@ -347,6 +347,11 @@ impl InboundState {
             id: tc.call_id.clone(),
             name: tc.fn_name,
             arguments: parse_tool_args(&raw),
+            // WP19 mechanical fill only — preserves today's behavior exactly.
+            // Populating this from `pending_thought_signatures` (instead of
+            // the empty-thinking-block workaround below) is adapter work
+            // owned by the concurrent grain-llm-genai package.
+            thought_signature: None,
         };
         self.blocks.push(AssistantContent::ToolCall(grain_tc));
         let idx = self.blocks.len() - 1;
@@ -549,9 +554,11 @@ impl StopResolution {
 /// (`openai-completions.ts` `mapStopReason`), everything else as
 /// `Provider stopped with: <raw>` (`anthropic-messages.ts`,
 /// `google-generative-ai.ts`). The raw provider string is available here
-/// because genai preserves it inside every `StopReason` variant; grain's
-/// `AssistantMessage` has no `raw_stop_reason` slot to carry it further —
-/// that residual gap is reported as WP5 AB-R1, not silently dropped.
+/// because genai preserves it inside every `StopReason` variant.
+/// `AssistantMessage::raw_stop_reason` now exists to carry it (WP19,
+/// rust-host ledger item 13); wiring the raw string into that slot is
+/// adapter work this function does not yet do — the residual gap formerly
+/// reported as WP5 AB-R1.
 fn resolve_stop_reason(
     captured: Option<&genai::chat::StopReason>,
     content: &[AssistantContent],
@@ -620,8 +627,14 @@ fn empty_assistant(model: &Model) -> AssistantMessage {
         api: model.api.clone(),
         provider: model.provider.clone(),
         model: model.id.clone(),
+        response_id: None,
+        response_model: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        // WP19 mechanical fill only. Mapping genai's terminal stop string
+        // into this slot is adapter work owned by the concurrent
+        // grain-llm-genai package.
+        raw_stop_reason: None,
         error_message: None,
         error_code: None,
         timestamp: now_ms(),

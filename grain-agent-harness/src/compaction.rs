@@ -1259,11 +1259,14 @@ mod tests {
             api: "test".into(),
             provider: "test".into(),
             model: "test".into(),
+            response_id: None,
+            response_model: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             error_message: None,
             error_code: None,
             timestamp: 0,
+            raw_stop_reason: None,
         }
     }
 
@@ -1287,11 +1290,14 @@ mod tests {
                 api: model.api.clone(),
                 provider: model.provider.clone(),
                 model: model.id.clone(),
+                response_id: None,
+                response_model: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
                 error_code: None,
                 timestamp: 0,
+                raw_stop_reason: None,
             };
             Ok(Box::pin(stream::iter(vec![
                 AssistantMessageEvent::Start {
@@ -1677,16 +1683,20 @@ mod tests {
                     id: tool_call_id.into(),
                     name: tool_name.into(),
                     arguments: serde_json::json!({}),
+                    thought_signature: None,
                 }),
             ],
             api: "test".into(),
             provider: "test".into(),
             model: "test".into(),
+            response_id: None,
+            response_model: None,
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
             error_message: None,
             error_code: None,
             timestamp: 0,
+            raw_stop_reason: None,
         })
     }
 

@@ -224,6 +224,7 @@ mod tests {
                 id: (*id).into(),
                 name: (*name).into(),
                 arguments: serde_json::json!({}),
+                thought_signature: None,
             }));
         }
         AgentMessage::assistant(AssistantMessage {
@@ -231,11 +232,14 @@ mod tests {
             api: "test".into(),
             provider: "test".into(),
             model: "test".into(),
+            response_id: None,
+            response_model: None,
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
             error_message: None,
             error_code: None,
             timestamp: 0,
+            raw_stop_reason: None,
         })
     }
 

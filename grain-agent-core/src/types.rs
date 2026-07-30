@@ -39,12 +39,28 @@ pub struct ThinkingContent {
     pub provider_metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub arguments: serde_json::Value,
+    /// Opaque provider signature for reusing thought context, carried
+    /// directly on the tool call.
+    ///
+    /// Port of pi-ai `ToolCall.thoughtSignature`
+    /// (`packages/ai/src/types.ts:365` @ 34239180, "Google-specific: opaque
+    /// signature for reusing thought context"). Upstream replays the
+    /// signature on the tool call itself; without this slot a
+    /// signature-only turn has to synthesize an empty-text thinking block
+    /// to carry it.
+    ///
+    /// The replay rule lives in
+    /// [`crate::types::strip_cross_model_thought_signatures`]: same-model
+    /// replay keeps the signature, cross-model replay drops it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Content blocks legal in an assistant message.
@@ -335,9 +351,45 @@ pub struct AssistantMessage {
     pub api: String,
     pub provider: String,
     pub model: String,
+    /// The model the provider actually served, when it differs from the
+    /// requested [`Self::model`].
+    ///
+    /// Port of pi-ai `AssistantMessage.responseModel`
+    /// (`packages/ai/src/types.ts:405` @ 34239180: "Concrete `chunk.model`
+    /// when different from the requested `model` (e.g. OpenRouter `auto` ->
+    /// `anthropic/...`)"). Routing front-ends and aliases mean the requested
+    /// id is a request, not a fact; this is what answered. `None` when the
+    /// adapter has nothing to report or the served model matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_model: Option<String>,
+    /// The provider's identifier for this response.
+    ///
+    /// Port of pi-ai `AssistantMessage.responseId`
+    /// (`packages/ai/src/types.ts:406` @ 34239180: "Provider-specific
+    /// response/message identifier when the upstream API exposes one") —
+    /// e.g. Anthropic's `message.id`. The handle for correlating a
+    /// transcript entry with provider-side logs and billing records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
     #[serde(default)]
     pub usage: Usage,
     pub stop_reason: StopReason,
+    /// The provider's own stop string, verbatim and unmapped.
+    ///
+    /// Port of pi-ai `AssistantMessage.rawStopReason`
+    /// (`packages/ai/src/types.ts:411` @ 34239180). [`Self::stop_reason`] is
+    /// the normalized union; this is what the provider actually said —
+    /// e.g. Anthropic `"refusal"` / `"sensitive"`, Google
+    /// `"MALFORMED_FUNCTION_CALL"` / `"SAFETY"`, OpenAI `"content_filter"`,
+    /// Bedrock `"guardrail_intervened"`. Several distinct raw reasons
+    /// collapse onto one [`StopReason`], so this is the only channel that
+    /// preserves the distinction for diagnostics and policy.
+    ///
+    /// Populated by the provider adapter; `None` when the adapter does not
+    /// supply one. Omitted from the wire when `None` so serialized messages
+    /// round-trip against upstream shapes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_stop_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     /// Structured code for a loop-terminating failure, when the producer
@@ -379,6 +431,63 @@ pub enum Message {
     ToolResult(ToolResultMessage),
 }
 
+/// Whether `message` was produced by `model`, by upstream's three-part test.
+///
+/// Port of the `isSameModel` check in pi-ai `transformMessages`
+/// (`packages/ai/src/api/transform-messages.ts:95-98` @ 34239180):
+///
+/// ```text
+/// assistantMsg.provider === model.provider &&
+/// assistantMsg.api === model.api &&
+/// assistantMsg.model === model.id
+/// ```
+///
+/// Note the asymmetry upstream carries and this mirrors: the message's
+/// `model` field is compared against the model's **`id`**, not its `name`.
+pub fn is_same_model(message: &AssistantMessage, model: &Model) -> bool {
+    message.provider == model.provider && message.api == model.api && message.model == model.id
+}
+
+/// Drop [`ToolCall::thought_signature`] from assistant messages that a
+/// *different* model produced, in place.
+///
+/// This is the replay path for thought signatures. Port of the tool-call arm
+/// of pi-ai `transformMessages`
+/// (`packages/ai/src/api/transform-messages.ts:127-145` @ 34239180):
+///
+/// ```text
+/// if (!isSameModel && toolCall.thoughtSignature) {
+///     normalizedToolCall = { ...toolCall };
+///     delete normalizedToolCall.thoughtSignature;
+/// }
+/// ```
+///
+/// A thought signature is an opaque, model-scoped handle into the producing
+/// model's internal thought context. Replaying it to the same model lets that
+/// model resume its reasoning; replaying it to a different model is at best
+/// meaningless and at worst an API error, so it is stripped. Same-model replay
+/// keeps the signature untouched.
+///
+/// Only tool calls are touched — text and thinking blocks are left alone, and
+/// no message is added or removed. The rest of upstream's `transformMessages`
+/// (unsupported-image downgrade, tool-call-id normalization, synthetic results
+/// for orphaned tool calls) is provider-layer work and stays in the adapter.
+pub fn strip_cross_model_thought_signatures(messages: &mut [Message], model: &Model) {
+    for message in messages.iter_mut() {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        if is_same_model(assistant, model) {
+            continue;
+        }
+        for block in assistant.content.iter_mut() {
+            if let AssistantContent::ToolCall(tool_call) = block {
+                tool_call.thought_signature = None;
+            }
+        }
+    }
+}
+
 impl Message {
     /// Returns the serde tag for this message variant:
     /// `"user"`, `"assistant"`, or `"toolResult"`.
@@ -396,6 +505,14 @@ impl Message {
 /// Custom variants mirror the TypeScript `CustomAgentMessages` extension point:
 /// applications stash app-specific records here and filter / convert them in
 /// `convertToLlm` before reaching the model.
+// `Standard` is much larger than `Custom` and grew past clippy's threshold when
+// `AssistantMessage.raw_stop_reason` landed (WP19). The lint's remedy is boxing
+// the large variant, but `AgentMessage::Standard` is the workspace's hottest
+// public constructor — boxing it would churn every call site across every crate
+// and change the API that host embedders consume, to save a pointer hop on a
+// type that is almost always the `Standard` variant anyway. Suppressed
+// deliberately rather than paid for.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum AgentMessage {

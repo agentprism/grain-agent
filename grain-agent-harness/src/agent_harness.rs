@@ -1,10 +1,7 @@
 //! `AgentHarness` — top-level orchestrator that bundles `Agent` +
 //! `Session` + tools + skills + queues into a single façade.
 //!
-//! Phase 1 (this file) covers the minimum needed to migrate
-//! `grain-headless::cli::run` and `grain-tui::agent_worker::spawn`
-//! off the manual `Agent::new(...) + subscribe(SessionWriter)`
-//! pattern:
+//! Implemented here:
 //!
 //! - [`AgentHarnessOptions`] / [`AgentHarness::new`]
 //! - [`AgentHarness::prompt_text`] / [`AgentHarness::prompt`]
@@ -14,26 +11,52 @@
 //! - [`AgentHarness::abort`] / [`AgentHarness::wait_for_idle`]
 //! - [`AgentHarness::session`] — clone-cheap handle on the owned
 //!   session.
+//! - Queues: [`AgentHarness::steer`] / [`AgentHarness::follow_up`] /
+//!   [`AgentHarness::next_turn`].
+//! - State: [`AgentHarness::set_model`] /
+//!   [`AgentHarness::set_thinking_level`] /
+//!   [`AgentHarness::set_active_tools`], each persisted to the session
+//!   (batched while a run is in flight, flushed at turn boundaries).
+//! - Session control: [`AgentHarness::append_entry`] /
+//!   [`AgentHarness::navigate_tree`] / [`AgentHarness::compact`].
+//! - `Resources` (skills + prompt templates) with
+//!   [`AgentHarness::prompt_from_template`] / [`AgentHarness::skill`].
 //! - Session ownership: harness seeds the agent's transcript from
 //!   the session's branch on construction, then mirrors every
 //!   `MessageEnd` back into the session via an internal listener.
+//!   [`crate::resume`] is the same seeding, for callers that want a bare
+//!   `Agent` rather than the whole harness.
 //!
-//! Deferred to later phases (see `docs/agent-harness-design.md`):
+//! Known gaps against upstream (`packages/agent/src/harness/agent-harness.ts`
+//! @ 34239180) — see the repo's debt ledger for ownership:
 //!
-//! - Queues (`steer` / `follow_up` / `next_turn`) — Phase 2.
-//! - `set_model` / `set_thinking_level` / `set_active_tools` — Phase 2.
-//! - `append_entry` / `navigate_tree` / `compact` / `fork` — Phase 3.
-//! - `BeforeAgentStart` / `Context` events + `Resources` (skills +
-//!   prompt templates) + `prompt_from_template` / `skill` — Phase 4.
+//! - The provider-hook triad (`before_provider_request`,
+//!   `before_provider_payload`, `after_provider_response`) is absent. The
+//!   narrow form is wired — [`AgentHarnessOptions::on_payload`] /
+//!   [`AgentHarnessOptions::on_response`] /
+//!   [`AgentHarnessOptions::thinking_budgets`] reach the per-request
+//!   [`grain_agent_core::StreamOptions`] — but upstream's subscriber chain
+//!   with `applyStreamOptionsPatch` merge semantics is not ported.
+//! - `running` is set by [`AgentHarness::prompt`] only, so a settings change
+//!   made during [`AgentHarness::continue_`] or [`AgentHarness::compact`]
+//!   writes through mid-turn instead of batching to the turn boundary.
+//! - A failed settings write is logged, not surfaced: in-memory state is
+//!   already updated, so the agent can run one model while the session
+//!   records another. Upstream persists first and throws.
+//! - No harness-level `fork` over the ported [`crate::session::SessionRepo`]
+//!   fork. (Upstream has no `Agent.fork`; the fork lives at the session and
+//!   runtime layers.)
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use grain_agent_core::{
-    AfterToolCallFn, Agent, AgentError, AgentEvent, AgentMessage, AgentOptions, AgentTool,
-    AssistantMessage, AssistantMessageEvent, BeforeToolCallFn, ConvertToLlmFn, GetApiKeyFn, Model,
-    PrepareNextTurnFn, QueueMode, StreamFn, ThinkingLevel, ToolExecutionMode, TransformContextFn,
+    AfterToolCallFn, Agent, AgentError, AgentEvent, AgentLoopTurnUpdate, AgentMessage,
+    AgentOptions, AgentTool, AssistantMessage, AssistantMessageEvent, BeforeToolCallFn,
+    ConvertToLlmFn, GetApiKeyFn, Model, OnPayloadFn, OnResponseFn, PrepareNextTurnContext,
+    PrepareNextTurnFn, QueueMode, StreamFn, ThinkingBudgets, ThinkingLevel, ToolExecutionMode,
+    TransformContextFn,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -44,7 +67,7 @@ use crate::compaction::{
 };
 use crate::messages::convert_to_llm as convert_to_llm_sync;
 use crate::session::{Session, SessionError};
-use crate::system_prompt::Skill;
+use crate::system_prompt::{Skill, format_skill_invocation};
 
 // ---------------------------------------------------------------------------
 // Options
@@ -63,8 +86,9 @@ pub struct AgentHarnessOptions {
     pub resources: Resources,
     pub system_prompt: SystemPrompt,
     pub thinking_level: ThinkingLevel,
-    /// `None` means every tool is active. Names not in [`Self::tools`]
-    /// are silently ignored in Phase 1; Phase 2 will validate.
+    /// `None` means every tool is active. Names given here that are not in
+    /// [`Self::tools`] are ignored at construction; the later
+    /// [`AgentHarness::set_active_tools`] validates and rejects them.
     pub active_tool_names: Option<Vec<String>>,
     pub steering_mode: QueueMode,
     pub follow_up_mode: QueueMode,
@@ -74,6 +98,23 @@ pub struct AgentHarnessOptions {
     pub session_id: Option<String>,
     pub transport: Option<String>,
     pub max_retry_delay_ms: Option<u64>,
+    /// Inspect or replace the provider payload before it is sent. Forwarded
+    /// verbatim to [`AgentOptions::on_payload`].
+    ///
+    /// This is the narrow form of upstream's `before_provider_payload` hook
+    /// (`agent-harness.ts:303-318` @ 34239180): one callback rather than a
+    /// chain of subscribers. Whether the shipped provider adapter honors it
+    /// is an adapter question — `grain-llm-genai` currently does not.
+    pub on_payload: Option<OnPayloadFn>,
+    /// Called once an HTTP response is received, before its body is consumed.
+    /// Forwarded to [`AgentOptions::on_response`]. Narrow form of upstream's
+    /// `after_provider_response` event (`agent-harness.ts:414-420`).
+    pub on_response: Option<OnResponseFn>,
+    /// Per-level thinking token budgets, forwarded to
+    /// [`AgentOptions::thinking_budgets`]. Upstream exposes this on `Agent`
+    /// but not on its harness; grain surfaces it here so a harness-only
+    /// embedder is not forced down to the bare `Agent`.
+    pub thinking_budgets: Option<ThinkingBudgets>,
     /// Optional Agent hook: gate a tool call before it executes
     /// (storm suppression, schema repair, …). Passed through verbatim
     /// to [`AgentOptions::before_tool_call`].
@@ -115,6 +156,9 @@ impl AgentHarnessOptions {
             session_id: None,
             transport: None,
             max_retry_delay_ms: None,
+            on_payload: None,
+            on_response: None,
+            thinking_budgets: None,
             before_tool_call: None,
             after_tool_call: None,
             prepare_next_turn: None,
@@ -252,18 +296,32 @@ pub enum AgentHarnessEvent {
     // --- harness-own ---
     /// The harness was told to abort the running turn. Fires
     /// regardless of whether anything was actually running.
-    Abort,
+    ///
+    /// Carries the queued messages the abort discarded, mirroring upstream's
+    /// `AbortEvent` (`harness/types.ts:934-938` @ 34239180) — a listener that
+    /// wants to offer "resend?" needs the messages, not just the fact that
+    /// some were dropped.
+    Abort {
+        cleared_steer: Vec<AgentMessage>,
+        cleared_follow_up: Vec<AgentMessage>,
+    },
     /// Convenience marker — fired immediately after `AgentEnd` so
     /// callers that only want to know "the turn is done, including
     /// any harness-side post-processing" have a single subscribe
     /// point.
     Settled,
-    /// One of the harness queues changed (steer / follow_up /
-    /// next_turn). Phase 2 carries only a `has_queued` boolean —
-    /// `grain-agent-core::Agent` doesn't surface exact lengths.
-    /// Higher-fidelity counts can be added when needed.
+    /// One of the harness queues changed (steer / follow_up / next_turn).
+    ///
+    /// Upstream reports each bucket's messages
+    /// (`harness/types.ts:927-932` @ 34239180); grain reports depths, which
+    /// is what a status line actually renders, without cloning transcripts
+    /// on every queue mutation.
     QueueUpdate {
+        /// True when any bucket is non-empty.
         has_queued: bool,
+        steer_count: usize,
+        follow_up_count: usize,
+        next_turn_count: usize,
     },
     /// `set_model` ran successfully. Pi fires this after every
     /// runtime model swap so listeners (e.g. the TUI status bar)
@@ -413,6 +471,8 @@ pub enum HarnessError {
     EmptyTranscript,
     #[error("unknown prompt template: {0}")]
     UnknownTemplate(String),
+    #[error("unknown skill: {0}")]
+    UnknownSkill(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -434,9 +494,40 @@ impl HarnessUnsubscribe {
     }
 }
 
+/// A session write deferred until the harness is next idle.
+///
+/// Port of upstream's `PendingSessionWrite`
+/// (`packages/agent/src/harness/types.ts:555-559` @ 34239180: a
+/// `SessionTreeEntry` minus `id` / `parentId` / `timestamp`, since those are
+/// minted at flush time). Upstream batches exactly the state-change entries
+/// below; loop-produced messages are **not** batched — they append
+/// synchronously from the `message_end` handler
+/// (`agent-harness.ts:539-543`), and grain's session-mirror listener does the
+/// same.
+#[derive(Debug, Clone)]
+enum PendingSessionWrite {
+    Model { provider: String, model_id: String },
+    ThinkingLevel { thinking_level: String },
+    ActiveTools { active_tool_names: Vec<String> },
+}
+
 struct HarnessInner {
     listeners: BTreeMap<u64, HarnessEventListener>,
     next_listener_id: u64,
+    /// True between a prompt entrypoint and the agent's `AgentEnd`.
+    ///
+    /// Stands in for upstream's `phase` (`agent-harness.ts:559` et al). Only
+    /// the idle/not-idle distinction is modeled, which is all the batching
+    /// rule needs — upstream's other phases (`compaction`, `branch_summary`)
+    /// exist to reject re-entrant calls, which grain gates differently.
+    running: bool,
+    /// Session writes deferred while [`Self::running`], drained in FIFO order
+    /// once the run settles.
+    pending_session_writes: Vec<PendingSessionWrite>,
+    /// The third queue bucket. Unlike steer and follow-up (which live on the
+    /// `Agent` and feed the *running* loop), this one is owned by the harness
+    /// and drains at the start of the next prompt.
+    next_turn_queue: Vec<AgentMessage>,
     /// Snapshot of every tool passed to `AgentHarnessOptions::tools`,
     /// kept unfiltered so `set_active_tools` can re-derive the
     /// active subset without losing the full catalog.
@@ -450,6 +541,26 @@ struct HarnessInner {
     /// Live skills + prompt templates. Replaced atomically via
     /// `set_resources`; `prompt_from_template` looks up here.
     resources: Resources,
+    /// How the system prompt is produced. Kept (not just its rendered
+    /// output) so a [`SystemPrompt::Dynamic`] closure can be re-run each
+    /// turn, as upstream's `createTurnState` does.
+    system_prompt: SystemPrompt,
+    /// Mirror of the agent's current model / thinking level, maintained by
+    /// the setters. The dynamic-prompt closure needs both, and reading them
+    /// from here avoids a circular dependency on the `Agent` the closure is
+    /// installed into.
+    model: Model,
+    thinking_level: ThinkingLevel,
+}
+
+/// What an [`AgentHarness::abort`] discarded.
+///
+/// Port of upstream's `AbortResult` (`agent-harness.ts:1051`): the queued
+/// messages that were dropped, so a caller can requeue or report them.
+#[derive(Debug, Clone, Default)]
+pub struct AbortResult {
+    pub cleared_steer: Vec<AgentMessage>,
+    pub cleared_follow_up: Vec<AgentMessage>,
 }
 
 /// The orchestrator.
@@ -482,6 +593,9 @@ impl AgentHarness {
             session_id,
             transport,
             max_retry_delay_ms,
+            on_payload,
+            on_response,
+            thinking_budgets,
             before_tool_call,
             after_tool_call,
             prepare_next_turn,
@@ -490,14 +604,6 @@ impl AgentHarness {
 
         // Seed the agent with the session's current branch context.
         let seeded_messages = session.build_context().await.messages;
-        let resolved_system_prompt = match &system_prompt {
-            SystemPrompt::Static(s) => s.clone(),
-            // Phase 1: Dynamic prompts collapse to empty until Phase 2
-            // wires set_model / set_thinking_level which would
-            // trigger a re-render. Callers needing dynamic prompts
-            // today should use Static.
-            SystemPrompt::Dynamic(_) => String::new(),
-        };
 
         // Normalize active-tool selection and derive the initial
         // filtered subset that goes into the Agent.
@@ -506,6 +612,27 @@ impl AgentHarness {
         let filtered_tools = filter_tools(&tools, active_set.as_ref());
 
         let stream_fn_for_compact = stream_fn.clone();
+
+        // `inner` is built before the Agent so the dynamic-prompt closure can
+        // read live model / thinking / tools / resources without needing a
+        // handle on the Agent it is installed into.
+        let inner = Arc::new(Mutex::new(HarnessInner {
+            listeners: BTreeMap::new(),
+            next_listener_id: 0,
+            running: false,
+            pending_session_writes: Vec::new(),
+            next_turn_queue: Vec::new(),
+            all_tools: tools,
+            active_tool_names: active_set,
+            stream_fn: stream_fn_for_compact,
+            resources,
+            system_prompt,
+            model: model.clone(),
+            thinking_level,
+        }));
+
+        let resolved_system_prompt = render_system_prompt(&inner).await;
+
         let mut agent_opts = AgentOptions::new(model, stream_fn);
         agent_opts.system_prompt = resolved_system_prompt;
         agent_opts.thinking_level = thinking_level;
@@ -526,6 +653,9 @@ impl AgentHarness {
         agent_opts.session_id = session_id;
         agent_opts.transport = transport;
         agent_opts.max_retry_delay_ms = max_retry_delay_ms;
+        agent_opts.on_payload = on_payload;
+        agent_opts.on_response = on_response;
+        agent_opts.thinking_budgets = thinking_budgets;
         agent_opts.tool_execution = tool_execution;
         // Provider-agnostic hooks (Phase 3.0): pass through verbatim
         // to the underlying Agent. Lets callers wire storm
@@ -534,18 +664,43 @@ impl AgentHarness {
         // AgentHarness's other features.
         agent_opts.before_tool_call = before_tool_call;
         agent_opts.after_tool_call = after_tool_call;
-        agent_opts.prepare_next_turn = prepare_next_turn;
+        // Re-render the system prompt between turns. Upstream rebuilds the
+        // whole turn state in `prepareNextTurn` and hands the loop a fresh
+        // context (`agent-harness.ts:485-494` @ 34239180); grain overlays the
+        // freshly rendered prompt onto whatever context the turn is carrying,
+        // after any caller-supplied hook has had its say.
+        let inner_for_prompt = inner.clone();
+        agent_opts.prepare_next_turn =
+            Some(Arc::new(move |ctx: PrepareNextTurnContext, cancel| {
+                let inner = inner_for_prompt.clone();
+                let caller = prepare_next_turn.clone();
+                Box::pin(async move {
+                    let mut update = match &caller {
+                        Some(hook) => hook(ctx.clone(), cancel).await.unwrap_or_default(),
+                        None => AgentLoopTurnUpdate::default(),
+                    };
+                    // A caller hook that swapped model / thinking level must be
+                    // visible to the prompt closure that runs next.
+                    {
+                        let mut g = inner.lock().await;
+                        if let Some(m) = &update.model {
+                            g.model = m.clone();
+                        }
+                        if let Some(t) = update.thinking_level {
+                            g.thinking_level = t;
+                        }
+                    }
+                    let rendered = render_system_prompt(&inner).await;
+                    let mut context = update.context.unwrap_or_else(|| (*ctx.context).clone());
+                    if context.system_prompt != rendered {
+                        context.system_prompt = rendered;
+                    }
+                    update.context = Some(context);
+                    Some(update)
+                })
+            }));
 
         let agent = Arc::new(Agent::new(agent_opts));
-
-        let inner = Arc::new(Mutex::new(HarnessInner {
-            listeners: BTreeMap::new(),
-            next_listener_id: 0,
-            all_tools: tools,
-            active_tool_names: active_set,
-            stream_fn: stream_fn_for_compact,
-            resources,
-        }));
 
         // Install internal session-mirror listener: every finalized
         // message lands back in the session. Mirrors what
@@ -571,13 +726,26 @@ impl AgentHarness {
         // → every harness listener. Tacks on `Settled` after
         // `AgentEnd` so callers have a single end-of-turn signal.
         let inner_for_broadcast = inner.clone();
+        let session_for_flush = session.clone();
         agent
             .subscribe(Arc::new(move |event, signal| {
                 let inner = inner_for_broadcast.clone();
+                let session = session_for_flush.clone();
                 Box::pin(async move {
                     let is_end = matches!(event, AgentEvent::AgentEnd { .. });
+                    // Upstream flushes deferred writes at `turn_end` and
+                    // `agent_end` (agent-harness.ts:551-558), so a long
+                    // multi-turn run persists state changes at turn
+                    // boundaries rather than hoarding them until the end.
+                    let is_turn_end = matches!(event, AgentEvent::TurnEnd { .. });
                     let mapped = AgentHarnessEvent::from_agent_event(event);
                     broadcast(&inner, mapped, signal.clone()).await;
+                    if is_turn_end || is_end {
+                        if is_end {
+                            inner.lock().await.running = false;
+                        }
+                        flush_pending_session_writes(&inner, &session).await;
+                    }
                     if is_end {
                         broadcast(&inner, AgentHarnessEvent::Settled, signal).await;
                     }
@@ -596,14 +764,27 @@ impl AgentHarness {
     /// [`AgentHarnessEvent::BeforeAgentStart`] before dispatching
     /// to the agent loop.
     pub async fn prompt_text(&self, text: impl Into<String>) -> Result<(), HarnessError> {
-        self.emit_before_start().await;
-        self.agent.prompt_text(text).await.map_err(Into::into)
+        let message = AgentMessage::user(grain_agent_core::UserMessage {
+            content: vec![grain_agent_core::UserContent::text(text.into())],
+            timestamp: now_ms(),
+        });
+        self.prompt(vec![message]).await
     }
 
     /// Start a new prompt from a batch of messages. Emits
     /// [`AgentHarnessEvent::BeforeAgentStart`] before dispatching.
     pub async fn prompt(&self, messages: Vec<AgentMessage>) -> Result<(), HarnessError> {
         self.emit_before_start().await;
+        // Queued next-turn messages lead this prompt (upstream
+        // `messages = [...queuedMessages, messages[0]!]`, agent-harness.ts:596).
+        let mut queued = self.take_next_turn_queue().await;
+        let messages = if queued.is_empty() {
+            messages
+        } else {
+            queued.extend(messages);
+            queued
+        };
+        self.mark_running().await;
         self.agent.prompt(messages).await.map_err(Into::into)
     }
 
@@ -629,15 +810,33 @@ impl AgentHarness {
         self.prompt_text(rendered).await
     }
 
-    /// Invoke a "skill" — Phase 4 minimal version synthesizes a
-    /// user prompt like `"Use the <name> skill with args: <json>"`
-    /// and submits it. Phase 5 will wire pi's typed-skill semantics
-    /// (validate against `Resources::skills`, structured invocation).
-    pub async fn skill(&self, name: &str, args: serde_json::Value) -> Result<(), HarnessError> {
-        let text = format!(
-            "Use the `{name}` skill with arguments: {}",
-            serde_json::to_string(&args).unwrap_or_else(|_| "{}".into())
-        );
+    /// Invoke a skill by name.
+    ///
+    /// Port of upstream `AgentHarness.skill`
+    /// (`agent-harness.ts:673-688` @ 34239180): look the name up in
+    /// [`Resources::skills`], fail with [`HarnessError::UnknownSkill`] if it
+    /// is not there, and submit [`format_skill_invocation`]'s block. The
+    /// previous behavior — synthesizing "Use the `x` skill" for *any* name —
+    /// meant a typo silently became a prompt asking the model to use a skill
+    /// that does not exist.
+    ///
+    /// `additional_instructions` is appended after the skill block, as
+    /// upstream does.
+    pub async fn skill(
+        &self,
+        name: &str,
+        additional_instructions: Option<&str>,
+    ) -> Result<(), HarnessError> {
+        let text = {
+            let g = self.inner.lock().await;
+            let skill = g
+                .resources
+                .skills
+                .iter()
+                .find(|candidate| candidate.name == name)
+                .ok_or_else(|| HarnessError::UnknownSkill(name.to_string()))?;
+            format_skill_invocation(skill, additional_instructions)
+        };
         self.prompt_text(text).await
     }
 
@@ -654,6 +853,10 @@ impl AgentHarness {
     /// `Agent::continue_` for the contract (the tail message must
     /// convert to a `user` or `toolResult` LLM message).
     pub async fn continue_(&self) -> Result<(), HarnessError> {
+        // Same batching gate as `prompt`: a settings change made while this
+        // run is in flight must land at the turn boundary, not spliced into
+        // the middle of the turn's entry chain.
+        self.mark_running().await;
         self.agent.continue_().await.map_err(Into::into)
     }
 
@@ -676,7 +879,22 @@ impl AgentHarness {
     /// Replace the active model. Forwards to `Agent::set_model` and
     /// emits [`AgentHarnessEvent::ModelSelect`].
     pub async fn set_model(&self, model: Model) {
+        // Persist first, assign second (upstream `agent-harness.ts:891-894`).
+        // The reverse order lets a failed write leave the agent running one
+        // model while the session records another, with nothing to signal it.
+        if self
+            .record_session_write(PendingSessionWrite::Model {
+                provider: model.provider.clone(),
+                model_id: model.id.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
         self.agent.set_model(model.clone()).await;
+        self.inner.lock().await.model = model.clone();
+        self.refresh_system_prompt().await;
         self.emit(AgentHarnessEvent::ModelSelect { model }).await;
     }
 
@@ -688,9 +906,69 @@ impl AgentHarness {
     /// Replace the thinking level. Forwards to `Agent::set_thinking_level`
     /// and emits [`AgentHarnessEvent::ThinkingLevelSelect`].
     pub async fn set_thinking_level(&self, level: ThinkingLevel) {
+        // Persist first, assign second — see `set_model`.
+        if self
+            .record_session_write(PendingSessionWrite::ThinkingLevel {
+                thinking_level: thinking_level_tag(level).to_string(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
         self.agent.set_thinking_level(level).await;
+        self.inner.lock().await.thinking_level = level;
+        self.refresh_system_prompt().await;
         self.emit(AgentHarnessEvent::ThinkingLevelSelect { level })
             .await;
+    }
+
+    /// Persist a session state change, or defer it when a run is in flight.
+    ///
+    /// Upstream's rule (`agent-harness.ts:724-734`, `:894`, `:913`, `:940`
+    /// @ 34239180): when the harness is idle the write goes straight through;
+    /// while a run is in flight it joins `pendingSessionWrites` and lands at
+    /// the next turn boundary. Batching keeps mid-run state churn off the
+    /// hot path and out of the middle of a turn's entry chain.
+    async fn record_session_write(&self, write: PendingSessionWrite) -> Result<(), SessionError> {
+        {
+            let mut g = self.inner.lock().await;
+            if g.running {
+                g.pending_session_writes.push(write);
+                return Ok(());
+            }
+        }
+        // Idle: write through *now*, and report the outcome so the caller can
+        // decline to mutate in-memory state on failure. Deliberately does not
+        // touch the pending queue — re-queuing a write whose in-memory twin
+        // was never applied would reintroduce the divergence from the other
+        // side, applying it to the session later while memory never had it.
+        apply_session_write(&self.session, &write).await
+    }
+
+    /// Re-render a [`SystemPrompt::Dynamic`] prompt and push it onto the
+    /// agent immediately.
+    ///
+    /// Reconfiguration is the other half of upstream's re-render trigger: a
+    /// `Dynamic` prompt that mentions the model or the active tool set must
+    /// not keep describing the previous ones. A `Static` prompt is untouched,
+    /// so this never clobbers a caller's `set_system_prompt`.
+    async fn refresh_system_prompt(&self) {
+        let is_dynamic = matches!(
+            self.inner.lock().await.system_prompt,
+            SystemPrompt::Dynamic(_)
+        );
+        if !is_dynamic {
+            return;
+        }
+        let rendered = render_system_prompt(&self.inner).await;
+        self.agent.set_system_prompt(rendered).await;
+    }
+
+    /// Mark a run as started so subsequent state changes batch rather than
+    /// interleave with the turn's entries.
+    async fn mark_running(&self) {
+        self.inner.lock().await.running = true;
     }
 
     /// Restrict the agent's visible tool list to the named subset.
@@ -718,7 +996,14 @@ impl AgentHarness {
             new_filtered = filter_tools(&g.all_tools, g.active_tool_names.as_ref());
             new_names = names.to_vec();
         }
+        // Persist first, assign second — see `set_model`. This one can report
+        // the failure, since it already returns `Result`.
+        self.record_session_write(PendingSessionWrite::ActiveTools {
+            active_tool_names: new_names.clone(),
+        })
+        .await?;
         self.agent.set_tools(new_filtered).await;
+        self.refresh_system_prompt().await;
         self.emit(AgentHarnessEvent::ActiveToolsSelect { names: new_names })
             .await;
         Ok(())
@@ -738,18 +1023,43 @@ impl AgentHarness {
         self.emit_queue_update().await;
     }
 
-    /// Queue a "next turn" message. In pi this is a third bucket
-    /// distinct from follow-up; Phase 2 maps it to follow-up
-    /// pending a richer queue model.
+    /// Queue a message to lead the *next* prompt.
+    ///
+    /// The third bucket, ported from upstream's `nextTurnQueue`
+    /// (`agent-harness.ts:719-722`, drained at `:588-597` @ 34239180). It
+    /// differs from steer and follow-up in three ways that matter:
+    ///
+    /// - **Callable while idle.** Steering and follow-up only mean something
+    ///   relative to a run in flight; this is "say this next time you go".
+    /// - **Drains at the next prompt**, prepended *ahead* of that prompt's
+    ///   own message, rather than being consumed mid-run.
+    /// - **Always drains fully**, ignoring [`QueueMode`].
+    ///
+    /// It also survives [`Self::abort`], which clears only the other two.
     pub async fn next_turn(&self, message: AgentMessage) {
-        self.agent.follow_up(message).await;
+        self.inner.lock().await.next_turn_queue.push(message);
         self.emit_queue_update().await;
     }
 
+    /// Drain the next-turn bucket, returning its messages in queue order.
+    async fn take_next_turn_queue(&self) -> Vec<AgentMessage> {
+        let queued = std::mem::take(&mut self.inner.lock().await.next_turn_queue);
+        if !queued.is_empty() {
+            self.emit_queue_update().await;
+        }
+        queued
+    }
+
     async fn emit_queue_update(&self) {
-        let has_queued = self.agent.has_queued_messages().await;
-        self.emit(AgentHarnessEvent::QueueUpdate { has_queued })
-            .await;
+        let (steer_count, follow_up_count) = self.agent.queued_counts().await;
+        let next_turn_count = self.inner.lock().await.next_turn_queue.len();
+        self.emit(AgentHarnessEvent::QueueUpdate {
+            has_queued: steer_count + follow_up_count + next_turn_count > 0,
+            steer_count,
+            follow_up_count,
+            next_turn_count,
+        })
+        .await;
     }
 
     // ----- Phase 3 — session control -------------------------------------
@@ -806,6 +1116,21 @@ impl AgentHarness {
     /// `keep_recent` is clamped to `[1, total)`. Empty transcripts
     /// return [`HarnessError::EmptyTranscript`].
     pub async fn compact(&self, keep_recent: usize) -> Result<String, HarnessError> {
+        // The summarizer is a provider call, so this is a run for batching
+        // purposes: settings changed during it must not splice into the middle
+        // of the compaction. Nothing here goes through the agent loop, so no
+        // `AgentEnd` will arrive to clear the gate — this method owns both
+        // ends of it, including on the error paths.
+        self.mark_running().await;
+        let result = self.compact_inner(keep_recent).await;
+        {
+            self.inner.lock().await.running = false;
+        }
+        flush_pending_session_writes(&self.inner, &self.session).await;
+        result
+    }
+
+    async fn compact_inner(&self, keep_recent: usize) -> Result<String, HarnessError> {
         let state = self.agent.state().await;
         let messages = state.messages.clone();
         let total = messages.len();
@@ -914,11 +1239,31 @@ impl AgentHarness {
         broadcast(&self.inner, event, signal).await;
     }
 
-    /// Abort the current turn (if any). Always fires an `Abort` event
-    /// to subscribers — even when nothing was running — so listeners
-    /// have a stable signal.
-    pub async fn abort(&self) {
+    /// Abort the current turn (if any), discarding queued steer and
+    /// follow-up messages and returning them.
+    ///
+    /// Port of upstream `AgentHarness.abort`
+    /// (`agent-harness.ts:1024-1051` @ 34239180), in its order: snapshot and
+    /// clear both queues, cancel the run, emit `QueueUpdate`, wait for the
+    /// run to settle, then emit `Abort`. Waiting before the event means a
+    /// listener that reacts to `Abort` observes a genuinely idle harness.
+    /// Fires `Abort` even when nothing was running, so listeners have a
+    /// stable signal.
+    pub async fn abort(&self) -> AbortResult {
+        let cleared_steer = self.agent.take_steering_queue().await;
+        let cleared_follow_up = self.agent.take_follow_up_queue().await;
         self.agent.abort().await;
+        self.emit_queue_update().await;
+        self.agent.wait_for_idle().await;
+        self.emit(AgentHarnessEvent::Abort {
+            cleared_steer: cleared_steer.clone(),
+            cleared_follow_up: cleared_follow_up.clone(),
+        })
+        .await;
+        AbortResult {
+            cleared_steer,
+            cleared_follow_up,
+        }
     }
 
     /// Wait until the agent is idle. Delegates to the core
@@ -978,6 +1323,115 @@ async fn broadcast(
     }
 }
 
+/// Milliseconds since the Unix epoch, matching how core stamps messages.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Render the current system prompt.
+///
+/// [`SystemPrompt::Static`] returns its string; [`SystemPrompt::Dynamic`]
+/// re-runs the closure against live model / thinking level / active tools /
+/// resources — upstream's `createTurnState` behavior
+/// (`agent-harness.ts:354-387` @ 34239180).
+///
+/// The closure borrows out of the guard, but the future it returns is
+/// `'static`, so the lock is released before awaiting: a prompt closure that
+/// itself calls back into the harness cannot deadlock.
+async fn render_system_prompt(inner: &Arc<Mutex<HarnessInner>>) -> String {
+    let fut = {
+        let g = inner.lock().await;
+        match &g.system_prompt {
+            SystemPrompt::Static(s) => return s.clone(),
+            SystemPrompt::Dynamic(render) => {
+                let active = filter_tools(&g.all_tools, g.active_tool_names.as_ref());
+                let ctx = SystemPromptCtx {
+                    model: &g.model,
+                    thinking_level: g.thinking_level,
+                    active_tools: &active,
+                    resources: &g.resources,
+                };
+                render(&ctx)
+            }
+        }
+    };
+    fut.await
+}
+
+/// Serialize a [`ThinkingLevel`] to the session's wire tag.
+///
+/// Matches the lowercase union upstream persists
+/// (`"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`), which
+/// is also what `build_session_context` reads back.
+fn thinking_level_tag(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "off",
+        ThinkingLevel::Minimal => "minimal",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::XHigh => "xhigh",
+        ThinkingLevel::Max => "max",
+    }
+}
+
+/// Apply one session write, logging and reporting any failure.
+async fn apply_session_write(
+    session: &Session,
+    write: &PendingSessionWrite,
+) -> Result<(), SessionError> {
+    let result = match write {
+        PendingSessionWrite::Model { provider, model_id } => session
+            .append_model_change(provider.clone(), model_id.clone())
+            .await
+            .map(|_| ()),
+        PendingSessionWrite::ThinkingLevel { thinking_level } => session
+            .append_thinking_level_change(thinking_level.clone())
+            .await
+            .map(|_| ()),
+        PendingSessionWrite::ActiveTools { active_tool_names } => session
+            .append_active_tools_change(active_tool_names.clone())
+            .await
+            .map(|_| ()),
+    };
+    if let Err(e) = &result {
+        eprintln!("[warn] harness session write: {e}");
+    }
+    result
+}
+
+/// Drain deferred session writes in FIFO order.
+///
+/// Port of upstream `flushPendingSessionWrites`
+/// (`agent-harness.ts:512-536` @ 34239180). Upstream removes an entry from
+/// the queue only *after* its write resolves, so a failing write stays at the
+/// head and is retried on the next flush; this keeps that ordering by popping
+/// the front and pushing it back on failure. Writes happen without the lock
+/// held, so a mutator racing the flush appends behind the drained batch
+/// rather than deadlocking.
+async fn flush_pending_session_writes(inner: &Arc<Mutex<HarnessInner>>, session: &Session) {
+    loop {
+        let next = {
+            let mut g = inner.lock().await;
+            if g.pending_session_writes.is_empty() {
+                return;
+            }
+            g.pending_session_writes.remove(0)
+        };
+
+        if apply_session_write(session, &next).await.is_err() {
+            // Non-fatal, like the message-mirror path: put the entry back at
+            // the head so the next flush retries it, and stop draining so a
+            // persistent failure doesn't spin.
+            inner.lock().await.pending_session_writes.insert(0, next);
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,11 +1465,14 @@ mod tests {
                 api: "stub".into(),
                 provider: "stub".into(),
                 model: "stub-model".into(),
+                response_id: None,
+                response_model: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
                 error_code: None,
                 timestamp: 0,
+                raw_stop_reason: None,
             };
             let evt = grain_agent_core::AssistantMessageEvent::Done { result: msg };
             Ok(Box::pin(stream::once(async move { evt })))
@@ -1306,7 +1763,13 @@ mod tests {
         h.subscribe(Arc::new(move |event, _| {
             let c = c.clone();
             Box::pin(async move {
-                if matches!(event, AgentHarnessEvent::QueueUpdate { has_queued: true }) {
+                if matches!(
+                    event,
+                    AgentHarnessEvent::QueueUpdate {
+                        has_queued: true,
+                        ..
+                    }
+                ) {
                     c.fetch_add(1, Ordering::SeqCst);
                 }
             })
@@ -1521,28 +1984,61 @@ mod tests {
         assert_eq!(saw.load(Ordering::SeqCst), 1);
     }
 
+    fn triage_skill() -> Skill {
+        Skill {
+            name: "triage".into(),
+            description: "Triage an incident".into(),
+            file_path: "/skills/triage/SKILL.md".into(),
+            disable_model_invocation: false,
+            body: "Sort by severity.".into(),
+        }
+    }
+
     #[tokio::test]
-    async fn skill_synthesizes_a_prompt_mentioning_name_and_args() {
-        let h = AgentHarness::new(AgentHarnessOptions::new(
-            empty_session(),
-            dummy_model(),
-            stub_stream_fn(),
-        ))
-        .await;
-        h.skill("triage", serde_json::json!({ "priority": "high" }))
+    async fn skill_submits_the_upstream_invocation_block() {
+        let mut opts = AgentHarnessOptions::new(empty_session(), dummy_model(), stub_stream_fn());
+        opts.resources.skills = vec![triage_skill()];
+        let h = AgentHarness::new(opts).await;
+
+        h.skill("triage", Some("focus on paging alerts"))
             .await
             .unwrap();
         h.wait_for_idle().await;
+
         let msgs = h.agent().state().await.messages;
         let user = msgs.iter().find_map(|m| match m {
             AgentMessage::Standard(Message::User(u)) => Some(u),
             _ => None,
         });
         let UserContent::Text(t) = &user.unwrap().content[0] else {
-            panic!();
+            panic!("expected a text block");
         };
-        assert!(t.text.contains("triage"));
-        assert!(t.text.contains("priority"));
+        assert!(t.text.contains("<skill name=\"triage\""));
+        assert!(t.text.contains("location=\"/skills/triage/SKILL.md\""));
+        assert!(
+            t.text
+                .contains("References are relative to /skills/triage.")
+        );
+        assert!(t.text.contains("Sort by severity."));
+        assert!(t.text.ends_with("focus on paging alerts"));
+    }
+
+    /// A name that is not in `Resources::skills` is an error, not a prompt
+    /// politely asking the model to use a skill that does not exist.
+    #[tokio::test]
+    async fn unknown_skill_is_rejected() {
+        let mut opts = AgentHarnessOptions::new(empty_session(), dummy_model(), stub_stream_fn());
+        opts.resources.skills = vec![triage_skill()];
+        let h = AgentHarness::new(opts).await;
+
+        match h.skill("triaage", None).await {
+            Err(HarnessError::UnknownSkill(name)) => assert_eq!(name, "triaage"),
+            other => panic!("expected UnknownSkill, got {other:?}"),
+        }
+        assert!(
+            h.agent().state().await.messages.is_empty(),
+            "a rejected skill must not put anything in the transcript"
+        );
     }
 
     #[tokio::test]

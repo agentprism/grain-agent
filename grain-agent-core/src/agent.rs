@@ -41,6 +41,9 @@ impl PendingMessageQueue {
     fn has_items(&self) -> bool {
         !self.messages.is_empty()
     }
+    fn len(&self) -> usize {
+        self.messages.len()
+    }
     fn drain(&mut self) -> Vec<AgentMessage> {
         if self.messages.is_empty() {
             return Vec::new();
@@ -56,6 +59,11 @@ impl PendingMessageQueue {
     }
     fn clear(&mut self) {
         self.messages.clear();
+    }
+    /// Empty the queue, returning everything it held — regardless of
+    /// [`QueueMode`], which governs draining into a turn, not discarding.
+    fn take_all(&mut self) -> Vec<AgentMessage> {
+        self.messages.drain(..).collect()
     }
 }
 
@@ -385,11 +393,39 @@ impl Agent {
         self.inner.lock().await.follow_up_queue.clear();
     }
 
+    /// Clear the steering queue, returning what was discarded.
+    ///
+    /// Upstream snapshots the queue before clearing it so `abort()` can
+    /// report what it threw away (`const clearedSteer = [...this.steerQueue]`,
+    /// `packages/agent/src/harness/agent-harness.ts:1025-1028` @ 34239180);
+    /// callers can requeue the messages instead of losing them silently.
+    /// Unlike `drain`, this ignores [`QueueMode`] and always takes everything.
+    pub async fn take_steering_queue(&self) -> Vec<AgentMessage> {
+        self.inner.lock().await.steering_queue.take_all()
+    }
+
+    /// Clear the follow-up queue, returning what was discarded.
+    /// See [`Self::take_steering_queue`].
+    pub async fn take_follow_up_queue(&self) -> Vec<AgentMessage> {
+        self.inner.lock().await.follow_up_queue.take_all()
+    }
+
     /// Discard both steering and follow-up queues.
     pub async fn clear_all_queues(&self) {
         let mut g = self.inner.lock().await;
         g.steering_queue.clear();
         g.follow_up_queue.clear();
+    }
+
+    /// Pending message counts as `(steering, follow_up)`.
+    ///
+    /// Lets a wrapper report queue depth without draining. Upstream's harness
+    /// keeps its own copies of the queues and reports their contents
+    /// (`agent-harness.ts:320-327` @ 34239180); grain's queues live here, so
+    /// the counts have to come from here too.
+    pub async fn queued_counts(&self) -> (usize, usize) {
+        let g = self.inner.lock().await;
+        (g.steering_queue.len(), g.follow_up_queue.len())
     }
 
     /// Returns `true` when either queue has at least one pending message.
@@ -644,6 +680,8 @@ impl Agent {
                     api: g.model.api.clone(),
                     provider: g.model.provider.clone(),
                     model: g.model.id.clone(),
+                    response_id: None,
+                    response_model: None,
                     usage: Usage::default(),
                     stop_reason: if aborted {
                         StopReason::Aborted
@@ -651,6 +689,8 @@ impl Agent {
                         StopReason::Error
                     },
                     error_message: Some(err.to_string()),
+                    // Locally synthesized, so no provider stop string exists.
+                    raw_stop_reason: None,
                     // AgentLoopError carries no structured code (its variants
                     // are continue-precondition failures).
                     error_code: None,

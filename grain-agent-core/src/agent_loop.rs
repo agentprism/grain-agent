@@ -591,7 +591,17 @@ async fn stream_assistant_response(
     };
 
     // 2) Convert to LLM messages.
-    let llm_messages = (config.convert_to_llm)(transformed).await;
+    let mut llm_messages = (config.convert_to_llm)(transformed).await;
+
+    // 2b) Thought-signature replay rule. A signature is an opaque handle into
+    // the producing model's thought context, so it only replays to that same
+    // model; carrying it to another model is meaningless at best and an API
+    // error at worst. Upstream applies this inside `transformMessages`
+    // (`packages/ai/src/api/transform-messages.ts:127-145` @ 34239180); grain
+    // applies it here, the one place that knows both the transcript and the
+    // model this request targets. Relevant because `prepare_next_turn` can
+    // swap the model mid-run, so a single transcript can span models.
+    crate::types::strip_cross_model_thought_signatures(&mut llm_messages, &config.model);
 
     // 3) Build LLM context.
     let tool_defs: Vec<ToolDefinition> = context
@@ -628,8 +638,13 @@ async fn stream_assistant_response(
                 api: config.model.api.clone(),
                 provider: config.model.provider.clone(),
                 model: config.model.id.clone(),
+                response_id: None,
+                response_model: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::Error,
+                // Synthesized locally: the request never reached a provider,
+                // so there is no provider stop string to carry.
+                raw_stop_reason: None,
                 error_message: Some(err.to_string()),
                 error_code: err.code().cloned(),
                 timestamp: current_time_ms(),
@@ -731,8 +746,13 @@ async fn stream_assistant_response(
         api: config.model.api.clone(),
         provider: config.model.provider.clone(),
         model: config.model.id.clone(),
+        response_id: None,
+        response_model: None,
         usage: Usage::default(),
         stop_reason: StopReason::Error,
+        // Synthesized locally: the stream never delivered a terminal event,
+        // so no provider stop string was ever observed.
+        raw_stop_reason: None,
         error_message: Some("stream ended without terminal event".into()),
         error_code: None,
         timestamp: current_time_ms(),

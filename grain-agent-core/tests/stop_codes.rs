@@ -69,7 +69,8 @@ fn error_code_serde_round_trips_and_tolerates_upstream_shapes() {
     }
 
     // Unknown code strings survive verbatim through Other.
-    let decoded: ErrorCode = serde_json::from_value(serde_json::json!("SESSION_NOT_FOUND")).unwrap();
+    let decoded: ErrorCode =
+        serde_json::from_value(serde_json::json!("SESSION_NOT_FOUND")).unwrap();
     assert_eq!(decoded, ErrorCode::Other("SESSION_NOT_FOUND".into()));
     assert_eq!(
         serde_json::to_value(&decoded).unwrap(),
@@ -79,9 +80,10 @@ fn error_code_serde_round_trips_and_tolerates_upstream_shapes() {
 
     // An Other spelling a named variant canonicalizes on round-trip
     // (documented behavior).
-    let recoded: ErrorCode =
-        serde_json::from_value(serde_json::to_value(ErrorCode::Other("budget_exhausted".into())).unwrap())
-            .unwrap();
+    let recoded: ErrorCode = serde_json::from_value(
+        serde_json::to_value(ErrorCode::Other("budget_exhausted".into())).unwrap(),
+    )
+    .unwrap();
     assert_eq!(recoded, ErrorCode::BudgetExhausted);
 }
 
@@ -168,8 +170,7 @@ async fn coded_stream_error_reaches_the_synthesized_error_message() {
 async fn uncoded_error_text_mentioning_a_code_stays_uncoded() {
     let stream: StreamFn = FnStream::new(|_, _, _, _, _| {
         let mut result = create_assistant_message(vec![], StopReason::Error);
-        result.error_message =
-            Some("worker report cites TOKEN_BUDGET_EXHAUSTED in prose".into());
+        result.error_message = Some("worker report cites TOKEN_BUDGET_EXHAUSTED in prose".into());
         // No error_code set by the producer.
         futures::stream::iter(vec![AssistantMessageEvent::Error {
             error: "worker report cites TOKEN_BUDGET_EXHAUSTED in prose".into(),
@@ -184,7 +185,10 @@ async fn uncoded_error_text_mentioning_a_code_stays_uncoded() {
 
     let last = final_assistant(&agent.state().await.messages);
     assert_eq!(last.stop_reason, StopReason::Error);
-    assert_eq!(last.error_code, None, "codes are explicit, never inferred from text");
+    assert_eq!(
+        last.error_code, None,
+        "codes are explicit, never inferred from text"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +198,10 @@ async fn uncoded_error_text_mentioning_a_code_stays_uncoded() {
 #[tokio::test]
 async fn successful_runs_carry_no_error_code() {
     let stream: StreamFn = FnStream::new(|_, _, _, _, _| {
-        done_stream(create_assistant_message(vec![text("done")], StopReason::Stop))
+        done_stream(create_assistant_message(
+            vec![text("done")],
+            StopReason::Stop,
+        ))
     });
     let agent = Agent::new(AgentOptions::new(create_model(), stream));
     agent.prompt_text("go").await.expect("prompt starts");

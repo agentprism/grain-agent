@@ -31,6 +31,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+use grain_agent_core::AgentOptions;
+
+use crate::resume::{ResumedAgent, resume_agent_from_session};
 use crate::session::{
     ForkPosition, Session, SessionError, SessionMetadata, SessionRepo, SessionStorage,
     SessionTreeEntry, SessionTreeEntryKind, uuidv7,
@@ -89,22 +92,114 @@ impl JsonlSessionStorage {
             _ => SessionError::Storage(format!("{}: {e}", lock_path.display())),
         })?;
 
+        // On-disk metadata wins when it exists. Callers routinely open a
+        // session from a synthetic `SessionMetadata::with_id(...)`, which
+        // carries nothing but the id; trusting that over the persisted record
+        // silently dropped everything else the session had recorded about
+        // itself (fork lineage, creation time, backend extras). The file is
+        // the truth — the argument is only a seed for a session that does not
+        // exist yet.
         let meta_path = dir.join(META_FILE);
-        if !meta_path.exists() {
-            let s = serde_json::to_string_pretty(&metadata)
-                .map_err(|e| SessionError::Storage(e.to_string()))?;
-            tokio::fs::write(&meta_path, s)
-                .await
-                .map_err(io_err(meta_path.display().to_string()))?;
+        let mut metadata = match tokio::fs::read_to_string(&meta_path).await {
+            Ok(raw) => serde_json::from_str::<SessionMetadata>(&raw).unwrap_or(metadata),
+            Err(_) => {
+                let s = serde_json::to_string_pretty(&metadata)
+                    .map_err(|e| SessionError::Storage(e.to_string()))?;
+                tokio::fs::write(&meta_path, s)
+                    .await
+                    .map_err(io_err(meta_path.display().to_string()))?;
+                metadata
+            }
+        };
+
+        // ...but the *id* is the directory, not the file.
+        //
+        // Everything else in `meta.json` describes the session; the id also
+        // names where it lives, and `SessionRepo::open` re-derives the
+        // directory from `metadata.id`. Letting a stale id inside the file win
+        // therefore rebinds the handle to a *different* session directory:
+        // restore a backup under a new name, copy a session to seed a worker,
+        // or simply rename the directory, and appends land in the session the
+        // file names rather than the one the caller opened — silent
+        // cross-session contamination of user work. The directory is the
+        // identity; the file's copy of it is advisory.
+        if let Some(dir_id) = dir.file_name().and_then(|n| n.to_str())
+            && metadata.id != dir_id
+        {
+            eprintln!(
+                "[warn] grain-agent-harness: {} records id {:?} but lives in \
+                 directory {:?}; using the directory name (the session was \
+                 probably copied, restored, or renamed)",
+                meta_path.display(),
+                metadata.id,
+                dir_id
+            );
+            metadata.id = dir_id.to_string();
         }
 
         let entries_path = dir.join(ENTRIES_FILE);
         let mut entries: Vec<SessionTreeEntry> = Vec::new();
         if entries_path.exists() {
-            let raw = tokio::fs::read_to_string(&entries_path)
+            // Read as BYTES, not text.
+            //
+            // A torn tail can split a multi-byte UTF-8 character — any emoji,
+            // CJK glyph, curly quote or em-dash caught mid-encoding. Decoding
+            // first means the read fails on the invalid tail and takes every
+            // intact entry in the file with it, turning a one-entry loss into
+            // an unopenable session. The repair below has to run in byte
+            // space, before anything tries to interpret the bytes as text.
+            let raw = tokio::fs::read(&entries_path)
                 .await
                 .map_err(io_err(entries_path.display().to_string()))?;
-            for (lineno, line) in raw.lines().enumerate() {
+
+            // Repair a torn tail before anything else reads or appends.
+            //
+            // A crash partway through `append_to_jsonl` leaves a final line
+            // with no terminating newline. Skipping it at parse time is not
+            // enough: the next append would concatenate onto the fragment,
+            // fusing garbage and a valid entry into one unparseable line and
+            // silently losing *that* entry too — and because the fused line
+            // is itself unterminated, every later crash/append cycle
+            // compounds it. Truncating to the last newline boundary makes the
+            // file exactly "all complete entries", which is the contract the
+            // rest of this module and its callers rely on. Safe to do here
+            // because the exclusive lock above is already held.
+            let complete_len = if raw.is_empty() || raw.ends_with(b"\n") {
+                raw.len()
+            } else {
+                let complete_len = raw
+                    .iter()
+                    .rposition(|b| *b == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&entries_path)
+                    .await
+                    .map_err(io_err(entries_path.display().to_string()))?;
+                file.set_len(complete_len as u64)
+                    .await
+                    .map_err(io_err(entries_path.display().to_string()))?;
+                file.sync_all()
+                    .await
+                    .map_err(io_err(entries_path.display().to_string()))?;
+                eprintln!(
+                    "[warn] grain-agent-harness: discarded {} byte(s) of a \
+                     partially-written trailing entry in {}",
+                    raw.len() - complete_len,
+                    entries_path.display()
+                );
+                complete_len
+            };
+
+            // Every *complete* line was written by `serde_json::to_string`, so
+            // the retained prefix is valid UTF-8 by construction. `lossy`
+            // rather than a hard error so that a byte-level corruption inside
+            // a complete line degrades to skipping that one entry (below)
+            // instead of failing the whole session open.
+            let text = String::from_utf8_lossy(&raw[..complete_len]);
+
+            for (lineno, line) in text.lines().enumerate() {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -346,7 +441,43 @@ impl JsonlSessionRepo {
         let Some(metadata) = Self::read_metadata_in(&dir).await else {
             return Err(SessionError::NotFound(format!("Session not found: {id}")));
         };
-        self.open(&metadata).await
+        // Open `dir` directly rather than routing through `open`, which
+        // re-derives the directory from `metadata.id`. When a session has been
+        // copied or restored under a different name, that id is stale and the
+        // round-trip would silently hand back a *different* session.
+        let storage = Arc::new(JsonlSessionStorage::open_or_init(dir, metadata).await?);
+        Ok(Session::new(storage))
+    }
+
+    /// Load session `id` from disk and rebuild an [`Agent`] carrying its
+    /// history — the one call a worker needs to come back after a host
+    /// restart.
+    ///
+    /// The returned agent both carries the recovered history *and* writes its
+    /// own turns back, so the loop below is durable across any number of
+    /// restarts, not just the first:
+    ///
+    /// ```no_run
+    /// # use grain_agent_harness::JsonlSessionRepo;
+    /// # use grain_agent_core::AgentOptions;
+    /// # async fn f(options: AgentOptions) -> Result<(), Box<dyn std::error::Error>> {
+    /// let repo = JsonlSessionRepo::new("/var/lib/agent/sessions")?;
+    /// let resumed = repo.resume_agent("worker-7", options).await?;
+    /// // Persisted as it completes — no manual append needed.
+    /// resumed.agent.prompt_text("carry on").await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Errors with [`SessionError::NotFound`] when no such session exists on
+    /// disk. See [`crate::resume`] for exactly what is and is not restored —
+    /// in particular the model, which the caller must resolve.
+    pub async fn resume_agent(
+        &self,
+        id: &str,
+        options: AgentOptions,
+    ) -> Result<ResumedAgent, SessionError> {
+        let session = self.open_id(id).await?;
+        resume_agent_from_session(&session, options).await
     }
 
     /// Open a session by id when it exists, otherwise create it.
@@ -434,11 +565,13 @@ impl SessionRepo for JsonlSessionRepo {
         let src_storage = JsonlSessionStorage::open_or_init(src_dir, source.clone()).await?;
         let fork_entries = compute_fork_entries(&src_storage, entry_id, position).await?;
 
+        // A fork records its origin, as upstream's JSONL header does.
         let metadata = if let Some(id) = id {
             SessionMetadata::with_id(id)
         } else {
             SessionMetadata::new()
-        };
+        }
+        .with_parent_session(source.id.clone());
         let dir = self.session_dir(&metadata.id);
         let storage = JsonlSessionStorage::open_or_init(dir, metadata).await?;
         for entry in fork_entries {

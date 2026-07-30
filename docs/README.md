@@ -81,6 +81,7 @@ Rust port of [`@earendil-works/pi-agent-core`](https://github.com/earendil-works
 | Topic | Doc | What it is |
 |-------|-----|------------|
 | Provider profiles | [providers.md](./providers.md) | Multi-vendor / multi-account / OAuth-subscription configuration; consumed by both `grain-headless` and `grain-tui` |
+| Claude Pro/Max OAuth | [oauth-claude-subscription-spec.md](./oauth-claude-subscription-spec.md) | **Specification, not yet implemented.** The subscription OAuth flow against upstream pi `34239180`: constants, PKCE, exchange/refresh, request shaping, and how today's implementation diverges |
 
 ### Project-wide
 
