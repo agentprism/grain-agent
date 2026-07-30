@@ -222,13 +222,14 @@ async fn main() {
 Any consumer that bills, budgets, or displays cost from
 `StreamEnd::captured_usage` over-reports Anthropic prompt tokens by ~2x.
 
-Critically, the error is **not correctable downstream**. `capture_usage`
-collapses `message_start` and `message_delta` into a single accumulator
-before anything is observable, and the streaming API exposes no other
-carrier for the raw values (`ChatStreamResponse` has only `stream` and
-`model_iden`; `ChatOptions::capture_raw_body` is not consulted by any
-streaming path). Two materially different streams therefore become
-byte-identical at the public API:
+Critically, the error **cannot be corrected from the streaming event API**.
+`capture_usage` collapses `message_start` and `message_delta` into a single
+accumulator before anything is observable, and no other carrier for the raw
+values reaches the consumer: `ChatStreamEvent` has one payload-bearing
+terminal (`End(StreamEnd)`), `ChatStreamResponse` exposes only `stream` and
+`model_iden`, and `ChatOptions::capture_raw_body` is not consulted by any
+streaming path. Two materially different streams therefore arrive
+byte-identical:
 
 | stream | provider truth | genai `StreamEnd` |
 |---|---|---|
@@ -236,10 +237,27 @@ byte-identical at the public API:
 | `message_start` 24, `message_delta` carries no `usage` | 24 | 24 |
 
 Both are legal Anthropic streams (the second is what proxies that omit
-usage from `message_delta` produce — and the `+= `-based code is in fact
-correct for that one). A downstream consumer cannot tell them apart, so it
-cannot apply any correction that is right for both. The fix has to live in
-the streamer.
+usage from `message_delta` produce — and the `+=`-based code is in fact
+correct for that one). Because the two are indistinguishable in
+`StreamEnd`, any correction a consumer applies to `captured_usage` returns
+the same answer for both, and exactly one of those answers is then wrong.
+
+There is exactly one workaround available to a consumer, and it is worth
+stating plainly rather than claiming none exists: because
+`ServiceTargetResolver` (and equally `WebConfig::with_proxy`,
+`AuthData::RequestOverride`, or `ModelSpec::Target`) lets the caller choose
+the endpoint genai connects to, a consumer can interpose a recording proxy
+between genai and the provider, tee the SSE body, and re-derive the true
+usage from the raw `message_start` / `message_delta` frames. We have this
+working. genai's own test suite does something similar
+(`tests/support/yakbak/server.rs`).
+
+That workaround is not a solution, because recovering the number means
+re-implementing Anthropic's SSE parsing outside the library — which is
+precisely the work the library exists to do, now duplicated and kept in sync
+by hand, plus a proxy hop on every request. A consumer who accepts that cost
+has largely stopped using genai's Anthropic streaming path. So the practical
+fix belongs in the streamer.
 
 ### 1.6 Still present on `main`
 
@@ -340,7 +358,46 @@ replayed on the following request for providers that require signed
 reasoning context. Without them the reasoning chain cannot be reconstructed
 across turns.
 
-### 2.6 Usage is only observable at `End`
+### 2.6 Anthropic `error` events are silently dropped mid-stream
+
+`src/adapter/adapters/anthropic/streamer.rs:242` ends the event match with
+
+```rust
+other => tracing::warn!("UNKNOWN MESSAGE TYPE: {other}"),
+```
+
+Anthropic's documented stream event set includes `error`, which the API emits
+mid-stream for conditions such as `overloaded_error` and
+`api_error`. It matches no arm, so it lands in `other`: logged at warn level
+and discarded. The streamer keeps polling, reaches end of body without ever
+seeing `message_stop`, and returns `Poll::Ready(None)`.
+
+The consumer therefore never receives an `End` event and never learns what
+the provider said. From the caller's side an explicit, actionable provider
+error (`{"type":"error","error":{"type":"overloaded_error","message":...}}`)
+is indistinguishable from a truncated connection. Surfacing the payload —
+either as a stream `Err` or as a terminal `End` carrying the provider's error
+— would let callers distinguish "retry, the provider is overloaded" from
+"the connection dropped".
+
+### 2.7 Anthropic `captured_thought_signatures` is hard-coded `None`
+
+`streamer.rs:233` builds `InterStreamEnd { …, captured_thought_signatures: None, … }`
+even though the same streamer emits `InterStreamEvent::ThoughtSignatureChunk`
+for `signature_delta` deltas a few lines earlier. The signatures stream to the
+consumer chunk by chunk but are absent from the terminal aggregate, unlike
+`captured_text_content`, `captured_reasoning_content` and
+`captured_tool_calls`, which are all populated.
+
+`StreamEnd::captured_thought_signatures()` and
+`into_assistant_message_for_tool_use()` consequently return nothing for
+Anthropic, so the documented "build the assistant message for a tool-use
+handoff" convenience silently loses the signatures that Anthropic requires on
+replay for signed thinking. A consumer must reconstruct them from the chunk
+events. The Gemini path populates the field, so this reads as an oversight in
+the Anthropic streamer rather than a deliberate asymmetry.
+
+### 2.8 Usage is only observable at `End`
 
 `ChatStreamEvent` has no usage-bearing variant other than `End(StreamEnd)`.
 Anthropic reports input tokens in `message_start`, before any content is
@@ -350,7 +407,7 @@ information has arrived on the wire but is held until the stream completes.
 An early usage event, or a usage field on the existing events, would expose
 what the provider already sent.
 
-### 2.7 Block boundaries are not observable
+### 2.9 Block boundaries are not observable
 
 Anthropic's `content_block_start` / `content_block_stop` are consumed
 internally and produce no event. Consumers must infer block transitions from

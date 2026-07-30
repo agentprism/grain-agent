@@ -16,8 +16,13 @@
 //!
 //! The load-bearing test is [`s3_double_count_is_indistinguishable_at_the_seam`]:
 //! it proves that the information needed to *correct* the S-3 Anthropic usage
-//! double-count never crosses genai's API, which is what makes S-3
-//! structurally unfixable at the adapter (as opposed to merely awkward).
+//! double-count never crosses genai's **streaming event API**. That scopes the
+//! claim precisely — it is a fact about `ChatStreamEvent`, not a claim that no
+//! adapter-side mechanism exists at any price. One does: genai lets the caller
+//! choose the endpoint it connects to, so a recording relay can tee the wire
+//! and re-derive the truth. That route is rejected on cost, not feasibility —
+//! see `SEAM-VECTORS.md` §6, "The endpoint-tee relay: possible, costed,
+//! rejected".
 
 use futures::StreamExt;
 use genai::ServiceTarget;
@@ -184,7 +189,8 @@ fn usage_of(end: &ChatStreamEvent) -> (i32, i32, i32) {
 }
 
 // ---------------------------------------------------------------------------
-// S-3 — the Anthropic usage double-count, and why it is unfixable above genai
+// S-3 — the Anthropic usage double-count, and why it is unrecoverable
+// from the streaming event API
 // ---------------------------------------------------------------------------
 
 /// **The S-3 impossibility proof.**
@@ -212,10 +218,19 @@ fn usage_of(end: &ChatStreamEvent) -> (i32, i32, i32) {
 /// wrong. Halving unconditionally would fix A and break B (B is a real
 /// upstream-asserted shape, and AV-4 pins it green today).
 ///
-/// This is what makes S-3 **structurally impossible at the adapter** rather
-/// than merely large: the corrective term — whether `message_delta` carried
-/// `input_tokens` at all — is destroyed inside genai before anything is
-/// observable.
+/// This is what makes S-3 **unrecoverable from `ChatStreamEvent`**: the
+/// corrective term — whether `message_delta` carried `input_tokens` at all —
+/// is destroyed inside genai before anything the streaming API exposes.
+///
+/// Scope note, because the distinction matters: this is *not* a proof that
+/// the adapter cannot fix S-3 by any means. genai lets the caller choose the
+/// endpoint it connects to (`ServiceTargetResolver`, `WebConfig::with_proxy`,
+/// `AuthData::RequestOverride`, `ModelSpec::Target`), so interposing a
+/// recording relay and re-parsing the wire does recover the true 12 vs 24 —
+/// this very test file uses that redirect mechanism to reach a local socket.
+/// That route is rejected because re-parsing Anthropic SSE ourselves is most
+/// of a provider backend, at which point keeping genai in the path buys
+/// nothing. See `SEAM-VECTORS.md` §6.
 #[tokio::test]
 async fn s3_double_count_is_indistinguishable_at_the_seam() {
     // Stream A: 12 at message_start, repeated 12 at message_delta.

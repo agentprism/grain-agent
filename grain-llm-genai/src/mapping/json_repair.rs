@@ -60,7 +60,7 @@ fn escape_control_character(c: char) -> String {
 }
 
 /// Repair malformed JSON **string literals**, mirroring upstream pi-ai's
-/// `repairJson` (`packages/ai/src/utils/json-parse.ts:39-83`) statement for
+/// `repairJson` (`packages/ai/src/utils/json-parse.ts:32-83`) statement for
 /// statement:
 ///
 /// - raw control characters (`U+0000`–`U+001F`) inside a string are escaped
