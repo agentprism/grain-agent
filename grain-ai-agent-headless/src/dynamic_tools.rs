@@ -419,6 +419,8 @@ mod tests {
             details: serde_json::json!({}),
             is_error: false,
             timestamp: 0,
+            usage: None,
+            added_tool_names: None,
         })];
         let decision = select_dynamic_tool_names(&tools, &prior, "continue");
         assert!(decision.names.contains(&"semble_rs".into()));

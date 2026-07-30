@@ -359,11 +359,13 @@ async fn ignores_tool_updates_after_execution_settles() {
                     content: vec![UserContent::text("running")],
                     details: json!({ "status": "running" }),
                     terminate: None,
+                    ..Default::default()
                 });
                 Ok(AgentToolResult {
                     content: vec![UserContent::text("ok")],
                     details: json!({ "status": "done" }),
                     terminate: Some(true),
+                    ..Default::default()
                 })
             })
         }),
@@ -391,6 +393,7 @@ async fn ignores_tool_updates_after_execution_settles() {
             content: vec![UserContent::text("late")],
             details: json!({ "status": "late" }),
             terminate: None,
+            ..Default::default()
         });
     }
     tokio::time::sleep(Duration::from_millis(0)).await;
@@ -429,6 +432,7 @@ async fn ignores_settled_parallel_tool_update_while_other_tool_running() {
                     content: vec![UserContent::text("done")],
                     details: json!({ "status": "done" }),
                     terminate: Some(true),
+                    ..Default::default()
                 })
             })
         }),
@@ -452,6 +456,7 @@ async fn ignores_settled_parallel_tool_update_while_other_tool_running() {
                     content: vec![UserContent::text("done")],
                     details: json!({ "status": "done" }),
                     terminate: Some(true),
+                    ..Default::default()
                 })
             })
         }),
@@ -500,6 +505,7 @@ async fn ignores_settled_parallel_tool_update_while_other_tool_running() {
             content: vec![UserContent::text("late")],
             details: json!({ "status": "late" }),
             terminate: None,
+            ..Default::default()
         });
     }
     tokio::time::sleep(Duration::from_millis(0)).await;
@@ -783,6 +789,7 @@ async fn prepare_next_turn_receives_run_cancellation_token() {
                     content: vec![UserContent::text("ok")],
                     details: json!({}),
                     terminate: None,
+                    ..Default::default()
                 })
             })
         }),

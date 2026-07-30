@@ -213,6 +213,7 @@ impl AgentTool for BashTool {
                         "totalOutputBytes": trunc.total_bytes,
                     }),
                     terminate: None,
+                    ..Default::default()
                 })
             }
             Outcome::Timeout => Err(AgentToolError::msg(format!(

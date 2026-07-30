@@ -129,6 +129,7 @@ impl AgentTool for ListTool {
                 "files": files.len(),
             }),
             terminate: None,
+            ..Default::default()
         })
     }
 }

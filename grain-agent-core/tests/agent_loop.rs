@@ -229,31 +229,100 @@ async fn applies_transform_context_before_convert_to_llm() {
 
 /// TS: "should handle tool calls and results"
 ///
-/// PARTIAL PORT (patch-9): upstream additionally asserts tool-result usage
-/// plumbing — `tool.execute` returns a `usage` reading, `afterToolCall`
-/// observes `result.usage` and replaces it, and the persisted toolResult
-/// message carries the patched usage. Rust `AgentToolResult`,
-/// `AfterToolCallResult`, and `ToolResultMessage` have no `usage` field
-/// (patch-9 type drift), so those assertions are untranslatable until WP4.
-/// The afterToolCall hook is kept in the ported test and asserts it observed
-/// the executed result.
+/// Full port including the upstream usage assertions (agent-loop.test.ts:
+/// 277-292, 320-323, 365-368): `tool.execute` returns a `usage` reading,
+/// `afterToolCall` observes `result.usage` equal to the tool's reading and
+/// replaces it via `{ usage: patched }`, and the persisted toolResult
+/// message carries the patched usage (patch-9 restored the plumbing).
 #[tokio::test]
 async fn handles_tool_calls_and_results() {
+    let tool_usage = grain_agent_core::Usage {
+        input: 1,
+        output: 2,
+        cache_read: 3,
+        cache_write: 4,
+        total_tokens: 10,
+        cost: grain_agent_core::Cost {
+            input: 0.1,
+            output: 0.2,
+            cache_read: 0.3,
+            cache_write: 0.4,
+            total: 1.0,
+        },
+        ..Default::default()
+    };
+    let patched_tool_usage = grain_agent_core::Usage {
+        input: 5,
+        output: 6,
+        cache_read: 7,
+        cache_write: 8,
+        total_tokens: 26,
+        cost: grain_agent_core::Cost {
+            input: 0.5,
+            output: 0.6,
+            cache_read: 0.7,
+            cache_write: 0.8,
+            total: 2.6,
+        },
+        ..Default::default()
+    };
+
     let executed: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    // Upstream echo tool extended with the usage reading returned by
+    // execute (agent-loop.test.ts:294-307).
+    let executed_capture = executed.clone();
+    let usage_for_tool = tool_usage.clone();
+    let tool = TestTool::new(
+        "echo",
+        "Echo",
+        "Echo tool",
+        value_schema(),
+        Arc::new(move |_id, args, _cancel, _on_update| {
+            let executed = executed_capture.clone();
+            let usage = usage_for_tool.clone();
+            Box::pin(async move {
+                let value = args
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                executed.lock().unwrap().push(value.clone());
+                Ok(AgentToolResult {
+                    content: vec![UserContent::text(format!("echoed: {value}"))],
+                    details: json!({ "value": value }),
+                    usage: Some(usage),
+                    ..Default::default()
+                })
+            })
+        }),
+    )
+    .arc();
     let context = AgentContext {
         system_prompt: "".into(),
         messages: vec![],
-        tools: vec![echo_tool(executed.clone())],
+        tools: vec![tool],
     };
 
     let observed_result_text: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+    let observed_tool_usage: Arc<StdMutex<Option<grain_agent_core::Usage>>> =
+        Arc::new(StdMutex::new(None));
     let mut config = AgentLoopConfig::new(create_model(), identity_converter());
     let observed_capture = observed_result_text.clone();
+    let observed_usage_capture = observed_tool_usage.clone();
+    let patched_for_hook = patched_tool_usage.clone();
     config.after_tool_call = Some(Arc::new(move |ctx, _cancel| {
         let observed = observed_capture.clone();
+        let observed_usage = observed_usage_capture.clone();
+        let patched = patched_for_hook.clone();
         Box::pin(async move {
             *observed.lock().unwrap() = content_text(&ctx.result.content);
-            Ok(None)
+            // TS: observedToolUsage = result.usage; return { usage: patched }
+            // (agent-loop.test.ts:320-323).
+            *observed_usage.lock().unwrap() = ctx.result.usage.clone();
+            Ok(Some(grain_agent_core::AfterToolCallResult {
+                usage: Some(patched),
+                ..Default::default()
+            }))
         })
     }));
 
@@ -274,7 +343,7 @@ async fn handles_tool_calls_and_results() {
     });
 
     let (sink, events) = recording_sink();
-    run_agent_loop(
+    let messages = run_agent_loop(
         vec![create_user_message("echo something")],
         context,
         config,
@@ -306,6 +375,17 @@ async fn handles_tool_calls_and_results() {
         observed_result_text.lock().unwrap().as_deref(),
         Some("echoed: hello")
     );
+    // TS: expect(observedToolUsage).toEqual(toolUsage) — the hook saw the
+    // execute-returned usage (agent-loop.test.ts:365).
+    assert_eq!(observed_tool_usage.lock().unwrap().clone(), Some(tool_usage));
+    // TS: the persisted toolResult message carries the patched usage
+    // (agent-loop.test.ts:366-368).
+    let tool_result = messages.iter().find_map(|m| match m {
+        AgentMessage::Standard(Message::ToolResult(tr)) => Some(tr.clone()),
+        _ => None,
+    });
+    let tool_result = tool_result.expect("expected a toolResult message");
+    assert_eq!(tool_result.usage, Some(patched_tool_usage));
 }
 
 /// TS: "should not execute tool calls from a length-truncated assistant message"
@@ -405,6 +485,7 @@ async fn executes_mutated_before_tool_call_args_without_revalidation() {
                     content: vec![UserContent::text(format!("echoed: {value}"))],
                     details: json!({ "value": value }),
                     terminate: None,
+                    ..Default::default()
                 })
             })
         }),
@@ -497,6 +578,7 @@ async fn prepares_tool_arguments_for_validation() {
                     content: vec![UserContent::text(format!("edited {count}"))],
                     details: json!({ "count": count }),
                     terminate: None,
+                    ..Default::default()
                 })
             })
         }),
@@ -602,6 +684,7 @@ async fn emits_tool_execution_end_in_completion_order_persists_results_in_source
                     content: vec![UserContent::text(format!("echoed: {value}"))],
                     details: json!({ "value": value }),
                     terminate: None,
+                    ..Default::default()
                 })
             })
         }),
@@ -827,6 +910,7 @@ async fn forces_sequential_when_tool_has_sequential_execution_mode() {
                     content: vec![UserContent::text(format!("slow: {value}"))],
                     details: json!({ "value": value }),
                     terminate: None,
+                    ..Default::default()
                 })
             })
         }),
@@ -914,6 +998,7 @@ async fn forces_sequential_when_one_of_multiple_tools_is_sequential() {
                     content: vec![UserContent::text(format!("slow: {value}"))],
                     details: json!({ "value": value }),
                     terminate: None,
+                    ..Default::default()
                 })
             })
         }),
@@ -941,6 +1026,7 @@ async fn forces_sequential_when_one_of_multiple_tools_is_sequential() {
                     content: vec![UserContent::text(format!("fast: {value}"))],
                     details: json!({ "value": value }),
                     terminate: None,
+                    ..Default::default()
                 })
             })
         }),
@@ -1029,6 +1115,7 @@ async fn allows_parallel_when_all_tools_parallel() {
                     content: vec![UserContent::text(format!("echoed: {value}"))],
                     details: json!({ "value": value }),
                     terminate: None,
+                    ..Default::default()
                 })
             })
         }),
@@ -1273,6 +1360,7 @@ async fn stops_after_tool_batch_when_all_results_terminate() {
                     content: vec![UserContent::text(format!("echoed: {value}"))],
                     details: json!({ "value": value }),
                     terminate: Some(true),
+                    ..Default::default()
                 })
             })
         }),
@@ -1336,6 +1424,7 @@ async fn continues_after_parallel_tool_calls_when_not_all_terminate() {
                     content: vec![UserContent::text(format!("echoed: {value}"))],
                     details: json!({ "value": value }),
                     terminate: Some(terminate),
+                    ..Default::default()
                 })
             })
         }),

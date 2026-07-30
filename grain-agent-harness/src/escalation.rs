@@ -149,6 +149,8 @@ mod tests {
             tool_name: "grep".into(),
             content: vec![UserContent::Text(TextContent { text: "x".into() })],
             details: serde_json::Value::Null,
+            usage: None,
+            added_tool_names: None,
             is_error,
             timestamp: 0,
         }

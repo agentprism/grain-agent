@@ -487,3 +487,170 @@ async fn forwards_provider_extras_to_stream_options() {
     .await;
     assert!(response_seen.load(Ordering::SeqCst));
 }
+
+// ---------------------------------------------------------------------------
+// patch-9: type drift vs. upstream
+// (upstream: StopReason "pending" pi-ai types.ts:391; Usage.cacheWrite1h /
+//  Usage.reasoning types.ts:368-389; ThinkingLevel "max"
+//  packages/agent/src/types.ts:294; AgentToolResult.usage/.addedToolNames
+//  types.ts:354-369; toolResult spread-merge agent-loop.ts:773-787)
+// ---------------------------------------------------------------------------
+
+/// StopReason::Pending and ThinkingLevel::Max use the upstream wire names.
+#[test]
+fn stop_reason_pending_and_thinking_level_max_wire_names() {
+    use grain_agent_core::ThinkingLevel;
+    assert_eq!(
+        serde_json::to_value(StopReason::Pending).unwrap(),
+        json!("pending")
+    );
+    assert_eq!(
+        serde_json::from_value::<StopReason>(json!("pending")).unwrap(),
+        StopReason::Pending
+    );
+    assert_eq!(
+        serde_json::to_value(ThinkingLevel::Max).unwrap(),
+        json!("max")
+    );
+    assert_eq!(
+        serde_json::from_value::<ThinkingLevel>(json!("max")).unwrap(),
+        ThinkingLevel::Max
+    );
+}
+
+/// Usage carries cacheWrite1h and reasoning with upstream wire names, and
+/// omits them when absent (they are optional in pi-ai types.ts:373-380).
+#[test]
+fn usage_cache_write_1h_and_reasoning_wire_format() {
+    use grain_agent_core::Usage;
+    let usage = Usage {
+        input: 10,
+        output: 20,
+        cache_read: 1,
+        cache_write: 2,
+        cache_write_1h: Some(2),
+        reasoning: Some(0),
+        total_tokens: 30,
+        ..Default::default()
+    };
+    let wire = serde_json::to_value(&usage).unwrap();
+    assert_eq!(wire["cacheWrite1h"], json!(2));
+    // Some(0) is meaningful: providers with a reasoning breakdown report 0.
+    assert_eq!(wire["reasoning"], json!(0));
+
+    let round: Usage = serde_json::from_value(wire).unwrap();
+    assert_eq!(round, usage);
+
+    // Absent fields stay off the wire and deserialize to None.
+    let bare = serde_json::to_value(Usage::default()).unwrap();
+    assert!(bare.get("cacheWrite1h").is_none());
+    assert!(bare.get("reasoning").is_none());
+}
+
+/// AgentToolResult.addedToolNames flows into the persisted toolResult
+/// message only when non-empty (the upstream conditional spread,
+/// agent-loop.ts:783), and tool-result usage flows through unconditionally.
+#[tokio::test]
+async fn added_tool_names_spread_into_tool_result_message_only_when_non_empty() {
+    use grain_agent_core::{Message, Usage};
+
+    // Tool 1 returns addedToolNames + usage; tool 2 returns an empty list.
+    let tool = TestTool::new(
+        "spawner",
+        "Spawner",
+        "Introduces tools",
+        value_schema(),
+        Arc::new(move |_id, args, _cancel, _on_update| {
+            Box::pin(async move {
+                let value = args
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let added = if value == "with" {
+                    Some(vec!["new_tool".to_string()])
+                } else {
+                    Some(Vec::new())
+                };
+                Ok(AgentToolResult {
+                    content: vec![UserContent::text("ok")],
+                    details: json!({}),
+                    usage: Some(Usage {
+                        input: 7,
+                        ..Default::default()
+                    }),
+                    added_tool_names: added,
+                    ..Default::default()
+                })
+            })
+        }),
+    )
+    .arc();
+
+    let context = AgentContext {
+        system_prompt: "".into(),
+        messages: vec![],
+        tools: vec![tool],
+    };
+    let config = AgentLoopConfig::new(create_model(), identity_converter());
+
+    let stream = FnStream::new(|n, _model, _ctx, _opts, _cancel| {
+        if n == 0 {
+            done_stream(create_assistant_message(
+                vec![
+                    tool_call("tool-1", "spawner", json!({ "value": "with" })),
+                    tool_call("tool-2", "spawner", json!({ "value": "without" })),
+                ],
+                StopReason::ToolUse,
+            ))
+        } else {
+            done_stream(create_assistant_message(
+                vec![text("done")],
+                StopReason::Stop,
+            ))
+        }
+    });
+
+    let (sink, _events) = recording_sink();
+    let messages = run_agent_loop(
+        vec![create_user_message("go")],
+        context,
+        config,
+        sink,
+        CancellationToken::new(),
+        stream,
+    )
+    .await
+    .expect("loop failed");
+
+    let tool_results: Vec<_> = messages
+        .iter()
+        .filter_map(|m| match m {
+            grain_agent_core::AgentMessage::Standard(Message::ToolResult(tr)) => Some(tr.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_results.len(), 2);
+    assert_eq!(
+        tool_results[0].added_tool_names,
+        Some(vec!["new_tool".to_string()])
+    );
+    // Empty list is dropped, matching `addedToolNames?.length ? ... : {}`.
+    assert_eq!(tool_results[1].added_tool_names, None);
+    for tr in &tool_results {
+        assert_eq!(
+            tr.usage,
+            Some(Usage {
+                input: 7,
+                ..Default::default()
+            })
+        );
+    }
+
+    // Wire name check: the serialized toolResult message uses camelCase
+    // addedToolNames and omits it when absent.
+    let wire = serde_json::to_value(&tool_results[0]).unwrap();
+    assert_eq!(wire["addedToolNames"], json!(["new_tool"]));
+    let wire = serde_json::to_value(&tool_results[1]).unwrap();
+    assert!(wire.get("addedToolNames").is_none());
+}

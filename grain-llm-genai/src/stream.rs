@@ -145,15 +145,17 @@ fn chat_options_with_runtime(base: ChatOptions, options: &StreamOptions) -> Chat
 /// | `Medium`              | `Medium`                |
 /// | `High`                | `High`                  |
 /// | `XHigh`               | `XHigh`                 |
+/// | `Max`                 | `Max`                   |
 ///
-/// genai additionally offers `ReasoningEffort::Max` and
-/// `ReasoningEffort::Budget(u32)`, which have no grain-side counterpart
-/// yet — they stay unmapped until a later WP adds the corresponding
-/// `ThinkingLevel` variants. (The historical `XHigh` → `High` collapse was
-/// stale adapter code: every genai release this adapter has pinned —
-/// 0.6.0-beta.20 onward — already had `ReasoningEffort::XHigh`, so the
-/// collapse silently downgraded the user's intent for no reason. It was
-/// removed in the 0.6.5 migration; `XHigh` now passes through unchanged.)
+/// genai additionally offers `ReasoningEffort::Budget(u32)`, which has no
+/// grain-side counterpart yet — it stays unmapped until a later WP adds a
+/// budget-based `ThinkingLevel` variant. `Max` maps directly since WP4's
+/// patch-9 added `ThinkingLevel::Max`. (The historical `XHigh` → `High`
+/// collapse was stale adapter code: every genai release this adapter has
+/// pinned — 0.6.0-beta.20 onward — already had `ReasoningEffort::XHigh`,
+/// so the collapse silently downgraded the user's intent for no reason. It
+/// was removed in the 0.6.5 migration; `XHigh` now passes through
+/// unchanged.)
 ///
 /// Forward-compat note: the genai 0.7 line renames `ReasoningEffort::None`
 /// to `ReasoningEffort::Zero` (with `#[serde(alias = "None")]`), so on that
@@ -166,6 +168,7 @@ fn thinking_level_to_effort(level: ThinkingLevel) -> Option<ReasoningEffort> {
         ThinkingLevel::Medium => Some(ReasoningEffort::Medium),
         ThinkingLevel::High => Some(ReasoningEffort::High),
         ThinkingLevel::XHigh => Some(ReasoningEffort::XHigh),
+        ThinkingLevel::Max => Some(ReasoningEffort::Max),
     }
 }
 

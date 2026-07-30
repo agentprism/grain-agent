@@ -67,6 +67,7 @@ impl AgentTool for SourceInfoTool {
             content: vec![UserContent::text(body)],
             details: serde_json::json!({}),
             terminate: None,
+            ..Default::default()
         })
     }
 }

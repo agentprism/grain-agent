@@ -87,11 +87,17 @@ pub struct AfterToolCallContext {
     pub context: Arc<AgentContext>,
 }
 
+/// Partial override returned from `afterToolCall`. Field-by-field merge
+/// semantics per upstream (`packages/agent/src/types.ts:66-90` @ 34239180):
+/// provided fields replace the executed tool-result values wholesale;
+/// omitted fields keep the originals. No deep merge.
 #[derive(Debug, Default, Clone)]
 pub struct AfterToolCallResult {
     pub content: Option<Vec<UserContent>>,
     pub details: Option<serde_json::Value>,
     pub is_error: Option<bool>,
+    /// Replaces the tool-result usage reading (agent-loop.ts:738).
+    pub usage: Option<Usage>,
     pub terminate: Option<bool>,
 }
 
@@ -1248,11 +1254,15 @@ async fn finalize_executed_owned(
         };
         match hook(after_ctx, cancel.clone()).await {
             Ok(Some(after)) => {
+                // agent-loop.ts:734-741 — `afterResult.X ?? result.X` merge.
                 if let Some(content) = after.content {
                     result.content = content;
                 }
                 if let Some(details) = after.details {
                     result.details = details;
+                }
+                if let Some(usage) = after.usage {
+                    result.usage = Some(usage);
                 }
                 if let Some(t) = after.terminate {
                     result.terminate = Some(t);
@@ -1291,11 +1301,20 @@ fn should_terminate(finalized: &[FinalizedCall]) -> bool {
 }
 
 fn make_tool_result_message(finalized: &FinalizedCall) -> ToolResultMessage {
+    // Port of createToolResultMessage (agent-loop.ts:773-787): the finalized
+    // result's usage carries over, and addedToolNames is included only when
+    // non-empty (the upstream conditional spread at agent-loop.ts:783).
     ToolResultMessage {
         tool_call_id: finalized.tool_call.id.clone(),
         tool_name: finalized.tool_call.name.clone(),
         content: finalized.result.content.clone(),
         details: finalized.result.details.clone(),
+        usage: finalized.result.usage.clone(),
+        added_tool_names: finalized
+            .result
+            .added_tool_names
+            .clone()
+            .filter(|names| !names.is_empty()),
         is_error: finalized.is_error,
         timestamp: current_time_ms(),
     }

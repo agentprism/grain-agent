@@ -111,6 +111,7 @@ impl AgentTool for WriteTool {
                 "overwrote": existed,
             }),
             terminate: None,
+            ..Default::default()
         })
     }
 }
