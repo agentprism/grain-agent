@@ -128,6 +128,8 @@ mod tests {
             api: "openai".into(),
             provider: "openai".into(),
             model: "gpt-x".into(),
+            response_id: None,
+            response_model: None,
             usage: Default::default(),
             stop_reason: StopReason::Stop,
             error_message: None,

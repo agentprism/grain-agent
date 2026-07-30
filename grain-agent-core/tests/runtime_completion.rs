@@ -473,3 +473,134 @@ async fn dynamic_api_key_overrides_static_and_falls_back_to_it() {
     let empty: GetApiKeyFn = Arc::new(|_provider| Box::pin(async { None }));
     assert_eq!(resolve(Some(empty)).await.as_deref(), Some("sk-static"));
 }
+
+// ---------------------------------------------------------------------------
+// Carrying slots: response_model / response_id (seam gaps S-6 / S-2)
+// ---------------------------------------------------------------------------
+
+/// Both identifiers ride the terminal event through the loop onto the
+/// transcript, unchanged. `response_model` differing from `model` is the
+/// normal case they exist for — the requested id is a request, the response
+/// model is what answered.
+#[tokio::test]
+async fn response_model_and_id_cross_the_provider_seam() {
+    let stream = FnStream::new(|_n, _model, _ctx, _opts, _cancel| {
+        done_stream(AssistantMessage {
+            response_model: Some("anthropic/claude-sonnet-4".into()),
+            response_id: Some("msg_01XYZ".into()),
+            ..create_assistant_message(vec![text("ok")], StopReason::Stop)
+        })
+    });
+
+    let agent = Agent::new(AgentOptions::new(create_model(), stream));
+    agent.prompt_text("hi").await.expect("prompt failed");
+
+    let state = agent.state().await;
+    let last = state
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            AgentMessage::Standard(Message::Assistant(a)) => Some(a.clone()),
+            _ => None,
+        })
+        .expect("no assistant message in transcript");
+
+    assert_eq!(
+        last.response_model.as_deref(),
+        Some("anthropic/claude-sonnet-4")
+    );
+    assert_eq!(last.response_id.as_deref(), Some("msg_01XYZ"));
+    assert_eq!(
+        last.model, "mock",
+        "the requested model id must stay as requested"
+    );
+}
+
+/// Locally synthesized failures never reached a provider, so neither slot is
+/// invented.
+#[tokio::test]
+async fn locally_synthesized_failures_carry_no_response_identifiers() {
+    let stream =
+        FnStream::new(|_n, _model, _ctx, _opts, _cancel| futures::stream::iter(Vec::new()).boxed());
+
+    let agent = Agent::new(AgentOptions::new(create_model(), stream));
+    agent.prompt_text("hi").await.expect("prompt failed");
+
+    let last = agent
+        .state()
+        .await
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            AgentMessage::Standard(Message::Assistant(a)) => Some(a.clone()),
+            _ => None,
+        })
+        .expect("no assistant message in transcript");
+
+    assert_eq!(last.response_model, None);
+    assert_eq!(last.response_id, None);
+}
+
+/// Wire shape: upstream's camelCase keys, omitted when absent, and older
+/// transcripts without them still load.
+#[test]
+fn response_identifier_wire_shape_matches_upstream() {
+    let msg = AssistantMessage {
+        response_model: Some("anthropic/claude-sonnet-4".into()),
+        response_id: Some("msg_01XYZ".into()),
+        ..create_assistant_message(vec![text("x")], StopReason::Stop)
+    };
+    let v = serde_json::to_value(&msg).unwrap();
+    assert_eq!(v["responseModel"], json!("anthropic/claude-sonnet-4"));
+    assert_eq!(v["responseId"], json!("msg_01XYZ"));
+
+    let bare = create_assistant_message(vec![text("x")], StopReason::Stop);
+    let v = serde_json::to_value(&bare).unwrap();
+    assert!(
+        v.get("responseModel").is_none() && v.get("responseId").is_none(),
+        "absent identifiers must not appear on the wire"
+    );
+
+    let round: AssistantMessage =
+        serde_json::from_value(serde_json::to_value(&msg).unwrap()).unwrap();
+    assert_eq!(
+        round.response_model.as_deref(),
+        Some("anthropic/claude-sonnet-4")
+    );
+    assert_eq!(round.response_id.as_deref(), Some("msg_01XYZ"));
+
+    // A transcript written before these fields existed still deserializes.
+    let legacy = json!({
+        "content": [], "api": "openai-responses", "provider": "openai",
+        "model": "mock", "stopReason": "stop", "timestamp": 0
+    });
+    let parsed: AssistantMessage = serde_json::from_value(legacy).unwrap();
+    assert_eq!(parsed.response_model, None);
+    assert_eq!(parsed.response_id, None);
+}
+
+/// The four optional carrying slots are independent: populating one must not
+/// disturb the others, since adapters fill them from different wire events.
+#[test]
+fn carrying_slots_are_independent() {
+    let only_id = AssistantMessage {
+        response_id: Some("msg_1".into()),
+        ..create_assistant_message(vec![text("x")], StopReason::Stop)
+    };
+    assert_eq!(only_id.response_model, None);
+    assert_eq!(only_id.raw_stop_reason, None);
+
+    let only_raw = AssistantMessage {
+        raw_stop_reason: Some("refusal".into()),
+        ..create_assistant_message(vec![text("x")], StopReason::Stop)
+    };
+    assert_eq!(only_raw.response_id, None);
+    assert_eq!(only_raw.response_model, None);
+
+    let v = serde_json::to_value(&only_id).unwrap();
+    assert_eq!(v["responseId"], json!("msg_1"));
+    assert!(v.get("responseModel").is_none());
+    assert!(v.get("rawStopReason").is_none());
+}

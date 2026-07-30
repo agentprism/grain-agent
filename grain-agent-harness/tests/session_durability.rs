@@ -59,6 +59,8 @@ impl LlmStream for Replier {
             api: model.api.clone(),
             provider: model.provider.clone(),
             model: model.id.clone(),
+            response_id: None,
+            response_model: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             raw_stop_reason: None,

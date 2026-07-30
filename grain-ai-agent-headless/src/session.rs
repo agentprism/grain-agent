@@ -205,6 +205,8 @@ mod tests {
             api: "t".into(),
             provider: "t".into(),
             model: "t".into(),
+            response_id: None,
+            response_model: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             raw_stop_reason: None,

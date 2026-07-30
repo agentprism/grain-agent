@@ -409,6 +409,8 @@ mod tests {
             api: "openai".into(),
             provider: "openai".into(),
             model: model.into(),
+            response_id: None,
+            response_model: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             raw_stop_reason: None,

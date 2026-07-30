@@ -55,6 +55,8 @@ pub fn create_assistant_message(
         api: "openai-responses".into(),
         provider: "openai".into(),
         model: "mock".into(),
+        response_id: None,
+        response_model: None,
         usage: Usage::default(),
         stop_reason,
         error_message: None,

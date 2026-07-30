@@ -351,6 +351,26 @@ pub struct AssistantMessage {
     pub api: String,
     pub provider: String,
     pub model: String,
+    /// The model the provider actually served, when it differs from the
+    /// requested [`Self::model`].
+    ///
+    /// Port of pi-ai `AssistantMessage.responseModel`
+    /// (`packages/ai/src/types.ts:405` @ 34239180: "Concrete `chunk.model`
+    /// when different from the requested `model` (e.g. OpenRouter `auto` ->
+    /// `anthropic/...`)"). Routing front-ends and aliases mean the requested
+    /// id is a request, not a fact; this is what answered. `None` when the
+    /// adapter has nothing to report or the served model matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_model: Option<String>,
+    /// The provider's identifier for this response.
+    ///
+    /// Port of pi-ai `AssistantMessage.responseId`
+    /// (`packages/ai/src/types.ts:406` @ 34239180: "Provider-specific
+    /// response/message identifier when the upstream API exposes one") —
+    /// e.g. Anthropic's `message.id`. The handle for correlating a
+    /// transcript entry with provider-side logs and billing records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
     #[serde(default)]
     pub usage: Usage,
     pub stop_reason: StopReason,

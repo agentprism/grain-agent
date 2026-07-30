@@ -625,6 +625,8 @@ fn empty_assistant(model: &Model) -> AssistantMessage {
         api: model.api.clone(),
         provider: model.provider.clone(),
         model: model.id.clone(),
+        response_id: None,
+        response_model: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
         // WP19 mechanical fill only. Mapping genai's terminal stop string

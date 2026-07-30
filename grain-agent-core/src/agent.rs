@@ -680,6 +680,8 @@ impl Agent {
                     api: g.model.api.clone(),
                     provider: g.model.provider.clone(),
                     model: g.model.id.clone(),
+                    response_id: None,
+                    response_model: None,
                     usage: Usage::default(),
                     stop_reason: if aborted {
                         StopReason::Aborted

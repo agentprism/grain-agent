@@ -1425,6 +1425,8 @@ mod tests {
                 api: "stub".into(),
                 provider: "stub".into(),
                 model: "stub-model".into(),
+                response_id: None,
+                response_model: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
