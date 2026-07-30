@@ -105,6 +105,17 @@ impl GenaiStream {
 ///   onto genai's `ReasoningEffort` variants 1:1 by name; see
 ///   [`thinking_level_to_effort`]).
 ///
+/// **Always enforced**, regardless of what the builder-provided base
+/// options say:
+/// - `capture_usage`: the `LlmStream` terminal contract maps
+///   `StreamEnd::captured_usage` into the final message's `Usage`; without
+///   the flag genai never populates it.
+/// - `capture_tool_calls`: genai 0.6.5's OpenAI streamer only merges
+///   tool-call fragments into id-stable cumulative chunks when this is on
+///   (`adapter/adapters/openai/streamer.rs::capture_tool_call`); with it
+///   off, follow-up fragments arrive under a synthetic `call_{index}` id
+///   and the inbound accumulator would treat them as new calls.
+///
 /// **Not yet honored** (the genai 0.5 API doesn't expose per-call slots
 /// for these, so wiring them up requires a fuller refactor of the client
 /// builder; see the M-2 code-review entry):
@@ -112,7 +123,7 @@ impl GenaiStream {
 /// - `session_id` / `transport`: provider-specific transport knobs.
 /// - `max_retry_delay_ms`: WebConfig is set at client build time.
 fn chat_options_with_runtime(base: ChatOptions, options: &StreamOptions) -> ChatOptions {
-    let mut chat = base;
+    let mut chat = base.with_capture_usage(true).with_capture_tool_calls(true);
     if let Some(level) = options.reasoning
         && let Some(effort) = thinking_level_to_effort(level)
     {
@@ -232,5 +243,36 @@ impl LlmStream for GenaiStream {
         };
 
         Ok(Box::pin(out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_options_enforce_usage_and_tool_call_capture() {
+        // Even when a caller supplies bare ChatOptions via the builder
+        // (dropping the baseline capture flags), the per-request projection
+        // must re-enable the captures the adapter's correctness depends on.
+        let bare = ChatOptions::default();
+        let projected = chat_options_with_runtime(bare, &StreamOptions::default());
+        assert_eq!(projected.capture_usage, Some(true));
+        assert_eq!(projected.capture_tool_calls, Some(true));
+    }
+
+    #[test]
+    fn runtime_options_map_thinking_level() {
+        let projected = chat_options_with_runtime(
+            ChatOptions::default(),
+            &StreamOptions {
+                reasoning: Some(ThinkingLevel::XHigh),
+                ..StreamOptions::default()
+            },
+        );
+        assert!(matches!(
+            projected.reasoning_effort,
+            Some(ReasoningEffort::XHigh)
+        ));
     }
 }

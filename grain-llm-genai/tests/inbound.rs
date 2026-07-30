@@ -599,6 +599,38 @@ fn aborted_mid_stream_flushes_pending_signature() {
 }
 
 #[test]
+fn captured_usage_maps_cache_details() {
+    let usage = genai::chat::Usage {
+        prompt_tokens: Some(1000),
+        completion_tokens: Some(50),
+        total_tokens: Some(1050),
+        prompt_tokens_details: Some(genai::chat::PromptTokensDetails {
+            cache_creation_tokens: Some(200),
+            cache_creation_details: None,
+            cached_tokens: Some(700),
+            audio_tokens: None,
+        }),
+        ..Default::default()
+    };
+    let end = ChatStreamEvent::End(StreamEnd {
+        captured_usage: Some(usage),
+        ..Default::default()
+    });
+    let (events, _) = run([ChatStreamEvent::Start, chunk("hi"), end]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.usage.input, 1000);
+        assert_eq!(result.usage.output, 50);
+        assert_eq!(result.usage.total_tokens, 1050);
+        assert_eq!(result.usage.cache_read, 700);
+        assert_eq!(result.usage.cache_write, 200);
+        // No genai-side counterpart: stays default; the loop computes cost.
+        assert_eq!(result.usage.cost, grain_agent_core::Cost::default());
+    } else {
+        panic!();
+    }
+}
+
+#[test]
 fn duplicate_start_event_is_idempotent() {
     let (events, _) = run([ChatStreamEvent::Start, ChatStreamEvent::Start, end_normal()]);
     let starts = events
