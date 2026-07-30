@@ -170,8 +170,9 @@ impl InboundState {
 
     fn on_thought_signature(&mut self, content: String) -> Vec<AssistantMessageEvent> {
         // Anthropic-style signed thinking: silently update the open thinking
-        // block's `signature`. No separate grain event — subscribers see the
-        // updated signature on the next partial.
+        // block's `signature` (grain's natural slot,
+        // `ThinkingContent::signature`). No separate grain event —
+        // subscribers see the updated signature on the next partial.
         if let Some(OpenBlock::Thinking { index }) = self.open
             && let AssistantContent::Thinking(t) = &mut self.blocks[index]
         {
@@ -180,6 +181,12 @@ impl InboundState {
                 None => t.signature = Some(content),
             }
         }
+        // TODO(WP3: thought-signature mapping): a signature chunk arriving
+        // with no thinking block open (e.g. a provider that emits the
+        // signature after the block closed, or before any reasoning text)
+        // is currently consumed without being attached anywhere. WP3
+        // decides where such orphan signatures land; until then this is a
+        // deliberate no-panic no-op rather than a silent `unreachable!`.
         Vec::new()
     }
 
