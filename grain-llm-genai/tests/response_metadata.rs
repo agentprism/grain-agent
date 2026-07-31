@@ -3,10 +3,14 @@
 //!
 //! These three fields were "structural gaps" for as long as
 //! `grain_agent_core::AssistantMessage` had nowhere to put them. WP19 added
-//! the slots; this transport is the one place in the workspace where the
-//! values genuinely exist, because it parses the Anthropic event stream
-//! itself instead of going through genai (whose Anthropic streamer hard-codes
-//! `captured_response_id: None` and never reads `chunk.model`).
+//! the slots; for `response_id` and `response_model` this transport is the
+//! one place in the workspace where the values genuinely exist, because it
+//! parses the Anthropic event stream itself instead of going through genai
+//! (whose Anthropic streamer hard-codes `captured_response_id: None` and
+//! never reads `chunk.model`). `raw_stop_reason` is populated here too —
+//! and, since WP32, on the default genai path as well (the raw string
+//! crosses genai inside every `StopReason` variant; see
+//! `mapping::inbound` and `tests/inbound.rs`).
 //!
 //! The unit tests in `src/anthropic/state.rs` drive the state machine
 //! directly. These drive the WHOLE transport over a real socket —

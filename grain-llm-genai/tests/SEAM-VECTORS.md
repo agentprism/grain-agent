@@ -9,7 +9,19 @@ standard.
 - genai version under measurement: **0.6.5** (workspace pin).
 - Harness: `tests/seam_vectors.rs`.
 
-**WP25 status (this revision).** The Anthropic vectors now run through the
+**WP32 status (this revision).** **AB-R1 is closed.** The default genai path
+now assigns the provider's verbatim stop string into
+`AssistantMessage::raw_stop_reason` (`mapping::inbound::on_end`, from
+`StopReason::raw()` — the raw string was always preserved inside every genai
+variant; only the assignment was missing). Every vector's terminal comparison
+now asserts the field, which turns upstream's previously-excluded
+`rawStopReason` legs (OV-1, OV-2, GV-1, GV-2, AV-2, AV-3) into pinned
+behavior. **No count moves: 11 PASS / 2 STRUCTURAL stands** — the six vectors
+that gained the assertion were already PASS on their representable remainder;
+they are now PASS with nothing excluded. The two STRUCTURAL vectors (OV-3,
+OV-6) are blocked by genai for other fields and are unaffected.
+
+**WP25 status (prior revision).** The Anthropic vectors now run through the
 **native Anthropic transport** (`src/anthropic/`), a second `LlmStream`
 behind the same seam, built because the WP21 measurement below showed the gaps
 unreachable from `ChatStreamEvent` and the one alternative route (an
@@ -111,7 +123,7 @@ Grain protocol: `grain-agent-core::AssistantMessageEvent`.
 |---|---|---|
 | `content[]` (text/thinking/toolCall) | `content: Vec<AssistantContent>` | mapped; `toolCall.thoughtSignature` now HAS a grain slot (`ToolCall::thought_signature`, WP19) but no producer on either path — genai drops `reasoning_details` (S-7), and the Anthropic wire carries no signature on `tool_use` at all |
 | `stopReason` stop/length/toolUse/error/aborted | `StopReason` Stop/Length/ToolUse/Error/Aborted | mapped; upstream's mid-stream `"pending"` placeholder has no grain variant — grain partials carry the default `Stop` (cosmetic, excluded from comparison) |
-| `rawStopReason` | — none | **AB-R1** (info crosses genai; grain drops it) |
+| `rawStopReason` | `raw_stop_reason` | mapped (**AB-R1 closed**, WP32): the verbatim provider string genai preserves inside every `StopReason` variant is assigned at `on_end`; asserted on every vector's terminal |
 | `errorMessage` | `error_message` | mapped |
 | `usage.input` (cache-**exclusive**) | `usage.input` (cache-**inclusive**, see `Cost::cost_for`) | convention differs; numerically equal whenever cache counters are 0 (all vectors here) |
 | `usage.output/cacheRead/cacheWrite/totalTokens` | `output/cache_read/cache_write/total_tokens` | mapped (total via AB-2 fallback when the wire omits it; see AB-2 divergence notes in §5) |
@@ -138,13 +150,20 @@ with tool-call content streamed — we mirror upstream per provider rather
 than generalizing over it. Pinned by unit tests in `tests/inbound.rs`
 (`gemini_completed_with_tool_calls_overrides_to_tool_use`,
 `anthropic_end_turn_with_tool_calls_stays_stop`,
-`captured_pause_turn_is_resubmittable_stop`).
+`captured_pause_turn_is_resubmittable_stop`). The verbatim raw string is
+assigned separately from this mapping (WP32,
+`InboundState::on_end` → `AssistantMessage::raw_stop_reason`) and pinned
+by `captured_stop_reason_raw_string_is_preserved_verbatim`,
+`error_class_stop_reasons_also_carry_the_raw_string`,
+`missing_captured_stop_reason_leaves_raw_none`, and
+`locally_synthesized_terminals_carry_no_raw_stop_reason` in the same file.
 
 ## 3. Comparison scope
 
 Asserted per vector: exact event-kind sequence, `content_index` per event,
 `delta` payloads verbatim, and the full terminal message (content blocks,
-stop reason, error message, usage incl. cost struct).
+stop reason, raw provider stop string, error message, usage incl. cost
+struct).
 
 Excluded and tracked as named gaps instead (so one cross-cutting gap does
 not smear every vector into STRUCTURAL):
@@ -156,11 +175,15 @@ not smear every vector into STRUCTURAL):
   variant; cosmetic);
 - `timestamp`, `model`/`api`/`provider` echoes;
 - `usage.reasoning` (**AB-R2**) — inventoried below with the vectors
-  upstream asserts it on. `rawStopReason` (**AB-R1**) and `responseId`
-  (**S-2**) no longer belong on this list for the NATIVE transport: both
-  now have grain slots (WP19) and are populated and asserted
-  (`tests/response_metadata.rs`). They remain unassertable on the **genai**
-  path, which is what the vectors in this file exercise.
+  upstream asserts it on. `rawStopReason` (**AB-R1**, closed WP32),
+  `responseId` (**S-2**) no longer belong on this list at all for
+  `raw_stop_reason` and partially for the rest: `raw_stop_reason` is
+  populated on BOTH paths (the genai adapter assigns it from
+  `StopReason::raw()`; the native transport from `message_delta`) and every
+  vector asserts it; `responseId` has a grain slot (WP19) populated and
+  asserted on the native transport (`tests/response_metadata.rs`) but
+  remains unassertable on the **genai** path, which never populates
+  `captured_response_id`.
 
 STRUCTURAL vectors assert the *upstream-translated* expectation and are
 intentionally **red** under `cargo test -- --ignored`; the red is the
@@ -178,13 +201,13 @@ explicit `structural gap` panic naming the unrepresentable field.
 | AV-3 | anthropic | `anthropic-sse-parsing.test.ts` | preserves sensitive stop reasons with a descriptive error message | **PASS** (native transport) | Was S-3. `message_delta.usage` now replaces rather than adds: 12/0/12, not 24/24 |
 | AV-4 | anthropic | `anthropic-sse-parsing.test.ts` | treats message_delta without usage as a no-op for usage accumulation | **PASS** (native transport) | Passed on genai too; on the native path the same green comes from replacement semantics skipping absent fields — the case that makes an unconditional halving of genai's total unsound |
 | AV-5 | anthropic | `anthropic-sse-parsing.test.ts` | ignores unknown SSE events after message_stop | **PASS** (native transport) | Was S-3. 12/5/17, not 24/5/29. Trailing junk frames are never read: the transport stops at the terminal |
-| OV-1 | openai-completions | `openai-completions-raw-stop-reason.test.ts` | preserves raw finish reasons for successful stops | **PASS** | Events/stop/usage exact. Upstream's `rawStopReason === "stop"` leg is AB-R1, still excluded — but **no longer blocked**: the slot exists (WP19) and the raw string DOES cross genai (preserved inside every `StopReason` variant). What is missing is only the assignment in `mapping::inbound::resolve_stop_reason`. Deliberately not done here: that is the DEFAULT path, so it is a live behavior change needing its own verification, unlike the opt-in transport WP27 wired |
-| OV-2 | openai-completions | `openai-completions-raw-stop-reason.test.ts` | preserves raw finish reasons for provider error stops | **PASS** | Fixed by AB-1 (was: silent `Done/Stop`). Error event + `Provider finish_reason: content_filter` exact. `rawStopReason` → AB-R1 |
+| OV-1 | openai-completions | `openai-completions-raw-stop-reason.test.ts` | preserves raw finish reasons for successful stops | **PASS** | Events/stop/usage exact, and since WP32 the `rawStopReason === "stop"` leg is asserted too — AB-R1 closed. The slot arrived in WP19, the raw string always crossed genai (preserved inside every `StopReason` variant), and the assignment landed in `mapping::inbound::on_end`. Nothing about this vector is excluded anymore |
+| OV-2 | openai-completions | `openai-completions-raw-stop-reason.test.ts` | preserves raw finish reasons for provider error stops | **PASS** | Fixed by AB-1 (was: silent `Done/Stop`). Error event + `Provider finish_reason: content_filter` exact; `rawStopReason === "content_filter"` asserted since WP32 (AB-R1 closed) |
 | OV-3 | openai-completions | `openai-completions-response-model.test.ts` | surfaces routed chunk.model on responseModel without changing model | **STRUCTURAL** | S-6: `chunk.model` never crosses genai (grain's `response_model` slot now exists and the native transport fills it — this vector is genai-blocked only). Representable remainder (text events, stop, usage 10/5/15) passes |
 | OV-4 | openai-completions | `openai-completions-response-model.test.ts` | leaves responseModel undefined when chunks echo the requested id | **PASS** | Absence semantics vacuously exact; usage total 2 via AB-2 |
 | OV-5 | openai-completions | `openai-completions-response-model.test.ts` | ignores empty or missing chunk.model | **PASS** | Two text deltas aggregate; usage total 3 via AB-2 |
 | OV-6 | openai-completions (openrouter-flavored) | `openai-completions-reasoning-details.test.ts` | preserves reasoning_details that arrive before their matching tool call | **STRUCTURAL** | S-7: `delta.reasoning_details` never crosses genai; grain `ToolCall` has no signature slot. Representable remainder (toolcall events, args, toolUse stop) passes |
-| GV-1 | google-generative-ai | `google-raw-stop-reason.test.ts` | preserves raw Gemini finish reasons for Google Generative AI errors (`MALFORMED_FUNCTION_CALL`) | **PASS** | Fixed by AB-1 (was: silent `Done/Stop`). Error + `Provider stopped with: MALFORMED_FUNCTION_CALL`, usage 1/0/1 exact. `rawStopReason` → AB-R1 |
+| GV-1 | google-generative-ai | `google-raw-stop-reason.test.ts` | preserves raw Gemini finish reasons for Google Generative AI errors (`MALFORMED_FUNCTION_CALL`) | **PASS** | Fixed by AB-1 (was: silent `Done/Stop`). Error + `Provider stopped with: MALFORMED_FUNCTION_CALL`, usage 1/0/1 exact; `rawStopReason === "MALFORMED_FUNCTION_CALL"` asserted since WP32 (AB-R1 closed) |
 | GV-2 | google-vertex | `google-raw-stop-reason.test.ts` | preserves raw Gemini finish reasons for Google Vertex errors (`SAFETY`) | **PASS** | Fixed by AB-1. Upstream drives this through the vertex transport; the wire (GenerateContentResponse SSE) is identical. genai 0.6.5 does have a dedicated Vertex adapter (`AdapterKind::Vertex`) — the collapse onto the gemini wire is grain's routing (`ProviderRouter`: `google → gemini`; no grain models route to the Vertex adapter today) |
 
 ## 5. Summary
@@ -196,9 +219,13 @@ explicit `structural gap` panic naming the unrepresentable field.
 
 Movement since WP21 (7 PASS / 6 STRUCTURAL): **AV-1, AV-2, AV-3, AV-5** moved
 STRUCTURAL → PASS when the Anthropic vectors were routed through the native
-transport. The two remaining STRUCTURAL vectors are openai-completions
-(OV-3 responseModel, OV-6 reasoning_details); both need a genai change *and* a
-grain-agent-core field, so neither is reachable from any backend work here.
+transport (WP25). WP32 moved no vector — it widened what PASS means: the
+terminal comparison now also asserts `raw_stop_reason`, so the six upstream
+`rawStopReason` legs previously excluded as AB-R1 are pinned inside the
+existing greens. The two remaining STRUCTURAL vectors are openai-completions
+(OV-3 responseModel, OV-6 reasoning_details); their grain-side slots exist
+(WP19), so both are blocked solely on genai surfacing the value at the seam —
+not reachable from any backend or adapter work here.
 | ADAPTER-BUG (vector left failing) | 0 | — |
 
 Adapter bugs found while building the vectors:
@@ -261,18 +288,26 @@ Adapter bugs found while building the vectors:
   `zero_as_none` turns a wire `reasoning_tokens: 0` into `None`, so
   upstream's `Some(0)` is not reproducible. Not asserted by any vector at
   the pin (fixtures carry 0).
+- **AB-R1 (closed, WP32)** — `rawStopReason` was dropped. The raw provider
+  string always crossed genai (every `genai::chat::StopReason` variant
+  wraps it: `Completed("stop")`, `ContentFilter("SAFETY")`,
+  `Other("MALFORMED_FUNCTION_CALL")`, …) but at measurement time grain's
+  `AssistantMessage` had no field to carry it — a public core-type change,
+  reported rather than made. WP19 added the slot
+  (`AssistantMessage::raw_stop_reason`, rust-host ledger 13) and the
+  native Anthropic transport populated it for its provider (WP27); WP32
+  completed the picture by assigning `StopReason::raw()` in
+  `mapping::inbound::on_end` on the DEFAULT genai path, verbatim and
+  before normalization, exactly where upstream assigns it
+  (`openai-completions.ts:459`, `google-generative-ai.ts:215`,
+  `google-vertex.ts:232`, `anthropic-messages.ts:709`). Locally
+  synthesized terminals (abort, transport error, missing captured reason)
+  stay `None`, matching upstream's undefined. Asserted on every vector's
+  terminal here, and in isolation by four unit tests in
+  `tests/inbound.rs`. Upstream asserts it on OV-1, OV-2, AV-2, AV-3,
+  GV-1, GV-2 — all six legs are now pinned.
 
-**Reported, not fixed (requires a grain-agent-core type change, out of
-adapter scope):**
-
-- **AB-R1** — `rawStopReason` is dropped. The raw provider string *does*
-  cross genai (every `genai::chat::StopReason` variant wraps it:
-  `Completed("stop")`, `ContentFilter("SAFETY")`,
-  `Other("MALFORMED_FUNCTION_CALL")`, …) but grain's `AssistantMessage`
-  has no `raw_stop_reason` field to carry it. Adding one is a public
-  core-type change (every struct literal in the workspace + the pi-compat
-  serialization surface). Upstream asserts it on OV-1, OV-2, AV-2, AV-3,
-  GV-1, GV-2.
+No reported-not-fixed adapter bugs remain at this revision.
 
 ## 6. Structural gap list
 

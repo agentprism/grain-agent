@@ -24,10 +24,11 @@
 //!
 //! Comparison scope (documented in SEAM-VECTORS.md §3): event kind order,
 //! `content_index`, `delta` payloads, and the full terminal message
-//! (content blocks, stop reason, error message, usage). Timestamps,
-//! mid-stream `partial` usage (structural gap S-1: genai only surfaces
-//! usage at `End`), and fields with no grain slot (`rawStopReason`,
-//! `responseId`) are excluded and tracked as named gaps instead.
+//! (content blocks, stop reason, RAW provider stop string, error message,
+//! usage). Timestamps, mid-stream `partial` usage (structural gap S-1:
+//! genai only surfaces usage at `End`), and fields with no producer at this
+//! seam (`responseId` on the genai path) are excluded and tracked as named
+//! gaps instead.
 
 use futures::StreamExt;
 use genai::ServiceTarget;
@@ -227,6 +228,12 @@ async fn run_anthropic_vector(
 struct Terminal {
     content: Vec<AssistantContent>,
     stop: StopReason,
+    /// Upstream `rawStopReason`: the provider's verbatim stop string,
+    /// assigned unconditionally whenever the wire carried one
+    /// (`openai-completions.ts:459`, `google-generative-ai.ts:215`,
+    /// `google-vertex.ts:232`, `anthropic-messages.ts:709` at the pin).
+    /// Asserted on every vector since WP32 closed AB-R1.
+    raw_stop: Option<&'static str>,
     error_message: Option<String>,
     usage: Usage,
 }
@@ -300,26 +307,28 @@ fn assert_terminal(
     vector: &str,
     position: usize,
     expected: &Terminal,
-    actual_stop: StopReason,
-    actual_content: &[AssistantContent],
-    actual_error: Option<&str>,
-    actual_usage: &Usage,
+    actual: &grain_agent_core::AssistantMessage,
 ) {
     assert_eq!(
-        actual_stop, expected.stop,
+        actual.stop_reason, expected.stop,
         "[{vector}] terminal event #{position}: stop_reason mismatch"
     );
     assert_eq!(
-        actual_error,
+        actual.raw_stop_reason.as_deref(),
+        expected.raw_stop,
+        "[{vector}] terminal event #{position}: raw_stop_reason mismatch"
+    );
+    assert_eq!(
+        actual.error_message.as_deref(),
         expected.error_message.as_deref(),
         "[{vector}] terminal event #{position}: error_message mismatch"
     );
     assert_eq!(
-        actual_content, expected.content,
+        actual.content, expected.content,
         "[{vector}] terminal event #{position}: content mismatch"
     );
     assert_eq!(
-        actual_usage, &expected.usage,
+        actual.usage, expected.usage,
         "[{vector}] terminal event #{position}: usage mismatch"
     );
 }
@@ -389,15 +398,7 @@ fn assert_events(vector: &str, actual: &[AssistantMessageEvent], expected: &[Exp
                 );
             }
             (AssistantMessageEvent::Done { result }, Expect::Done(t)) => {
-                assert_terminal(
-                    vector,
-                    i,
-                    t,
-                    result.stop_reason,
-                    &result.content,
-                    result.error_message.as_deref(),
-                    &result.usage,
-                );
+                assert_terminal(vector, i, t, result);
             }
             (AssistantMessageEvent::Error { error, result }, Expect::Error(t)) => {
                 assert_eq!(
@@ -405,15 +406,7 @@ fn assert_events(vector: &str, actual: &[AssistantMessageEvent], expected: &[Exp
                     t.error_message.as_deref(),
                     "[{vector}] event #{i} (Error): error string mismatch"
                 );
-                assert_terminal(
-                    vector,
-                    i,
-                    t,
-                    result.stop_reason,
-                    &result.content,
-                    result.error_message.as_deref(),
-                    &result.usage,
-                );
+                assert_terminal(vector, i, t, result);
             }
             _ => panic!(
                 "[{vector}] event #{i}: expected {e:?}, got {} .\nActual:\n  {dump}",
@@ -676,6 +669,7 @@ async fn av1_anthropic_repairs_malformed_sse_and_tool_json() {
                     json!({"path": "A\\H", "text": "col1\tcol2"}),
                 )],
                 stop: StopReason::ToolUse,
+                raw_stop: Some("tool_use"),
                 error_message: None,
                 usage: usage_of(12, 5, 17),
             }),
@@ -731,6 +725,9 @@ async fn av2_anthropic_preserves_refusal_stop_details() {
             Expect::Error(Terminal {
                 content: vec![],
                 stop: StopReason::Error,
+                // Upstream asserts this leg explicitly:
+                // `expect(result.rawStopReason).toBe("refusal")`.
+                raw_stop: Some("refusal"),
                 error_message: Some(REFUSAL_EXPLANATION.to_string()),
                 usage: usage_of(412, 0, 412),
             }),
@@ -780,6 +777,8 @@ async fn av3_anthropic_sensitive_stop_reason() {
             Expect::Error(Terminal {
                 content: vec![],
                 stop: StopReason::Error,
+                // Upstream: `expect(result.rawStopReason).toBe("sensitive")`.
+                raw_stop: Some("sensitive"),
                 error_message: Some("Provider stopped with: sensitive".to_string()),
                 usage: usage_of(12, 0, 12),
             }),
@@ -831,6 +830,7 @@ async fn av4_anthropic_message_delta_without_usage_is_noop() {
             Expect::Done(Terminal {
                 content: vec![text_block("Hello")],
                 stop: StopReason::Stop,
+                raw_stop: Some("end_turn"),
                 error_message: None,
                 usage: usage_of(12, 0, 12),
             }),
@@ -871,6 +871,7 @@ async fn av5_anthropic_ignores_unknown_events_after_message_stop() {
             Expect::Done(Terminal {
                 content: vec![text_block("Hello")],
                 stop: StopReason::Stop,
+                raw_stop: Some("end_turn"),
                 error_message: None,
                 usage: usage_of(12, 5, 17),
             }),
@@ -885,9 +886,10 @@ async fn av5_anthropic_ignores_unknown_events_after_message_stop() {
 /// OV-1 — upstream test/openai-completions-raw-stop-reason.test.ts:
 /// "preserves raw finish reasons for successful stops". PASS.
 ///
-/// Upstream also asserts `rawStopReason === "stop"` — the raw string
-/// crosses genai (`StopReason::Completed("stop")`) but grain's
-/// `AssistantMessage` has no slot for it: reported gap AB-R1.
+/// Upstream's `rawStopReason === "stop"` leg is asserted since WP32: the
+/// raw string crosses genai inside `StopReason::Completed("stop")` and the
+/// inbound adapter now assigns it into `AssistantMessage::raw_stop_reason`
+/// (AB-R1 closed — the slot arrived in WP19, the assignment in WP32).
 #[tokio::test]
 async fn ov1_openai_preserves_raw_finish_reason_stop() {
     let sse = openai_sse(&[json!({
@@ -910,6 +912,8 @@ async fn ov1_openai_preserves_raw_finish_reason_stop() {
             Expect::Done(Terminal {
                 content: vec![],
                 stop: StopReason::Stop,
+                // Upstream: `expect(message.rawStopReason).toBe("stop")`.
+                raw_stop: Some("stop"),
                 error_message: None,
                 usage: usage_of(0, 0, 0),
             }),
@@ -919,7 +923,8 @@ async fn ov1_openai_preserves_raw_finish_reason_stop() {
 
 /// OV-2 — upstream test/openai-completions-raw-stop-reason.test.ts:
 /// "preserves raw finish reasons for provider error stops". PASS since
-/// adapter fix AB-1 (previously reported a clean `Stop`).
+/// adapter fix AB-1 (previously reported a clean `Stop`); the
+/// `rawStopReason === "content_filter"` leg asserted since WP32 (AB-R1).
 #[tokio::test]
 async fn ov2_openai_content_filter_finish_reason_is_error() {
     let sse = openai_sse(&[json!({
@@ -938,6 +943,9 @@ async fn ov2_openai_content_filter_finish_reason_is_error() {
             Expect::Error(Terminal {
                 content: vec![],
                 stop: StopReason::Error,
+                // Upstream:
+                // `expect(message.rawStopReason).toBe("content_filter")`.
+                raw_stop: Some("content_filter"),
                 error_message: Some("Provider finish_reason: content_filter".to_string()),
                 usage: usage_of(0, 0, 0),
             }),
@@ -984,6 +992,7 @@ async fn ov3_openai_routed_response_model_surfaces() {
             Expect::Done(Terminal {
                 content: vec![text_block("hi")],
                 stop: StopReason::Stop,
+                raw_stop: Some("stop"),
                 error_message: None,
                 usage: usage_of(10, 5, 15),
             }),
@@ -1039,6 +1048,7 @@ async fn ov4_openai_response_model_echo_stays_unset() {
             Expect::Done(Terminal {
                 content: vec![text_block("hi")],
                 stop: StopReason::Stop,
+                raw_stop: Some("stop"),
                 error_message: None,
                 usage: usage_of(1, 1, 2),
             }),
@@ -1087,6 +1097,7 @@ async fn ov5_openai_ignores_empty_or_missing_chunk_model() {
             Expect::Done(Terminal {
                 content: vec![text_block("hi!")],
                 stop: StopReason::Stop,
+                raw_stop: Some("stop"),
                 error_message: None,
                 usage: usage_of(1, 2, 3),
             }),
@@ -1157,6 +1168,7 @@ async fn ov6_openai_reasoning_details_attach_to_tool_call() {
                     json!({"path": "README.md"}),
                 )],
                 stop: StopReason::ToolUse,
+                raw_stop: Some("tool_calls"),
                 error_message: None,
                 usage: usage_of(0, 0, 0),
             }),
@@ -1179,7 +1191,8 @@ async fn ov6_openai_reasoning_details_attach_to_tool_call() {
 
 /// GV-1 — upstream: "preserves raw Gemini finish reasons for Google
 /// Generative AI errors" (MALFORMED_FUNCTION_CALL). PASS since adapter fix
-/// AB-1 (previously reported a clean `Stop`).
+/// AB-1 (previously reported a clean `Stop`); the `rawStopReason ===
+/// "MALFORMED_FUNCTION_CALL"` leg asserted since WP32 (AB-R1).
 #[tokio::test]
 async fn gv1_google_malformed_function_call_is_error() {
     let sse = gemini_sse(&[json!({
@@ -1207,6 +1220,9 @@ async fn gv1_google_malformed_function_call_is_error() {
             Expect::Error(Terminal {
                 content: vec![],
                 stop: StopReason::Error,
+                // Upstream: `expect(message.rawStopReason)
+                //     .toBe("MALFORMED_FUNCTION_CALL")`.
+                raw_stop: Some("MALFORMED_FUNCTION_CALL"),
                 error_message: Some("Provider stopped with: MALFORMED_FUNCTION_CALL".to_string()),
                 usage: usage_of(1, 0, 1),
             }),
@@ -1250,6 +1266,8 @@ async fn gv2_google_vertex_safety_is_error() {
             Expect::Error(Terminal {
                 content: vec![],
                 stop: StopReason::Error,
+                // Upstream: `expect(message.rawStopReason).toBe("SAFETY")`.
+                raw_stop: Some("SAFETY"),
                 error_message: Some("Provider stopped with: SAFETY".to_string()),
                 usage: usage_of(1, 0, 1),
             }),
