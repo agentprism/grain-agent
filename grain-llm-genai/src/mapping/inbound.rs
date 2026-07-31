@@ -398,6 +398,23 @@ impl InboundState {
         }
         result.timestamp = now_ms();
 
+        // WP32 (rust-host ledger item 13; closes WP5 AB-R1): carry the
+        // provider's VERBATIM stop string alongside the normalized reason.
+        // genai preserves it inside every `StopReason` variant
+        // (`StopReason::raw()`), and upstream pi-ai assigns it at the moment
+        // the raw reason arrives, before mapping and unconditionally —
+        // `output.rawStopReason = choice.finish_reason`
+        // (`openai-completions.ts:459`), `= candidate.finishReason`
+        // (`google-generative-ai.ts:215`, `google-vertex.ts:232`),
+        // `= event.delta.stop_reason` (`anthropic-messages.ts:709`), all at
+        // pin 34239180. Locally synthesized terminals (abort, transport
+        // error, a stream that ends without a captured reason) have no
+        // provider string and stay `None`, matching upstream's undefined.
+        result.raw_stop_reason = end
+            .captured_stop_reason
+            .as_ref()
+            .map(|reason| reason.raw().to_string());
+
         // WP5 (adapter-bug AB-1, seam vectors OV-1/OV-2/GV-1/GV-2/AV-3):
         // genai 0.6.5 delivers the provider's finish reason on
         // `StreamEnd::captured_stop_reason` — with the raw provider string
@@ -554,11 +571,11 @@ impl StopResolution {
 /// (`openai-completions.ts` `mapStopReason`), everything else as
 /// `Provider stopped with: <raw>` (`anthropic-messages.ts`,
 /// `google-generative-ai.ts`). The raw provider string is available here
-/// because genai preserves it inside every `StopReason` variant.
-/// `AssistantMessage::raw_stop_reason` now exists to carry it (WP19,
-/// rust-host ledger item 13); wiring the raw string into that slot is
-/// adapter work this function does not yet do — the residual gap formerly
-/// reported as WP5 AB-R1.
+/// because genai preserves it inside every `StopReason` variant, and since
+/// WP32 [`InboundState::on_end`] assigns it verbatim into
+/// `AssistantMessage::raw_stop_reason` (rust-host ledger item 13; the
+/// residual gap formerly reported as WP5 AB-R1 is closed — see the
+/// assignment site for the upstream references).
 fn resolve_stop_reason(
     captured: Option<&genai::chat::StopReason>,
     content: &[AssistantContent],
@@ -631,9 +648,9 @@ fn empty_assistant(model: &Model) -> AssistantMessage {
         response_model: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
-        // WP19 mechanical fill only. Mapping genai's terminal stop string
-        // into this slot is adapter work owned by the concurrent
-        // grain-llm-genai package.
+        // Stays `None` on partials and on locally synthesized terminals;
+        // `on_end` overwrites it with the verbatim provider stop string when
+        // genai captured one (WP32, rust-host ledger item 13).
         raw_stop_reason: None,
         error_message: None,
         error_code: None,

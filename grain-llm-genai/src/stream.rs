@@ -110,6 +110,19 @@ impl GenaiStream {
             .then_some(native)
     }
 
+    /// Public introspection of the routing decision in
+    /// [`Self::native_anthropic_for`]: would `model` be served by the native
+    /// Anthropic transport rather than genai?
+    ///
+    /// Exists so consumers that opt in via
+    /// [`GenaiStreamBuilder::with_native_anthropic_transport`] can PIN their
+    /// construction choice in their own test suites (the AgentPrism host
+    /// does) without reaching into private fields: `true` only when the
+    /// opt-in was set *and* `model` routes to the anthropic namespace.
+    pub fn uses_native_anthropic_for(&self, model: &Model) -> bool {
+        self.native_anthropic_for(model).is_some()
+    }
+
     /// Translate a grain model id (`"anthropic/claude-sonnet-4-5"`) into the
     /// `"<namespace>::<model>"` form genai dispatches on. Provider names with
     /// no `/` pass through unchanged so callers can also feed genai-native
@@ -354,6 +367,7 @@ mod tests {
                 .native_anthropic_for(&model_id("anthropic/claude-haiku-4-5"))
                 .is_none()
         );
+        assert!(!stream.uses_native_anthropic_for(&model_id("anthropic/claude-haiku-4-5")));
     }
 
     /// Opting in routes Anthropic to the native transport — and nothing else.
@@ -370,11 +384,16 @@ mod tests {
                 .is_some(),
             "anthropic models must use the native transport when opted in"
         );
+        assert!(
+            stream.uses_native_anthropic_for(&model_id("anthropic/claude-haiku-4-5")),
+            "the public routing probe must agree with the private routing decision"
+        );
         for other in ["openai/gpt-5", "google/gemini-2.5-pro", "deepseek/deepseek-chat"] {
             assert!(
                 stream.native_anthropic_for(&model_id(other)).is_none(),
                 "{other} must stay on genai"
             );
+            assert!(!stream.uses_native_anthropic_for(&model_id(other)));
         }
     }
 

@@ -947,6 +947,103 @@ fn missing_captured_stop_reason_keeps_inference() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WP32 — raw_stop_reason assignment (rust-host ledger 13; closes WP5 AB-R1).
+// Upstream pi-ai sets `output.rawStopReason` to the provider's verbatim
+// string whenever one arrives, before and independent of normalization
+// (openai-completions.ts:459, google-generative-ai.ts:215,
+// google-vertex.ts:232, anthropic-messages.ts:709 @ 34239180). Seam-level
+// coverage is in tests/seam_vectors.rs (every vector asserts the field);
+// these pin the state-machine assignment in isolation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn captured_stop_reason_raw_string_is_preserved_verbatim() {
+    // Every genai variant wraps the raw provider string; the assignment must
+    // be variant-agnostic and verbatim. `end_turn` and `stop` both normalize
+    // to `Stop`, so the raw channel is what keeps them distinguishable.
+    use genai::chat::StopReason as G;
+    for (captured, expected_raw) in [
+        (G::Completed("end_turn".to_string()), "end_turn"),
+        (G::Completed("stop".to_string()), "stop"),
+        (G::StopSequence("stop_sequence".to_string()), "stop_sequence"),
+        (G::MaxTokens("max_tokens".to_string()), "max_tokens"),
+        (G::ToolCall("tool_calls".to_string()), "tool_calls"),
+        (G::Other("pause_turn".to_string()), "pause_turn"),
+    ] {
+        let (events, _) = run([ChatStreamEvent::Start, end_with_stop(captured)]);
+        if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+            assert_eq!(
+                result.raw_stop_reason.as_deref(),
+                Some(expected_raw),
+                "the provider's verbatim stop string must survive onto the terminal"
+            );
+        } else {
+            panic!("expected Done, got {:?}", events.last());
+        }
+    }
+}
+
+#[test]
+fn error_class_stop_reasons_also_carry_the_raw_string() {
+    // Upstream asserts rawStopReason on its ERROR-leg vectors too
+    // (content_filter, SAFETY, MALFORMED_FUNCTION_CALL, refusal,
+    // sensitive): the raw channel matters most where normalization
+    // collapses distinct provider outcomes onto `StopReason::Error`.
+    use genai::chat::StopReason as G;
+    for (captured, expected_raw) in [
+        (G::ContentFilter("SAFETY".to_string()), "SAFETY"),
+        (G::Other("refusal".to_string()), "refusal"),
+        (
+            G::Other("MALFORMED_FUNCTION_CALL".to_string()),
+            "MALFORMED_FUNCTION_CALL",
+        ),
+    ] {
+        let (events, _) = run([ChatStreamEvent::Start, end_with_stop(captured)]);
+        match events.last().unwrap() {
+            AssistantMessageEvent::Error { result, .. } => {
+                assert_eq!(result.stop_reason, StopReason::Error);
+                assert_eq!(result.raw_stop_reason.as_deref(), Some(expected_raw));
+            }
+            other => panic!("expected Error terminal, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn missing_captured_stop_reason_leaves_raw_none() {
+    // No provider string arrived → nothing to preserve. Inventing one here
+    // would turn the inference fallback into a fake provider statement.
+    let (events, _) = run([ChatStreamEvent::Start, chunk("hi"), end_normal()]);
+    if let AssistantMessageEvent::Done { result } = events.last().unwrap() {
+        assert_eq!(result.raw_stop_reason, None);
+    } else {
+        panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+#[test]
+fn locally_synthesized_terminals_carry_no_raw_stop_reason() {
+    // Aborts and transport errors are grain-side outcomes, not provider
+    // statements; upstream leaves rawStopReason undefined on them
+    // (mirrors grain-agent-core/tests/runtime_completion.rs).
+    let mut state = InboundState::new(&model());
+    state.on_event(ChatStreamEvent::Start);
+    if let AssistantMessageEvent::Error { result, .. } = state.into_aborted() {
+        assert_eq!(result.raw_stop_reason, None);
+    } else {
+        panic!("expected Error terminal");
+    }
+
+    let mut state = InboundState::new(&model());
+    state.on_event(ChatStreamEvent::Start);
+    if let AssistantMessageEvent::Error { result, .. } = state.into_error_msg("upstream 500") {
+        assert_eq!(result.raw_stop_reason, None);
+    } else {
+        panic!("expected Error terminal");
+    }
+}
+
 #[test]
 fn usage_total_falls_back_to_components_when_wire_omits_it() {
     // AB-2 (seam vectors OV-4/OV-5): genai's OpenAI streamer passes an
