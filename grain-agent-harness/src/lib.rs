@@ -30,6 +30,31 @@
 //!   `AgentHarnessOptions` forwards `on_payload` / `on_response` /
 //!   `thinking_budgets` to `grain_agent_core::StreamOptions`.
 
+// ---------------------------------------------------------------------------
+// Pre-existing clippy debt (DEBT.md G33), scoped so CI can run `-D warnings`.
+//
+// CI lints the workspace with `cargo clippy --workspace --all-targets --
+// -D warnings`. This crate carries 2 findings that predate that job. Rather
+// than weaken the gate to report-only — which would never catch anything —
+// each lint is allowed HERE and ONLY here, so:
+//   - any OTHER lint in this crate still fails CI;
+//   - these same lints still fail CI in every other crate;
+//   - closing G33 means deleting the two attributes below, nothing else.
+//
+// These are crate-root attributes rather than Cargo.toml `[lints]` on
+// purpose: manifest lint levels are emitted BEFORE the trailing `-D warnings`
+// on clippy's command line, so rustc's last-flag-wins ordering lets
+// `-D warnings` override them. Source attributes are scoped inside the crate
+// and take precedence over command-line levels, so they actually hold.
+//
+// Owner: WP19 grain-product backlog (G33). Do not add entries here to
+// silence NEW findings — fix those instead.
+// ---------------------------------------------------------------------------
+// src/session.rs:164 — large size difference between `SessionEntry` variants.
+#![allow(clippy::large_enum_variant)]
+// src/session.rs:637 — `if` collapsible into the outer `match`.
+#![allow(clippy::collapsible_match)]
+
 pub mod agent_harness;
 pub mod compaction;
 pub mod context_guard;

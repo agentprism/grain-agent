@@ -29,6 +29,39 @@
 // modules; enable selectively on the public API surface once that
 // surface stabilises.
 // #![warn(missing_docs)]
+//
+// ---------------------------------------------------------------------------
+// Pre-existing clippy debt (DEBT.md G33), scoped so CI can run `-D warnings`.
+//
+// CI lints the workspace with `cargo clippy --workspace --all-targets --
+// -D warnings`. This crate carries 7 findings that predate that job. Rather
+// than weaken the gate to report-only — which would never catch anything —
+// each lint is allowed HERE and ONLY here, so:
+//   - any OTHER lint in this crate still fails CI;
+//   - these same lints still fail CI in every other crate;
+//   - closing G33 means deleting the three attributes below, nothing else.
+//
+// These are crate-root attributes rather than Cargo.toml `[lints]` on
+// purpose: manifest lint levels are emitted BEFORE the trailing `-D warnings`
+// on clippy's command line, so rustc's last-flag-wins ordering lets
+// `-D warnings` override them. Source attributes are scoped inside the crate
+// and take precedence over command-line levels, so they actually hold.
+//
+// Owner: WP19 grain-product backlog (G33). Do not add entries here to
+// silence NEW findings — fix those instead.
+// ---------------------------------------------------------------------------
+// src/agent_worker.rs:870 — `.filter(..).next()` should be `.find(..)`.
+#![allow(clippy::filter_next)]
+// src/app.rs:2047, :2052, :3204 — `if` collapsible into the outer `match`.
+#![allow(clippy::collapsible_match)]
+// src/run.rs:323 (8/7), src/ui.rs:649 (9/7), src/ui.rs:3249 (8/7) — render
+// and run entrypoints that thread widget/layout state positionally.
+#![allow(clippy::too_many_arguments)]
+// src/ui.rs:853 — `if let ... else { return None }` that reads as `?`.
+// Same pre-existing code as the rest of this list, but only surfaced by
+// clippy 1.97; 1.96 did not flag it. That version sensitivity is why the
+// CI clippy job pins its toolchain — see .github/workflows/ci.yml.
+#![allow(clippy::question_mark)]
 pub mod agent_worker;
 pub mod anim;
 pub mod app;

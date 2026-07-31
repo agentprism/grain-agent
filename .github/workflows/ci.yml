@@ -1,0 +1,153 @@
+name: CI
+
+# Build, test and lint the workspace on every PR and every push to main.
+#
+# Why this file exists (WP28): before it, `.github/workflows/` held only
+# `publish.yml` and `release.yml`, both `on: push: tags: ["v*"]`. Nothing
+# compiled the workspace on a pull request. That is the structural reason a
+# non-compiling `main` shipped and went unnoticed: PR #10 branched before
+# PR #8 landed and was merged without ever being built against it. The merge
+# was textually clean — the two PRs touched disjoint crates — but Rust struct
+# literals are exhaustive, so the newly-merged transport's `AssistantMessage`
+# /`ToolCall` literals were missing the fields PR #8 had added, and
+# `pub mod anthropic;` is unconditional, so every consumer of
+# grain-llm-genai broke. git raises nothing for that class of conflict; only
+# a compiler does. See agentprism-rust's workspace Cargo.toml header.
+#
+# The `pull_request` event is what closes that hole: GitHub builds the
+# MERGE COMMIT (`refs/pull/N/merge` — head merged into the current base), not
+# the branch tip, so a PR is tested as it would land rather than as it was
+# written. That is necessary but not sufficient — a run that went green
+# before base moved is not re-run automatically. See the branch-protection
+# note in the WP28 report.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One in-flight run per PR / per branch. Superseded PR pushes are cancelled
+# so the queue reflects the newest commit; main is never cancelled, because
+# every main commit's result is a record we want to keep.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are per-machine, never reused across runners, and
+  # only bloat the cache. Off for CI.
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `targets:` is load-bearing, not decoration.
+      #
+      # grain-llm-genai/tests/mobile_targets.rs shells out to rustc to
+      # compile-check src/data_dir.rs for each mobile target — the defect it
+      # guards against was a `#[cfg]` cascade with no matching arm, which left
+      # the function with no value and broke every Android and iOS build. The
+      # test SKIPS targets whose rust-std is missing and hard-fails only if it
+      # could check none at all ("this test proved nothing"). A bare
+      # ubuntu-latest runner has none of them, which is why the job failed.
+      #
+      # All five are installed, not just enough to clear the assert. Four are
+      # the actual mobile targets; wasm32-unknown-unknown is deliberately NOT
+      # mobile and is there to prove the `#[cfg(not(any(…)))]` catch-all is
+      # reached. Installing only wasm32 would satisfy the assert while never
+      # checking a single mobile target — a green that means nothing, which is
+      # exactly what the test's no-vacuous-pass guard exists to prevent.
+      #
+      # This costs rust-std downloads only: `check()` runs a bare
+      # `rustc --target … --emit=metadata` over a deliberately std-only
+      # module, so no Android NDK and no Apple SDK are required.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            aarch64-linux-android,
+            armv7-linux-androideabi,
+            x86_64-linux-android,
+            aarch64-apple-ios,
+            wasm32-unknown-unknown
+
+      # Caches ~/.cargo (registry + git) and ./target, keyed on the lockfile
+      # and toolchain. Shares nothing with the clippy job: clippy writes
+      # different metadata, so a shared key would thrash.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: build-test
+
+      # `--all-targets` also builds tests, benches and examples, so a broken
+      # test file is a build failure rather than something `cargo build`
+      # silently skips. `--locked` makes CI fail on a Cargo.lock that does not
+      # match Cargo.toml instead of silently re-resolving.
+      - name: Build workspace (all targets)
+        run: cargo build --workspace --all-targets --locked
+
+      # Runs the whole workspace. Every network/provider-key test in this repo
+      # is `#[ignore]`-gated (grain-ai-agent-headless/tests/live.rs,
+      # grain-llm-genai/tests/live.rs), so this leg is hermetic and needs no
+      # secrets — `cargo test` does not run ignored tests.
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # PINNED, unlike build-test which floats on stable. clippy's lint set
+      # changes between releases, so `-D warnings` on a floating toolchain
+      # means a new stable can turn this repo red with no code change. That is
+      # not hypothetical: this workspace is clean under clippy 1.96 but 1.97
+      # added `question_mark` against untouched code in grain-ai-agent-tui.
+      # Pinning makes lint adoption a deliberate, reviewable bump instead of a
+      # surprise; build-test still floats, because a real compile or test
+      # break on a new compiler IS something to hear about immediately.
+      #
+      # To bump: raise the version here, run the command below locally on that
+      # toolchain, and fix or explicitly allow whatever it newly reports.
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+
+      # Deny-by-default. The workspace carries 10 pre-existing findings under
+      # the pinned clippy (DEBT.md G33, which recorded 9 under 1.96; 1.97 adds
+      # `question_mark`), all in grain-agent-harness (2) and
+      # grain-ai-agent-tui (8). Rather than drop the gate to report-only —
+      # which would never catch anything — those specific lint NAMES are
+      # allowed in those specific crates, via `#![allow(..)]` at each crate's
+      # root. So:
+      #   - the other 9 crates are strictly enforced from day one;
+      #   - a NEW kind of lint fails anywhere, including in those two crates;
+      #   - those 5 lints fail in any other crate.
+      # Both properties were checked by deliberately injecting violations.
+      # Removing the debt is a matter of deleting those attributes.
+      #
+      # Crate-root attributes rather than Cargo.toml `[lints]`: manifest lint
+      # levels are emitted BEFORE the trailing `-D warnings` on clippy's
+      # command line, and rustc's last-flag-wins ordering lets `-D warnings`
+      # override them (verified — the manifest form did not hold). Source
+      # attributes are scoped inside the crate and take precedence over
+      # command-line levels.
+      - name: Clippy workspace (all targets)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
