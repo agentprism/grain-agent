@@ -212,7 +212,7 @@ impl LlmStream for AnthropicStream {
         let Some(auth) = self.config.auth.resolve_for_request() else {
             return Ok(one_shot_error(
                 model,
-                "anthropic transport: no Anthropic credential could be resolved                  (set ANTHROPIC_API_KEY, or configure an OAuth provider profile)"
+                "anthropic transport: no Anthropic credential could be resolved (set ANTHROPIC_API_KEY, or configure an OAuth provider profile)"
                     .to_string(),
             ));
         };
@@ -390,5 +390,52 @@ mod tests {
     fn default_base_url_targets_the_messages_endpoint() {
         let s = AnthropicStream::new(AnthropicTransportConfig::with_api_key("k"));
         assert_eq!(s.messages_url(), "https://api.anthropic.com/v1/messages");
+    }
+
+    /// The no-credential error reaches users verbatim (TUI, headless logs),
+    /// so its text is part of the surface: normalized single spacing, no
+    /// leftover interior runs from source-level line wrapping (G38).
+    #[tokio::test]
+    async fn no_credential_error_message_is_normalized() {
+        use futures::StreamExt;
+
+        let s = AnthropicStream::new(AnthropicTransportConfig {
+            base_url: AnthropicTransportConfig::DEFAULT_BASE_URL.to_string(),
+            auth: AnthropicAuth::PerRequest(Arc::new(|| None)),
+        });
+        let model = Model {
+            id: "anthropic/claude-haiku-4-5".into(),
+            name: "claude-haiku-4-5".into(),
+            api: "anthropic".into(),
+            provider: "anthropic".into(),
+            ..Default::default()
+        };
+        let stream = s
+            .stream(
+                &model,
+                &LlmContext::default(),
+                &StreamOptions::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("no-credential path must yield a one-shot error stream");
+
+        // `one_shot_error` preserves the event contract (Start … Error), so
+        // the terminal is the LAST event, not necessarily the first.
+        let events: Vec<_> = stream.collect().await;
+        let Some(grain_agent_core::AssistantMessageEvent::Error { error, .. }) = events.last()
+        else {
+            panic!("expected a terminal Error event, got {events:?}");
+        };
+        let error = error.clone();
+        assert_eq!(
+            error,
+            "anthropic transport: no Anthropic credential could be resolved \
+             (set ANTHROPIC_API_KEY, or configure an OAuth provider profile)"
+        );
+        assert!(
+            !error.contains("  "),
+            "user-facing error must not carry interior space runs: {error:?}"
+        );
     }
 }
