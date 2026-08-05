@@ -144,6 +144,9 @@ impl GenaiStream {
 /// - `reasoning` → `ChatOptions::with_reasoning_effort` (ThinkingLevel maps
 ///   onto genai's `ReasoningEffort` variants 1:1 by name; see
 ///   [`thinking_level_to_effort`]).
+/// - `thinking_budgets` → `ReasoningEffort::Budget` when the caller supplied
+///   an explicit token budget for the requested level AND `api` is a
+///   token-budget family; see [`effort_for_request`].
 ///
 /// **Always enforced**, regardless of what the builder-provided base
 /// options say:
@@ -161,7 +164,8 @@ impl GenaiStream {
 /// `AuthResolver`, and transport/retry config is fixed on the client — so
 /// wiring them up requires a fuller refactor of the client builder; see the
 /// M-2 code-review entry). `grain_agent_core::StreamOptions` carries all of
-/// the following per call; this adapter consumes only `reasoning`:
+/// the following per call; this adapter consumes only `reasoning` and
+/// `thinking_budgets`:
 /// - `api_key`: would need a dynamic auth resolver per-call.
 /// - `session_id` / `transport`: provider-specific transport knobs.
 /// - `max_retries` / `max_retry_delay_ms` / `timeout_ms` /
@@ -172,14 +176,93 @@ impl GenaiStream {
 ///
 /// Note `headers` uses upstream's null-suppression semantics — a `None`
 /// value removes a provider default header rather than being a no-op.
-fn chat_options_with_runtime(base: ChatOptions, options: &StreamOptions) -> ChatOptions {
+fn chat_options_with_runtime(base: ChatOptions, options: &StreamOptions, api: &str) -> ChatOptions {
     let mut chat = base.with_capture_usage(true).with_capture_tool_calls(true);
     if let Some(level) = options.reasoning
-        && let Some(effort) = thinking_level_to_effort(level)
+        && let Some(effort) = effort_for_request(level, options, api)
     {
         chat = chat.with_reasoning_effort(effort);
     }
     chat
+}
+
+/// Resolve the [`ReasoningEffort`] for one request: an explicit caller
+/// budget for the requested level becomes [`ReasoningEffort::Budget`] on
+/// token-budget API families; everything else takes the 1:1 named mapping
+/// ([`thinking_level_to_effort`]).
+///
+/// This is what makes `Budget(u32)` reachable, completing the full-range
+/// mapping rust-host.md's effort-mapping-rework item describes. The rule
+/// mirrors both the native Anthropic transport (`anthropic/request.rs::
+/// thinking_budget`: a caller-supplied [`ThinkingBudgets`] entry wins over
+/// the level's default budget) and upstream pi-ai, where `thinkingBudgets`
+/// are consumed only by the token-budget provider modules
+/// (`adjustMaxTokensForThinking` in `simple-options.ts` for
+/// anthropic/bedrock, `getGoogleBudget` in the google modules @ 34239180) —
+/// the openai modules send the named effort and never read budgets.
+///
+/// The family gate matters for more than fidelity: genai's OpenAI adapter
+/// deliberately ignores `Budget(_)` (`adapter/adapters/openai/
+/// adapter_shared.rs:27`, `return Ok(())` — no `reasoning_effort` set at
+/// all), so mapping budgets unconditionally would silently DROP the named
+/// reasoning level on OpenAI-family models whenever a caller configures
+/// budgets globally (the harness forwards `thinking_budgets` on every
+/// request regardless of provider). `Off` never becomes a budget — off
+/// means no thinking, and maps to `ReasoningEffort::None` as before.
+///
+/// Budgets are `u64` grain-side and `u32` in genai; values above
+/// `u32::MAX` saturate.
+fn effort_for_request(
+    level: ThinkingLevel,
+    options: &StreamOptions,
+    api: &str,
+) -> Option<ReasoningEffort> {
+    if is_token_budget_api(api)
+        && let Some(budget) = explicit_budget_for(level, options.thinking_budgets)
+    {
+        return Some(ReasoningEffort::Budget(
+            u32::try_from(budget).unwrap_or(u32::MAX),
+        ));
+    }
+    thinking_level_to_effort(level)
+}
+
+/// The caller-supplied budget for `level`, if any. Level → field mapping
+/// mirrors the explicit half of the native transport's
+/// `anthropic/request.rs::thinking_budget` exactly: `XHigh` / `Max` share
+/// the `high` budget (upstream's `clampReasoning` collapses them to `high`
+/// before the budget lookup, `simple-options.ts:49-50, 68-69`), and `Off`
+/// carries no budget by construction.
+fn explicit_budget_for(
+    level: ThinkingLevel,
+    budgets: Option<grain_agent_core::ThinkingBudgets>,
+) -> Option<u64> {
+    let budgets = budgets?;
+    match level {
+        ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal => budgets.minimal,
+        ThinkingLevel::Low => budgets.low,
+        ThinkingLevel::Medium => budgets.medium,
+        ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => budgets.high,
+    }
+}
+
+/// API families where genai maps `ReasoningEffort::Budget` onto a real
+/// token-budget wire field — anthropic (`thinking.budget_tokens`,
+/// `adapter/adapters/anthropic/adapter_shared.rs:719,751`), google/Gemini
+/// (`generationConfig.thinkingConfig.thinkingBudget`,
+/// `adapter/adapters/gemini/adapter_impl.rs:34-38`), and Bedrock Converse
+/// (`adapter/adapters/bedrock/converse.rs:233`) — exactly the modules where
+/// upstream pi-ai consumes `thinkingBudgets`. Matches grain's production
+/// wire names (`ApiKind::wire_name`: `anthropic`, `gemini`) as well as
+/// upstream's api ids (`anthropic-messages`, `google-generative-ai`,
+/// `google-vertex`, `bedrock-converse-stream`), same breadth as
+/// `mapping::inbound::is_google_api`.
+fn is_token_budget_api(api: &str) -> bool {
+    api.starts_with("anthropic")
+        || api.starts_with("google")
+        || api == "gemini"
+        || api.starts_with("bedrock")
 }
 
 /// Map grain's [`ThinkingLevel`] onto genai 0.6's [`ReasoningEffort`], 1:1
@@ -195,9 +278,11 @@ fn chat_options_with_runtime(base: ChatOptions, options: &StreamOptions) -> Chat
 /// | `XHigh`               | `XHigh`                 |
 /// | `Max`                 | `Max`                   |
 ///
-/// genai additionally offers `ReasoningEffort::Budget(u32)`, which has no
-/// grain-side counterpart yet — it stays unmapped until a later WP adds a
-/// budget-based `ThinkingLevel` variant. `Max` maps directly since WP4's
+/// genai additionally offers `ReasoningEffort::Budget(u32)`, reached via
+/// [`effort_for_request`] when the caller supplies an explicit
+/// `StreamOptions::thinking_budgets` entry for the requested level on a
+/// token-budget API family — this named 1:1 table is the default for every
+/// other request. `Max` maps directly since WP4's
 /// patch-9 added `ThinkingLevel::Max`. (The historical `XHigh` → `High`
 /// collapse was stale adapter code: every genai release this adapter has
 /// pinned — 0.6.0-beta.20 onward — already had `ReasoningEffort::XHigh`,
@@ -236,7 +321,7 @@ impl LlmStream for GenaiStream {
         }
 
         let chat_req = to_chat_request(context);
-        let chat_options = chat_options_with_runtime(self.chat_options.clone(), options);
+        let chat_options = chat_options_with_runtime(self.chat_options.clone(), options, &model.api);
         let model_for_genai = self.translate_model_id(&model.id);
 
         let stream_resp = match self
@@ -324,7 +409,7 @@ mod tests {
         // (dropping the baseline capture flags), the per-request projection
         // must re-enable the captures the adapter's correctness depends on.
         let bare = ChatOptions::default();
-        let projected = chat_options_with_runtime(bare, &StreamOptions::default());
+        let projected = chat_options_with_runtime(bare, &StreamOptions::default(), "openai");
         assert_eq!(projected.capture_usage, Some(true));
         assert_eq!(projected.capture_tool_calls, Some(true));
     }
@@ -338,7 +423,7 @@ mod tests {
         let base = ChatOptions::default()
             .with_capture_usage(false)
             .with_capture_tool_calls(false);
-        let projected = chat_options_with_runtime(base, &StreamOptions::default());
+        let projected = chat_options_with_runtime(base, &StreamOptions::default(), "openai");
         assert_eq!(projected.capture_usage, Some(true));
         assert_eq!(projected.capture_tool_calls, Some(true));
     }
@@ -405,10 +490,167 @@ mod tests {
                 reasoning: Some(ThinkingLevel::XHigh),
                 ..StreamOptions::default()
             },
+            "openai",
         );
         assert!(matches!(
             projected.reasoning_effort,
             Some(ReasoningEffort::XHigh)
+        ));
+    }
+
+    // -- G17: ReasoningEffort::Budget reachability -------------------------
+
+    use grain_agent_core::ThinkingBudgets;
+
+    fn budgeted(level: ThinkingLevel, budgets: ThinkingBudgets) -> StreamOptions {
+        StreamOptions {
+            reasoning: Some(level),
+            thinking_budgets: Some(budgets),
+            ..StreamOptions::default()
+        }
+    }
+
+    /// An explicit caller budget for the requested level reaches genai as
+    /// `ReasoningEffort::Budget` on token-budget API families — the path
+    /// that makes rust-host.md's "the mapping covers the full range"
+    /// (named levels PLUS `Budget(u32)`) true.
+    #[test]
+    fn explicit_budget_maps_to_reasoning_effort_budget_on_token_budget_apis() {
+        for api in ["anthropic", "anthropic-messages", "gemini", "google-vertex"] {
+            let projected = chat_options_with_runtime(
+                ChatOptions::default(),
+                &budgeted(
+                    ThinkingLevel::Medium,
+                    ThinkingBudgets {
+                        medium: Some(8192),
+                        ..ThinkingBudgets::default()
+                    },
+                ),
+                api,
+            );
+            assert!(
+                matches!(
+                    projected.reasoning_effort,
+                    Some(ReasoningEffort::Budget(8192))
+                ),
+                "{api}: expected Budget(8192), got {:?}",
+                projected.reasoning_effort
+            );
+        }
+    }
+
+    /// OpenAI-family requests keep the NAMED effort even when budgets are
+    /// configured: upstream's openai modules never read `thinkingBudgets`,
+    /// and genai's OpenAI adapter silently drops `Budget(_)` (no
+    /// `reasoning_effort` set at all) — mapping it would lose the user's
+    /// level whenever budgets are configured globally.
+    #[test]
+    fn openai_family_keeps_named_effort_despite_budgets() {
+        let projected = chat_options_with_runtime(
+            ChatOptions::default(),
+            &budgeted(
+                ThinkingLevel::Medium,
+                ThinkingBudgets {
+                    medium: Some(8192),
+                    ..ThinkingBudgets::default()
+                },
+            ),
+            "openai",
+        );
+        assert!(matches!(
+            projected.reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        ));
+    }
+
+    /// A budgets struct that carries no entry for the requested level falls
+    /// back to the named mapping.
+    #[test]
+    fn missing_budget_for_the_level_falls_back_to_named_effort() {
+        let projected = chat_options_with_runtime(
+            ChatOptions::default(),
+            &budgeted(
+                ThinkingLevel::High,
+                ThinkingBudgets {
+                    low: Some(2048),
+                    ..ThinkingBudgets::default()
+                },
+            ),
+            "anthropic",
+        );
+        assert!(matches!(
+            projected.reasoning_effort,
+            Some(ReasoningEffort::High)
+        ));
+    }
+
+    /// `Off` never becomes a budget — off means no thinking, and maps to
+    /// `ReasoningEffort::None` exactly as without budgets.
+    #[test]
+    fn off_is_never_budgeted() {
+        let projected = chat_options_with_runtime(
+            ChatOptions::default(),
+            &budgeted(
+                ThinkingLevel::Off,
+                ThinkingBudgets {
+                    high: Some(24000),
+                    ..ThinkingBudgets::default()
+                },
+            ),
+            "anthropic",
+        );
+        assert!(matches!(
+            projected.reasoning_effort,
+            Some(ReasoningEffort::None)
+        ));
+    }
+
+    /// `XHigh` / `Max` share the `high` budget entry — the same collapse the
+    /// native transport applies (`anthropic/request.rs::thinking_budget`)
+    /// and upstream's `clampReasoning` performs before its budget lookup.
+    #[test]
+    fn xhigh_and_max_share_the_high_budget() {
+        for level in [ThinkingLevel::XHigh, ThinkingLevel::Max] {
+            let projected = chat_options_with_runtime(
+                ChatOptions::default(),
+                &budgeted(
+                    level,
+                    ThinkingBudgets {
+                        high: Some(24000),
+                        ..ThinkingBudgets::default()
+                    },
+                ),
+                "gemini",
+            );
+            assert!(
+                matches!(
+                    projected.reasoning_effort,
+                    Some(ReasoningEffort::Budget(24000))
+                ),
+                "{level:?}: got {:?}",
+                projected.reasoning_effort
+            );
+        }
+    }
+
+    /// grain budgets are u64; genai's slot is u32. Oversized values saturate
+    /// rather than truncate or panic.
+    #[test]
+    fn oversized_budget_saturates_at_u32_max() {
+        let projected = chat_options_with_runtime(
+            ChatOptions::default(),
+            &budgeted(
+                ThinkingLevel::Medium,
+                ThinkingBudgets {
+                    medium: Some(u64::from(u32::MAX) + 5),
+                    ..ThinkingBudgets::default()
+                },
+            ),
+            "anthropic",
+        );
+        assert!(matches!(
+            projected.reasoning_effort,
+            Some(ReasoningEffort::Budget(u32::MAX))
         ));
     }
 }

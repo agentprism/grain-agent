@@ -5,7 +5,7 @@
 
 use genai::chat::{ChatStreamEvent, StreamChunk, StreamEnd, ToolCall as GenaiToolCall, ToolChunk};
 use grain_agent_core::{AssistantContent, AssistantMessageEvent, Model, StopReason};
-use grain_llm_genai::InboundState;
+use grain_llm_genai::{InboundEvent, InboundState};
 
 fn model() -> Model {
     Model {
@@ -1134,5 +1134,87 @@ fn usage_without_reasoning_breakdown_leaves_reasoning_none() {
         assert_eq!(result.usage.reasoning, None);
     } else {
         panic!("expected Done, got {:?}", events.last());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R78 — forward-compatible event handling (rust-host.md "Forward-compatible
+// event handling": tolerate stream-event variants the adapter does not know
+// without panicking and without emitting loop events)
+// ---------------------------------------------------------------------------
+
+/// An unknown stream-event variant mid-stream is skipped: no loop events,
+/// no state disturbance — the surrounding stream completes exactly as if
+/// the unknown event had never arrived. `InboundEvent::Unknown` has no
+/// genai 0.6.5 producer (the enum is exhaustive at this pin), so the test
+/// drives the classification seam directly; this is the behavior a future
+/// genai variant (e.g. `Heartbeat`) inherits on the day it ships.
+#[test]
+fn unknown_event_variants_are_skipped_without_loop_events() {
+    let mut state = InboundState::new(&model());
+    let mut events = Vec::new();
+
+    events.extend(state.on_event(ChatStreamEvent::Start));
+    events.extend(state.on_event(chunk("hel")));
+
+    let unknown_out = state.on_classified(InboundEvent::Unknown);
+    assert!(
+        unknown_out.is_empty(),
+        "an unknown variant must not emit loop events, got {unknown_out:?}"
+    );
+
+    events.extend(state.on_event(chunk("lo")));
+    events.extend(state.on_event(end_normal()));
+
+    // The stream around the unknown event is unperturbed: the text block was
+    // neither closed nor restarted, and the terminal carries the full text.
+    let tags: Vec<_> = events.iter().map(tag).collect();
+    assert_eq!(
+        tags,
+        vec!["Start", "TextStart", "TextDelta", "TextDelta", "TextEnd", "Done"]
+    );
+    let AssistantMessageEvent::Done { result } = events.last().unwrap() else {
+        panic!("expected Done terminal");
+    };
+    let AssistantContent::Text(t) = &result.content[0] else {
+        panic!("expected text block");
+    };
+    assert_eq!(t.text, "hello");
+}
+
+/// An unknown variant BEFORE anything else must not implicitly start the
+/// message either — `Start` still comes from the first real event.
+#[test]
+fn unknown_event_before_start_does_not_start_the_message() {
+    let mut state = InboundState::new(&model());
+    assert!(state.on_classified(InboundEvent::Unknown).is_empty());
+    let events = state.on_event(ChatStreamEvent::Start);
+    assert_eq!(events.iter().map(tag).collect::<Vec<_>>(), vec!["Start"]);
+}
+
+/// Every genai 0.6.5 variant classifies to its dedicated arm — the
+/// `Unknown` wildcard absorbs only what has no arm, never a known event.
+#[test]
+fn every_known_genai_variant_classifies_to_a_dedicated_arm() {
+    let cases: Vec<(ChatStreamEvent, &str)> = vec![
+        (ChatStreamEvent::Start, "Start"),
+        (chunk("t"), "Text"),
+        (reasoning("r"), "Reasoning"),
+        (thought_sig("s"), "ThoughtSignature"),
+        (tool_call("c1", "read", serde_json::json!({})), "ToolCall"),
+        (end_normal(), "End"),
+    ];
+    for (event, expected) in cases {
+        let classified = InboundEvent::from(event);
+        let got = match &classified {
+            InboundEvent::Start => "Start",
+            InboundEvent::Text(_) => "Text",
+            InboundEvent::Reasoning(_) => "Reasoning",
+            InboundEvent::ThoughtSignature(_) => "ThoughtSignature",
+            InboundEvent::ToolCall(_) => "ToolCall",
+            InboundEvent::End(_) => "End",
+            InboundEvent::Unknown => "Unknown",
+        };
+        assert_eq!(got, expected, "known variant fell through to {got}");
     }
 }

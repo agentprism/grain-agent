@@ -57,7 +57,7 @@ pub struct ToolCall {
     /// to carry it.
     ///
     /// The replay rule lives in
-    /// [`crate::types::strip_cross_model_thought_signatures`]: same-model
+    /// [`crate::types::project_messages_for_model`]: same-model
     /// replay keeps the signature, cross-model replay drops it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
@@ -448,14 +448,29 @@ pub fn is_same_model(message: &AssistantMessage, model: &Model) -> bool {
     message.provider == model.provider && message.api == model.api && message.model == model.id
 }
 
-/// Drop [`ToolCall::thought_signature`] from assistant messages that a
-/// *different* model produced, in place.
+/// Project assistant-message content for replay to `model`, in place: the
+/// thought-signature replay rule over **both** grain carriers.
 ///
-/// This is the replay path for thought signatures. Port of the tool-call arm
-/// of pi-ai `transformMessages`
-/// (`packages/ai/src/api/transform-messages.ts:127-145` @ 34239180):
+/// Port of the per-block replay arms of pi-ai `transformMessages`
+/// (`packages/ai/src/api/transform-messages.ts` @ 34239180) — the thinking
+/// arm (`:101-116`) and the tool-call thought-signature arm (`:127-134`):
 ///
 /// ```text
+/// if (block.type === "thinking") {
+///     // Redacted thinking is opaque encrypted content, only valid for the
+///     // same model. Drop it for cross-model to avoid API errors.
+///     if (block.redacted) {
+///         return isSameModel ? block : [];
+///     }
+///     // For same model: keep thinking blocks with signatures (needed for
+///     // replay) even if the thinking text is empty (OpenAI encrypted reasoning)
+///     if (isSameModel && block.thinkingSignature) return block;
+///     // Skip empty thinking blocks, convert others to plain text
+///     if (!block.thinking || block.thinking.trim() === "") return [];
+///     if (isSameModel) return block;
+///     return { type: "text" as const, text: block.thinking };
+/// }
+/// ...
 /// if (!isSameModel && toolCall.thoughtSignature) {
 ///     normalizedToolCall = { ...toolCall };
 ///     delete normalizedToolCall.thoughtSignature;
@@ -465,26 +480,86 @@ pub fn is_same_model(message: &AssistantMessage, model: &Model) -> bool {
 /// A thought signature is an opaque, model-scoped handle into the producing
 /// model's internal thought context. Replaying it to the same model lets that
 /// model resume its reasoning; replaying it to a different model is at best
-/// meaningless and at worst an API error, so it is stripped. Same-model replay
-/// keeps the signature untouched.
+/// meaningless and at worst an API error, so it is stripped. grain carries
+/// signatures on **two** blocks — [`ThinkingContent::signature`] (populated
+/// by the genai inbound mapping and the native Anthropic transport) and
+/// [`ToolCall::thought_signature`] — and this projection covers both.
 ///
-/// Only tool calls are touched — text and thinking blocks are left alone, and
-/// no message is added or removed. The rest of upstream's `transformMessages`
-/// (unsupported-image downgrade, tool-call-id normalization, synthetic results
-/// for orphaned tool calls) is provider-layer work and stays in the adapter.
-pub fn strip_cross_model_thought_signatures(messages: &mut [Message], model: &Model) {
+/// Per-block rules, mapping upstream's branches onto grain's shape:
+///
+/// - **Thinking, same model.** Kept verbatim whenever it carries replay
+///   payload — a `signature` (upstream's `thinkingSignature` keep, "even if
+///   the thinking text is empty") **or** [`ThinkingContent::provider_metadata`]
+///   (grain's slot for provider-scoped replay payloads; upstream's `redacted`
+///   flag maps here — the native Anthropic transport stores redacted thinking
+///   as `{"type": "redacted_thinking", "data": …}` metadata with empty
+///   `thinking` text, and dropping it would break its verbatim replay).
+///   Deliberate divergence from upstream: an empty, unsigned thinking block
+///   with `provider_metadata` is kept same-model where upstream (which has no
+///   such field) would drop it — same-model replay is that field's entire
+///   documented purpose.
+/// - **Thinking, empty otherwise.** Dropped (whitespace-only counts as
+///   empty), same-model and cross-model alike — upstream's
+///   `block.thinking.trim() === ""` rule.
+/// - **Thinking, cross-model with text.** Converted to a plain [`Text`]
+///   block carrying the thinking text; `signature` and `provider_metadata`
+///   do not survive the conversion. This is how upstream strips the
+///   thinking-side carrier (and its cross-model `redacted`/empty drop is the
+///   degenerate case: no text, nothing to convert).
+/// - **Tool call, cross-model.** [`ToolCall::thought_signature`] cleared;
+///   same-model replay keeps it untouched.
+/// - **Text.** Untouched. Upstream re-creates cross-model text blocks
+///   stripped to `{type, text}`; grain's [`TextContent`] carries only
+///   `text`, so that pass is an identity here.
+///
+/// No message is added or removed — only assistant-message content blocks
+/// change. The rest of upstream's `transformMessages` (unsupported-image
+/// downgrade, tool-call-id normalization, synthetic results for orphaned
+/// tool calls) is provider-layer work and stays in the adapter.
+///
+/// Every context-builder that hands a transcript to an [`crate::LlmStream`]
+/// must apply this projection: the agent loop does
+/// (`agent_loop::stream_assistant_response`), and so does the compaction
+/// summarizer's context builder in `grain-agent-harness` — the summarizer
+/// routinely runs a *different* model, which is exactly the cross-model case.
+///
+/// [`Text`]: AssistantContent::Text
+pub fn project_messages_for_model(messages: &mut [Message], model: &Model) {
     for message in messages.iter_mut() {
         let Message::Assistant(assistant) = message else {
             continue;
         };
-        if is_same_model(assistant, model) {
-            continue;
-        }
-        for block in assistant.content.iter_mut() {
-            if let AssistantContent::ToolCall(tool_call) = block {
-                tool_call.thought_signature = None;
-            }
-        }
+        let same_model = is_same_model(assistant, model);
+        let blocks = std::mem::take(&mut assistant.content);
+        assistant.content = blocks
+            .into_iter()
+            .filter_map(|block| match block {
+                AssistantContent::Thinking(thinking) => {
+                    if same_model
+                        && (thinking.signature.is_some() || thinking.provider_metadata.is_some())
+                    {
+                        return Some(AssistantContent::Thinking(thinking));
+                    }
+                    if thinking.thinking.trim().is_empty() {
+                        return None;
+                    }
+                    if same_model {
+                        Some(AssistantContent::Thinking(thinking))
+                    } else {
+                        Some(AssistantContent::Text(TextContent {
+                            text: thinking.thinking,
+                        }))
+                    }
+                }
+                AssistantContent::ToolCall(mut tool_call) => {
+                    if !same_model {
+                        tool_call.thought_signature = None;
+                    }
+                    Some(AssistantContent::ToolCall(tool_call))
+                }
+                other => Some(other),
+            })
+            .collect();
     }
 }
 

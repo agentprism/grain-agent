@@ -206,7 +206,7 @@ explicit `structural gap` panic naming the unrepresentable field.
 | OV-3 | openai-completions | `openai-completions-response-model.test.ts` | surfaces routed chunk.model on responseModel without changing model | **STRUCTURAL** | S-6: `chunk.model` never crosses genai (grain's `response_model` slot now exists and the native transport fills it — this vector is genai-blocked only). Representable remainder (text events, stop, usage 10/5/15) passes |
 | OV-4 | openai-completions | `openai-completions-response-model.test.ts` | leaves responseModel undefined when chunks echo the requested id | **PASS** | Absence semantics vacuously exact; usage total 2 via AB-2 |
 | OV-5 | openai-completions | `openai-completions-response-model.test.ts` | ignores empty or missing chunk.model | **PASS** | Two text deltas aggregate; usage total 3 via AB-2 |
-| OV-6 | openai-completions (openrouter-flavored) | `openai-completions-reasoning-details.test.ts` | preserves reasoning_details that arrive before their matching tool call | **STRUCTURAL** | S-7: `delta.reasoning_details` never crosses genai; grain `ToolCall` has no signature slot. Representable remainder (toolcall events, args, toolUse stop) passes |
+| OV-6 | openai-completions (openrouter-flavored) | `openai-completions-reasoning-details.test.ts` | preserves reasoning_details that arrive before their matching tool call | **STRUCTURAL** | S-7: `delta.reasoning_details` never crosses genai. The grain half is CLOSED — `ToolCall::thought_signature` exists (WP19), replay rule in `grain_agent_core::project_messages_for_model` — so the block is genai-only (see §2 and the vector's ignore message). Representable remainder (toolcall events, args, toolUse stop) passes |
 | GV-1 | google-generative-ai | `google-raw-stop-reason.test.ts` | preserves raw Gemini finish reasons for Google Generative AI errors (`MALFORMED_FUNCTION_CALL`) | **PASS** | Fixed by AB-1 (was: silent `Done/Stop`). Error + `Provider stopped with: MALFORMED_FUNCTION_CALL`, usage 1/0/1 exact; `rawStopReason === "MALFORMED_FUNCTION_CALL"` asserted since WP32 (AB-R1 closed) |
 | GV-2 | google-vertex | `google-raw-stop-reason.test.ts` | preserves raw Gemini finish reasons for Google Vertex errors (`SAFETY`) | **PASS** | Fixed by AB-1. Upstream drives this through the vertex transport; the wire (GenerateContentResponse SSE) is identical. genai 0.6.5 does have a dedicated Vertex adapter (`AdapterKind::Vertex`) — the collapse onto the gemini wire is grain's routing (`ProviderRouter`: `google → gemini`; no grain models route to the Vertex adapter today) |
 
@@ -216,6 +216,7 @@ explicit `structural gap` panic naming the unrepresentable field.
 |---|---|---|
 | PASS | 11 | AV-1, AV-2, AV-3, AV-4, AV-5, OV-1, OV-2, OV-4, OV-5, GV-1, GV-2 |
 | STRUCTURAL | 2 | OV-3, OV-6 |
+| ADAPTER-BUG (vector left failing) | 0 | — |
 
 Movement since WP21 (7 PASS / 6 STRUCTURAL): **AV-1, AV-2, AV-3, AV-5** moved
 STRUCTURAL → PASS when the Anthropic vectors were routed through the native
@@ -226,7 +227,6 @@ existing greens. The two remaining STRUCTURAL vectors are openai-completions
 (OV-3 responseModel, OV-6 reasoning_details); their grain-side slots exist
 (WP19), so both are blocked solely on genai surfacing the value at the seam —
 not reachable from any backend or adapter work here.
-| ADAPTER-BUG (vector left failing) | 0 | — |
 
 Adapter bugs found while building the vectors:
 

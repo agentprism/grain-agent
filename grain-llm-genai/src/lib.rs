@@ -34,7 +34,7 @@ pub mod stream;
 pub use anthropic::{AnthropicAuth, AnthropicStream, AnthropicTransportConfig};
 pub use builder::GenaiStreamBuilder;
 pub use config::{EnvKeyResolver, OpenAiCompatEndpoint, OpenAiCompatPreset, ProviderRouter};
-pub use mapping::inbound::InboundState;
+pub use mapping::inbound::{InboundEvent, InboundState};
 pub use mapping::outbound::{baseline_chat_options, to_chat_request};
 pub use mapping::usage::map_usage;
 pub use provider::{

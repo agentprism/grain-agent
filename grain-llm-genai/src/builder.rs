@@ -364,7 +364,8 @@ impl GenaiStreamBuilder {
         }
         let client = client_builder.build();
 
-        // Opt-in native Anthropic transport. Auth is resolved once here, the
+        // Opt-in native Anthropic transport. What is built once here is the
+        // auth RESOLVER — the credential itself is resolved per request, the
         // same way the genai auth resolver does it: explicit env override
         // first, then an OAuth profile for the `anthropic` adapter.
         let native = native_anthropic.then(|| {
