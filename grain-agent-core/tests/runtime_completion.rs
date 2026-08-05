@@ -18,8 +18,8 @@ use common::{FnStream, create_assistant_message, create_model, done_stream, text
 use futures::StreamExt;
 use grain_agent_core::{
     Agent, AgentMessage, AgentOptions, AssistantContent, AssistantMessage, CacheRetention, Message,
-    Model, StopReason, StreamOptions, ToolCall, is_same_model,
-    strip_cross_model_thought_signatures,
+    Model, StopReason, StreamOptions, ThinkingContent, ToolCall, is_same_model,
+    project_messages_for_model,
 };
 use serde_json::json;
 
@@ -44,6 +44,14 @@ fn signed_tool_call(signature: Option<&str>) -> AssistantContent {
     })
 }
 
+fn signed_thinking(thinking: &str, signature: Option<&str>) -> AssistantContent {
+    AssistantContent::Thinking(ThinkingContent {
+        thinking: thinking.into(),
+        signature: signature.map(str::to_string),
+        provider_metadata: None,
+    })
+}
+
 /// The tool call's `thought_signature` as the stream fn observed it.
 fn seam_signature(ctx_messages: &[Message]) -> Option<String> {
     ctx_messages.iter().find_map(|m| match m {
@@ -53,6 +61,18 @@ fn seam_signature(ctx_messages: &[Message]) -> Option<String> {
         }),
         _ => None,
     })?
+}
+
+/// The first thinking block's `signature` as the stream fn observed it —
+/// `None` also when no thinking block survived the projection at all.
+fn seam_thinking_signature(ctx_messages: &[Message]) -> Option<String> {
+    ctx_messages.iter().find_map(|m| match m {
+        Message::Assistant(a) => a.content.iter().find_map(|b| match b {
+            AssistantContent::Thinking(t) => t.signature.clone(),
+            _ => None,
+        }),
+        _ => None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -87,10 +107,11 @@ fn is_same_model_compares_provider_api_and_model_id() {
     assert!(!is_same_model(&msg, &model));
 }
 
-/// Same-model replay keeps the signature; cross-model replay drops it.
-/// Text and thinking blocks are untouched either way.
+/// Tool-call arm (`transform-messages.ts:127-134`): same-model replay keeps
+/// the signature; cross-model replay drops it. Text blocks are untouched
+/// either way, and no message is added or removed.
 #[test]
-fn strip_cross_model_thought_signatures_matches_upstream_rule() {
+fn projection_matches_upstream_tool_call_arm() {
     let build = || {
         vec![Message::Assistant(AssistantMessage {
             content: vec![text("hello"), signed_tool_call(Some("sig-abc"))],
@@ -99,7 +120,7 @@ fn strip_cross_model_thought_signatures_matches_upstream_rule() {
     };
 
     let mut same = build();
-    strip_cross_model_thought_signatures(&mut same, &create_model());
+    project_messages_for_model(&mut same, &create_model());
     assert_eq!(
         seam_signature(&same),
         Some("sig-abc".into()),
@@ -107,21 +128,145 @@ fn strip_cross_model_thought_signatures_matches_upstream_rule() {
     );
 
     let mut cross = build();
-    strip_cross_model_thought_signatures(&mut cross, &other_model());
+    project_messages_for_model(&mut cross, &other_model());
     assert_eq!(
         seam_signature(&cross),
         None,
         "cross-model replay must drop the signature"
     );
 
-    // Non-tool-call blocks survive the strip untouched, and no message is
-    // added or removed.
+    // Text blocks survive the strip untouched, and no message is added or
+    // removed.
     let Message::Assistant(a) = &cross[0] else {
         panic!("expected assistant message")
     };
     assert_eq!(cross.len(), 1);
     assert_eq!(a.content.len(), 2);
     assert!(matches!(a.content[0], AssistantContent::Text(_)));
+}
+
+/// Thinking arm (`transform-messages.ts:101-116`), same model: a signed
+/// thinking block is kept verbatim — including a signature-only block with
+/// empty text (upstream: "even if the thinking text is empty (OpenAI
+/// encrypted reasoning)"; grain's inbound also synthesizes such blocks for
+/// Gemini pending signatures).
+#[test]
+fn projection_keeps_same_model_thinking_signature() {
+    let mut messages = vec![Message::Assistant(AssistantMessage {
+        content: vec![
+            signed_thinking("planning...", Some("think-sig")),
+            signed_thinking("", Some("sig-only")),
+        ],
+        ..create_assistant_message(vec![], StopReason::Stop)
+    })];
+    project_messages_for_model(&mut messages, &create_model());
+
+    let Message::Assistant(a) = &messages[0] else {
+        panic!("expected assistant message")
+    };
+    assert_eq!(a.content.len(), 2, "both signed blocks must survive");
+    assert_eq!(
+        seam_thinking_signature(&messages),
+        Some("think-sig".into())
+    );
+    let AssistantContent::Thinking(second) = &a.content[1] else {
+        panic!("signature-only thinking block must survive same-model replay")
+    };
+    assert_eq!(second.signature.as_deref(), Some("sig-only"));
+}
+
+/// Thinking arm, cross model: a signed thinking block with text degrades to
+/// a plain text block (the signature — the live carrier the loop used to
+/// leak — does not survive); a signature-only block drops entirely.
+#[test]
+fn projection_strips_cross_model_thinking_signature() {
+    let mut messages = vec![Message::Assistant(AssistantMessage {
+        content: vec![
+            signed_thinking("planning...", Some("think-sig")),
+            signed_thinking("", Some("sig-only")),
+        ],
+        ..create_assistant_message(vec![], StopReason::Stop)
+    })];
+    project_messages_for_model(&mut messages, &other_model());
+
+    let Message::Assistant(a) = &messages[0] else {
+        panic!("expected assistant message")
+    };
+    assert_eq!(seam_thinking_signature(&messages), None);
+    assert_eq!(
+        a.content.len(),
+        1,
+        "the signature-only block must drop; the text-bearing one converts"
+    );
+    let AssistantContent::Text(t) = &a.content[0] else {
+        panic!("cross-model thinking must convert to plain text, got {a:?}")
+    };
+    assert_eq!(t.text, "planning...");
+}
+
+/// Thinking arm: empty, unsigned thinking blocks drop on BOTH sides of the
+/// model boundary (upstream's `block.thinking.trim() === ""` rule).
+#[test]
+fn projection_drops_empty_unsigned_thinking_blocks() {
+    for model in [create_model(), other_model()] {
+        let mut messages = vec![Message::Assistant(AssistantMessage {
+            content: vec![signed_thinking("  \n", None), text("visible")],
+            ..create_assistant_message(vec![], StopReason::Stop)
+        })];
+        project_messages_for_model(&mut messages, &model);
+        let Message::Assistant(a) = &messages[0] else {
+            panic!("expected assistant message")
+        };
+        assert_eq!(a.content.len(), 1, "empty unsigned thinking must drop");
+        assert!(matches!(a.content[0], AssistantContent::Text(_)));
+    }
+}
+
+/// Thinking arm, `redacted` branch mapped onto grain's shape: redacted
+/// thinking is a `ThinkingContent` whose `provider_metadata` is
+/// `{"type": "redacted_thinking", "data": …}` with empty text (produced by
+/// the native Anthropic transport). Same-model replay keeps it verbatim so
+/// the transport can replay the opaque payload; cross-model replay drops it
+/// (upstream: "opaque encrypted content, only valid for the same model").
+#[test]
+fn projection_applies_upstream_redacted_rule_via_provider_metadata() {
+    let redacted = || {
+        vec![Message::Assistant(AssistantMessage {
+            content: vec![AssistantContent::Thinking(ThinkingContent {
+                thinking: String::new(),
+                signature: None,
+                provider_metadata: Some(json!({
+                    "type": "redacted_thinking",
+                    "data": "EroBCkYIB..."
+                })),
+            })],
+            ..create_assistant_message(vec![], StopReason::Stop)
+        })]
+    };
+
+    let mut same = redacted();
+    project_messages_for_model(&mut same, &create_model());
+    let Message::Assistant(a) = &same[0] else {
+        panic!("expected assistant message")
+    };
+    let AssistantContent::Thinking(t) = &a.content[0] else {
+        panic!("same-model redacted thinking must survive verbatim")
+    };
+    assert_eq!(
+        t.provider_metadata.as_ref().and_then(|m| m.get("data")),
+        Some(&json!("EroBCkYIB..."))
+    );
+
+    let mut cross = redacted();
+    project_messages_for_model(&mut cross, &other_model());
+    let Message::Assistant(a) = &cross[0] else {
+        panic!("expected assistant message")
+    };
+    assert!(
+        a.content.is_empty(),
+        "cross-model redacted thinking must drop, got {:?}",
+        a.content
+    );
 }
 
 /// A signature-only turn needs no empty-text thinking block to carry the
@@ -132,7 +277,7 @@ fn signature_rides_the_tool_call_without_a_thinking_block() {
         content: vec![signed_tool_call(Some("sig-only"))],
         ..create_assistant_message(vec![], StopReason::ToolUse)
     })];
-    strip_cross_model_thought_signatures(&mut messages, &create_model());
+    project_messages_for_model(&mut messages, &create_model());
 
     let Message::Assistant(a) = &messages[0] else {
         panic!("expected assistant message")
@@ -159,7 +304,10 @@ async fn loop_preserves_signature_for_same_model_replay() {
 
     let mut options = AgentOptions::new(create_model(), stream);
     options.messages = vec![AgentMessage::assistant(AssistantMessage {
-        content: vec![signed_tool_call(Some("sig-same"))],
+        content: vec![
+            signed_thinking("planning...", Some("think-same")),
+            signed_tool_call(Some("sig-same")),
+        ],
         ..create_assistant_message(vec![], StopReason::ToolUse)
     })];
 
@@ -170,6 +318,11 @@ async fn loop_preserves_signature_for_same_model_replay() {
 
     let observed = seen.lock().unwrap().clone().expect("stream fn not called");
     assert_eq!(seam_signature(&observed), Some("sig-same".into()));
+    assert_eq!(
+        seam_thinking_signature(&observed),
+        Some("think-same".into()),
+        "the thinking-block carrier must also survive same-model replay"
+    );
 }
 
 /// The transcript was produced by one model and is being replayed to another
@@ -187,7 +340,10 @@ async fn loop_strips_signature_for_cross_model_replay() {
     // Transcript entry is from `create_model()`; the agent targets `other_model()`.
     let mut options = AgentOptions::new(other_model(), stream);
     options.messages = vec![AgentMessage::assistant(AssistantMessage {
-        content: vec![signed_tool_call(Some("sig-cross"))],
+        content: vec![
+            signed_thinking("planning...", Some("think-cross")),
+            signed_tool_call(Some("sig-cross")),
+        ],
         ..create_assistant_message(vec![], StopReason::ToolUse)
     })];
 
@@ -201,6 +357,22 @@ async fn loop_strips_signature_for_cross_model_replay() {
         seam_signature(&observed),
         None,
         "signature must not cross the model boundary"
+    );
+    assert_eq!(
+        seam_thinking_signature(&observed),
+        None,
+        "the thinking-block carrier must not cross the model boundary either"
+    );
+    let thinking_survives_as_text = observed.iter().any(|m| match m {
+        Message::Assistant(a) => a
+            .content
+            .iter()
+            .any(|b| matches!(b, AssistantContent::Text(t) if t.text == "planning...")),
+        _ => false,
+    });
+    assert!(
+        thinking_survives_as_text,
+        "cross-model thinking text degrades to a plain text block (upstream rule)"
     );
 }
 

@@ -885,6 +885,17 @@ async fn produce_summary(
         llm_messages.pop();
     }
 
+    // Thought-signature replay rule (both carriers:
+    // `ThinkingContent::signature` and `ToolCall::thought_signature`). This
+    // context is built OUTSIDE the agent loop, so the loop's own projection
+    // (`agent_loop::stream_assistant_response` step 2b) never sees it — and
+    // the summarizer routinely runs a different model than the one that
+    // produced the transcript, which is exactly the cross-model case the
+    // rule exists for. Same shared projection, same upstream source
+    // (`transformMessages`, pi `packages/ai/src/api/transform-messages.ts`
+    // :101-134 @ 34239180).
+    grain_agent_core::project_messages_for_model(&mut llm_messages, model);
+
     llm_messages.push(Message::User(UserMessage {
         content: vec![UserContent::Text(TextContent {
             text: compaction_prompt.to_string(),
@@ -1393,6 +1404,201 @@ mod tests {
             },
             other => panic!("expected user(u4), got {other:?}"),
         }
+    }
+
+    /// A summarizer that records the [`LlmContext`] it was handed, so tests
+    /// can assert what the compaction context-builder actually sends.
+    struct CapturingSummarizer {
+        text: String,
+        seen: Arc<Mutex<Option<Vec<Message>>>>,
+    }
+
+    #[async_trait]
+    impl LlmStream for CapturingSummarizer {
+        async fn stream(
+            &self,
+            model: &Model,
+            ctx: &LlmContext,
+            _opts: &StreamOptions,
+            _cancel: CancellationToken,
+        ) -> Result<AssistantStream, StreamError> {
+            *self.seen.lock().unwrap() = Some(ctx.messages.clone());
+            let final_msg = AssistantMessage {
+                content: vec![AssistantContent::Text(TextContent {
+                    text: self.text.clone(),
+                })],
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                response_id: None,
+                response_model: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                error_code: None,
+                timestamp: 0,
+                raw_stop_reason: None,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                AssistantMessageEvent::Start {
+                    partial: final_msg.clone(),
+                },
+                AssistantMessageEvent::Done { result: final_msg },
+            ])))
+        }
+    }
+
+    /// An assistant message (from the tests' "test"/"test"/"test" model
+    /// triple) carrying thought signatures on BOTH grain carriers:
+    /// `ThinkingContent::signature` and `ToolCall::thought_signature`.
+    fn dual_signed_assistant() -> AgentMessage {
+        AgentMessage::assistant(AssistantMessage {
+            content: vec![
+                AssistantContent::Thinking(grain_agent_core::ThinkingContent {
+                    thinking: "planning...".into(),
+                    signature: Some("think-sig".into()),
+                    provider_metadata: None,
+                }),
+                AssistantContent::ToolCall(grain_agent_core::ToolCall {
+                    id: "tc1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: Some("call-sig".into()),
+                }),
+            ],
+            stop_reason: StopReason::ToolUse,
+            ..assistant_msg("")
+        })
+    }
+
+    /// Transcript whose prefix contains `dual_signed_assistant()` (with its
+    /// paired tool result, so no safety net pops it) plus enough padding
+    /// that `prefix_len = 4` is a safe cut with a kept tail.
+    fn signed_transcript() -> Vec<AgentMessage> {
+        vec![
+            user("u0"),
+            dual_signed_assistant(),
+            tool_result("tc1", "file contents"),
+            user("u1"),
+            user("tail"),
+        ]
+    }
+
+    /// Signatures the summarizer observed at its seam, as
+    /// `(thinking_signature, tool_call_signature, thinking_block_count)`.
+    fn observed_signatures(messages: &[Message]) -> (Option<String>, Option<String>, usize) {
+        let mut thinking_sig = None;
+        let mut call_sig = None;
+        let mut thinking_blocks = 0;
+        for m in messages {
+            let Message::Assistant(a) = m else { continue };
+            for block in &a.content {
+                match block {
+                    AssistantContent::Thinking(t) => {
+                        thinking_blocks += 1;
+                        thinking_sig = thinking_sig.or_else(|| t.signature.clone());
+                    }
+                    AssistantContent::ToolCall(tc) => {
+                        call_sig = call_sig.or_else(|| tc.thought_signature.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (thinking_sig, call_sig, thinking_blocks)
+    }
+
+    /// The compaction context-builder bypasses the agent loop, so it must
+    /// apply the thought-signature replay projection itself. The summarizer
+    /// routinely runs a DIFFERENT model than the one that produced the
+    /// transcript — the cross-model case: neither carrier may reach the
+    /// summarizer's seam, and the thinking text degrades to plain text.
+    #[tokio::test]
+    async fn compaction_strips_signatures_for_cross_model_summarizer() {
+        let seen = Arc::new(Mutex::new(None));
+        let summarizer: Arc<dyn LlmStream> = Arc::new(CapturingSummarizer {
+            text: "summary".into(),
+            seen: seen.clone(),
+        });
+        // Different id than the transcript's "test"/"test"/"test" triple.
+        let summarizer_model = Model {
+            id: "summarizer-model".into(),
+            name: "summarizer-model".into(),
+            api: "test".into(),
+            provider: "test".into(),
+            ..Default::default()
+        };
+
+        compact_transcript(
+            &summarizer,
+            &summarizer_model,
+            "system",
+            &signed_transcript(),
+            4,
+            DEFAULT_COMPACTION_PROMPT,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction failed");
+
+        let observed = seen.lock().unwrap().clone().expect("summarizer not called");
+        let (thinking_sig, call_sig, thinking_blocks) = observed_signatures(&observed);
+        assert_eq!(
+            thinking_sig, None,
+            "ThinkingContent::signature must not reach a cross-model summarizer"
+        );
+        assert_eq!(
+            call_sig, None,
+            "ToolCall::thought_signature must not reach a cross-model summarizer"
+        );
+        assert_eq!(
+            thinking_blocks, 0,
+            "cross-model thinking degrades to plain text (upstream rule)"
+        );
+        let thinking_as_text = observed.iter().any(|m| match m {
+            Message::Assistant(a) => a
+                .content
+                .iter()
+                .any(|b| matches!(b, AssistantContent::Text(t) if t.text == "planning...")),
+            _ => false,
+        });
+        assert!(thinking_as_text, "the thinking text itself must survive");
+    }
+
+    /// Same-model summarizer replay keeps both carriers verbatim — the
+    /// projection must not over-strip.
+    #[tokio::test]
+    async fn compaction_keeps_signatures_for_same_model_summarizer() {
+        let seen = Arc::new(Mutex::new(None));
+        let summarizer: Arc<dyn LlmStream> = Arc::new(CapturingSummarizer {
+            text: "summary".into(),
+            seen: seen.clone(),
+        });
+        // Matches the transcript's "test"/"test"/"test" triple.
+        let same_model = Model {
+            id: "test".into(),
+            name: "test".into(),
+            api: "test".into(),
+            provider: "test".into(),
+            ..Default::default()
+        };
+
+        compact_transcript(
+            &summarizer,
+            &same_model,
+            "system",
+            &signed_transcript(),
+            4,
+            DEFAULT_COMPACTION_PROMPT,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compaction failed");
+
+        let observed = seen.lock().unwrap().clone().expect("summarizer not called");
+        let (thinking_sig, call_sig, _) = observed_signatures(&observed);
+        assert_eq!(thinking_sig, Some("think-sig".into()));
+        assert_eq!(call_sig, Some("call-sig".into()));
     }
 
     #[tokio::test]

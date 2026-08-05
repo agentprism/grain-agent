@@ -593,15 +593,18 @@ async fn stream_assistant_response(
     // 2) Convert to LLM messages.
     let mut llm_messages = (config.convert_to_llm)(transformed).await;
 
-    // 2b) Thought-signature replay rule. A signature is an opaque handle into
-    // the producing model's thought context, so it only replays to that same
-    // model; carrying it to another model is meaningless at best and an API
-    // error at worst. Upstream applies this inside `transformMessages`
-    // (`packages/ai/src/api/transform-messages.ts:127-145` @ 34239180); grain
-    // applies it here, the one place that knows both the transcript and the
-    // model this request targets. Relevant because `prepare_next_turn` can
-    // swap the model mid-run, so a single transcript can span models.
-    crate::types::strip_cross_model_thought_signatures(&mut llm_messages, &config.model);
+    // 2b) Thought-signature replay rule, over both carriers
+    // (`ThinkingContent::signature` and `ToolCall::thought_signature`). A
+    // signature is an opaque handle into the producing model's thought
+    // context, so it only replays to that same model; carrying it to another
+    // model is meaningless at best and an API error at worst. Upstream
+    // applies this inside `transformMessages`
+    // (`packages/ai/src/api/transform-messages.ts:101-134` @ 34239180); grain
+    // applies the shared projection wherever an LLM context is built — here,
+    // because `prepare_next_turn` can swap the model mid-run so a single
+    // transcript can span models, and in the harness's compaction summarizer,
+    // which routinely targets a different model outright.
+    crate::types::project_messages_for_model(&mut llm_messages, &config.model);
 
     // 3) Build LLM context.
     let tool_defs: Vec<ToolDefinition> = context

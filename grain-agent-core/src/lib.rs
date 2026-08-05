@@ -40,5 +40,5 @@ pub use types::{
     LlmContext, Message, Model, QueueMode, StopReason, TextContent, ThinkingBudgets,
     ThinkingContent, ThinkingLevel, ToolCall, ToolDefinition, ToolExecutionMode, ToolResultMessage,
     ToolUpdateCallback, Usage, UserContent, UserMessage, is_same_model,
-    strip_cross_model_thought_signatures,
+    project_messages_for_model,
 };
