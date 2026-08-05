@@ -82,6 +82,68 @@ struct ToolCallProgress {
     raw: String,
 }
 
+/// Grain-owned classification of a [`ChatStreamEvent`] — the
+/// forward-compatibility seam required by rust-host.md ("Forward-compatible
+/// event handling": the inbound mapping tolerates stream-event variants it
+/// does not know without panicking and without emitting loop events;
+/// dedicated arms land with the releases that ship them).
+///
+/// genai 0.6.5's `ChatStreamEvent` is **not** `#[non_exhaustive]`, which
+/// makes the doc's sentence impossible to satisfy with a plain `match`: a
+/// bare `_` arm is an unreachable pattern today (rejected by the CI-pinned
+/// `-D warnings`), and omitting it turns the first genai release that adds a
+/// variant into a build failure — the opposite of "tolerates". So unknowns
+/// are made representable in a type grain owns: every event is routed
+/// through [`From<ChatStreamEvent>`], whose single, narrowly-scoped
+/// `#[allow(unreachable_patterns)]` wildcard is the one place a future
+/// variant lands. Until a dedicated arm is added for it, such a variant
+/// classifies as [`InboundEvent::Unknown`] and
+/// [`InboundState::on_classified`] skips it — state intact, no events, no
+/// panic. The model is the native Anthropic transport's wire-level handling
+/// ([`crate::anthropic::state::AnthropicState::on_frame`], `_ =>
+/// Vec::new()`), where unknown event names are naturally representable as
+/// strings; this seam buys the Rust enum the same property.
+#[derive(Debug)]
+pub enum InboundEvent {
+    Start,
+    /// Text content delta ([`ChatStreamEvent::Chunk`]).
+    Text(String),
+    /// Reasoning/thinking delta ([`ChatStreamEvent::ReasoningChunk`]).
+    Reasoning(String),
+    /// Thought-signature payload ([`ChatStreamEvent::ThoughtSignatureChunk`]).
+    ThoughtSignature(String),
+    /// Cumulative tool-call snapshot ([`ChatStreamEvent::ToolCallChunk`]).
+    ToolCall(GenaiToolCall),
+    /// Terminal event ([`ChatStreamEvent::End`]).
+    End(StreamEnd),
+    /// A stream-event variant this adapter has no dedicated arm for.
+    /// Unreachable at genai 0.6.5 (the enum is exhaustive here); reachable
+    /// the moment a genai bump ships a new variant (e.g. `Heartbeat`, which
+    /// exists on genai's unreleased main branch). Skipped without emitting
+    /// loop events.
+    Unknown,
+}
+
+impl From<ChatStreamEvent> for InboundEvent {
+    fn from(event: ChatStreamEvent) -> Self {
+        match event {
+            ChatStreamEvent::Start => InboundEvent::Start,
+            ChatStreamEvent::Chunk(c) => InboundEvent::Text(c.content),
+            ChatStreamEvent::ReasoningChunk(c) => InboundEvent::Reasoning(c.content),
+            ChatStreamEvent::ThoughtSignatureChunk(c) => InboundEvent::ThoughtSignature(c.content),
+            ChatStreamEvent::ToolCallChunk(t) => InboundEvent::ToolCall(t.tool_call),
+            ChatStreamEvent::End(e) => InboundEvent::End(e),
+            // Unreachable at genai 0.6.5 — see the type-level docs for why
+            // the arm exists anyway. When a genai bump makes it reachable,
+            // rustc's unreachable-pattern diagnostic goes quiet on its own;
+            // the allow is scoped to this expression precisely so it cannot
+            // hide a dead arm anywhere else.
+            #[allow(unreachable_patterns)]
+            _ => InboundEvent::Unknown,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum OpenBlock {
     Text { index: usize },
@@ -112,14 +174,32 @@ impl InboundState {
     /// Dispatch a single genai event. May produce 0, 1, or 2+ grain events
     /// in emission order (e.g. a text → tool-call transition closes the open
     /// text block then opens the tool-call block).
+    ///
+    /// Routed through the [`InboundEvent`] classification seam so a
+    /// stream-event variant this adapter does not know degrades to a skipped
+    /// [`InboundEvent::Unknown`] instead of failing the build or the stream
+    /// (rust-host.md, "Forward-compatible event handling").
     pub fn on_event(&mut self, event: ChatStreamEvent) -> Vec<AssistantMessageEvent> {
+        self.on_classified(InboundEvent::from(event))
+    }
+
+    /// Dispatch one already-classified event. Public so the
+    /// forward-compatibility contract is testable: [`InboundEvent::Unknown`]
+    /// cannot be constructed *from* genai 0.6.5 (no unknown variant exists
+    /// yet), but its handling — skip, keep state, emit nothing — must hold
+    /// before the genai bump that makes it reachable.
+    pub fn on_classified(&mut self, event: InboundEvent) -> Vec<AssistantMessageEvent> {
         match event {
-            ChatStreamEvent::Start => self.on_start(),
-            ChatStreamEvent::Chunk(c) => self.on_text_chunk(c.content),
-            ChatStreamEvent::ReasoningChunk(c) => self.on_reasoning_chunk(c.content),
-            ChatStreamEvent::ThoughtSignatureChunk(c) => self.on_thought_signature(c.content),
-            ChatStreamEvent::ToolCallChunk(t) => self.on_tool_call(t.tool_call),
-            ChatStreamEvent::End(e) => self.on_end(e),
+            InboundEvent::Start => self.on_start(),
+            InboundEvent::Text(content) => self.on_text_chunk(content),
+            InboundEvent::Reasoning(content) => self.on_reasoning_chunk(content),
+            InboundEvent::ThoughtSignature(content) => self.on_thought_signature(content),
+            InboundEvent::ToolCall(tool_call) => self.on_tool_call(tool_call),
+            InboundEvent::End(end) => self.on_end(end),
+            // Tolerated, not surfaced: no loop events, no state change, no
+            // panic. Mirrors the native transport's wire-level
+            // `_ => Vec::new()` for unknown SSE event names.
+            InboundEvent::Unknown => Vec::new(),
         }
     }
 
